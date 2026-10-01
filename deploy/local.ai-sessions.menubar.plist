@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: scripts/install.sh replaces __HOME__ and installs it as
+     ~/Library/LaunchAgents/local.ai-sessions.menubar.plist. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.ai-sessions.menubar</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__HOME__/Applications/AISessions.app/Contents/MacOS/AISessions</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Restart after a crash, not after Quit (a clean exit). -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/.ai-sessions/state/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.ai-sessions/state/launchd.log</string>
+</dict>
+</plist>
