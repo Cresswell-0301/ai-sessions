@@ -52,6 +52,20 @@ public enum ActivityState: String, Codable, Sendable {
     case idle
 }
 
+/// How a turn came to an end. Only a completed turn is news: the user caused
+/// an interrupted one a moment ago, and an abandoned one never produced an
+/// answer to look at.
+public enum TurnEnd: String, Codable, Sendable {
+    /// The agent finished its answer.
+    case completed
+    /// Stopped before its answer: Esc in Claude, Stop in Codex (or Codex
+    /// aborting the turn itself, e.g. when its window reloads).
+    case interrupted
+    /// It never ended: the process running it died, or it went silent for
+    /// hours with no turn end written.
+    case abandoned
+}
+
 /// Where a session lives, so the router can bring the user back to it.
 public enum SessionHost: Codable, Equatable, Sendable {
     /// Inside a VS Code-family editor window. `extensionHostPid` is the
@@ -85,6 +99,13 @@ public struct Observation: Equatable, Sendable {
     /// False for automation the user did not start interactively
     /// (`claude -p`, SDK runs, `codex exec` probes, sub-agents).
     public var interactive: Bool
+    /// When `pid` started, as the source records it (Claude's registry
+    /// `procStart`): with the pid, it tells the process that ran a turn from
+    /// a later one, even one that reuses the pid.
+    public var procStart: String?
+    /// How the turn that led to this idle state ended; nil while running or
+    /// waiting, or when the source cannot tell (then it counts as completed).
+    public var turnEnd: TurnEnd?
 
     public init(
         key: SessionKey,
@@ -97,7 +118,9 @@ public struct Observation: Equatable, Sendable {
         entrypoint: String? = nil,
         lastMessage: String? = nil,
         host: SessionHost = .unknown,
-        interactive: Bool = true
+        interactive: Bool = true,
+        procStart: String? = nil,
+        turnEnd: TurnEnd? = nil
     ) {
         self.key = key
         self.state = state
@@ -110,6 +133,8 @@ public struct Observation: Equatable, Sendable {
         self.lastMessage = lastMessage
         self.host = host
         self.interactive = interactive
+        self.procStart = procStart
+        self.turnEnd = turnEnd
     }
 }
 
@@ -137,6 +162,9 @@ public struct TrackedSession: Equatable, Codable, Sendable {
     public var turnStartedAt: Date?
     /// Length of the most recently completed turn.
     public var lastTurnDuration: TimeInterval?
+    /// How the turn `lastTurnDuration` measures came to an end; nil when
+    /// unknown. An interrupted or abandoned turn is never announced.
+    public var lastTurnEnd: TurnEnd?
     /// Finished or needs input, and the user has not looked at it yet.
     public var unread: Bool
     public var lastMessage: String?
@@ -165,7 +193,8 @@ public struct TrackedSession: Equatable, Codable, Sendable {
         host: SessionHost = .unknown,
         interactive: Bool = true,
         firstSeen: Date,
-        lastChange: Date
+        lastChange: Date,
+        lastTurnEnd: TurnEnd? = nil
     ) {
         self.key = key
         self.title = title
@@ -176,6 +205,7 @@ public struct TrackedSession: Equatable, Codable, Sendable {
         self.stateSince = stateSince
         self.turnStartedAt = turnStartedAt
         self.lastTurnDuration = lastTurnDuration
+        self.lastTurnEnd = lastTurnEnd
         self.unread = unread
         self.lastMessage = lastMessage
         self.pid = pid
@@ -192,7 +222,8 @@ public struct TrackedSession: Equatable, Codable, Sendable {
 
 /// What the tracker tells the app after each tick.
 public enum TrackerEvent: Equatable, Sendable {
-    /// running -> idle. The app notifies when the turn was long enough.
+    /// running -> idle, the turn completed (an interrupted or abandoned one
+    /// emits nothing). The app notifies when the turn was long enough.
     case finished(TrackedSession)
     /// any -> waiting. The app always notifies.
     case needsInput(TrackedSession)

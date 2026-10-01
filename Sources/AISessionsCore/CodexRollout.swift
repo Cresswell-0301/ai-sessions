@@ -104,6 +104,10 @@ public final class CodexRolloutReader {
     public var stateSince: Date? { activity.stateSince }
     /// The event type that set `state` ("task_started", "task_complete", …).
     public var rawStatus: String? { activity.rawStatus }
+    /// How the last turn ended, while `state` is idle because of it:
+    /// `task_complete` completed it, `turn_aborted` (Stop, or Codex shutting
+    /// the turn down) interrupted it. nil otherwise.
+    public var turnEnd: TurnEnd? { activity.turnEnd }
     public var lastMessage: String? { activity.lastMessage }
     /// The user's first prompt, without the IDE context Codex prepends to it.
     public var firstUserMessage: String? { activity.firstUserMessage }
@@ -520,6 +524,9 @@ struct CodexActivity: Equatable {
     var state: ActivityState = .idle
     var stateSince: Date?
     var rawStatus: String?
+    /// Set by the boundary that made the thread idle; cleared by anything
+    /// that makes it busy again.
+    var turnEnd: TurnEnd?
     var lastMessage: String?
     var firstUserMessage: String?
     /// Every line since the meta line has been seen, so the next prompt is the first.
@@ -536,9 +543,12 @@ struct CodexActivity: Equatable {
             enter(.running, event)
         case .turnComplete(let message):
             enter(.idle, event)
+            turnEnd = .completed
             if let message = CodexText.preview(message) { lastMessage = message }
         case .turnAborted:
+            // Every abort reason means the turn did not finish its answer.
             enter(.idle, event)
+            turnEnd = .interrupted
         case .agentMessage(let text):
             if let text = CodexText.preview(text) { lastMessage = text }
         case .userMessage(let text):
@@ -558,12 +568,14 @@ struct CodexActivity: Equatable {
         state = .running
         stateSince = nil
         rawStatus = nil
+        turnEnd = nil
     }
 
     private mutating func enter(_ newState: ActivityState, _ event: CodexEvent) {
         state = newState
         stateSince = event.timestamp
         rawStatus = event.rawType
+        turnEnd = nil
     }
 }
 

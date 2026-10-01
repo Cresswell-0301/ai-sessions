@@ -8,6 +8,11 @@ import Foundation
 /// mark-read methods on one serial queue and hands the UI immutable
 /// `[TrackedSession]` snapshots, so nothing here takes a lock.
 public final class Tracker {
+    /// A turn that ended while the app was not running is announced on the
+    /// way back only if it ended this recently: after a night with the app
+    /// quit, "done in 4m" about yesterday's turn is noise, not news.
+    static let catchUpWindow: TimeInterval = 60 * 60
+
     /// Read on every tick. Visibility of automation sessions follows it at
     /// once; the turn threshold applies from the next finished turn.
     public var config: Config
@@ -53,13 +58,15 @@ public final class Tracker {
                 (entry, kind) = advance(previous, with: observation, now: now, announce: announce)
             } else {
                 (entry, kind) = adopt(observation, record: store.record(for: key), now: now, announce: announce)
-                if announce, kind != nil {
-                    Log.shared.info("\(key): a turn finished while the app was not running")
+                if announce, let kind {
+                    Log.shared.info(kind == .needsInput
+                        ? "\(key): asked for input while the app was not running"
+                        : "\(key): a turn finished while the app was not running")
                 }
             }
             entries[key] = entry
             if entry.session != previous?.session { orderedCache = nil }
-            store.update(Self.record(of: entry.session, seenAt: now), for: key)
+            store.update(Self.record(of: entry, seenAt: now), for: key)
             if announce, let kind { events.append(kind.event(for: entry.session)) }
         }
 
@@ -100,7 +107,7 @@ public final class Tracker {
     }
 
     /// First sight of a session by this tracker: adopt it silently, restoring
-    /// what the store remembers, except for the catch-up rule.
+    /// what the store remembers, except for the catch-up rules of `restore`.
     private func adopt(_ observation: Observation, record: StateStore.Record?, now: Date,
                        announce: Bool) -> (Entry, EventKind?) {
         var entry = Entry(session: TrackedSession(
@@ -118,18 +125,29 @@ public final class Tracker {
         return (entry, kind)
     }
 
-    /// Adoption against a remembered record. Only a turn that finished while
-    /// the app was not running is announced; any other change since then is
+    /// Adoption against a remembered record. Two changes since the app last
+    /// looked are news: a turn that completed recently in the process that
+    /// ran it, and a question the agent is waiting on. Any other change is
     /// taken over silently, so it may clear `unread` but never raises it.
     private func restore(_ record: StateStore.Record, to observation: Observation, now: Date,
                          announce: Bool) -> (Phase, EventKind?) {
         var phase = Phase(record)
         if record.state == .running, observation.state == .idle, !record.ended,
-           Self.isNewer(observation.stateSince, than: record.stateSince ?? record.turnStartedAt) {
+           Self.isNewer(observation.stateSince, than: record.stateSince ?? record.turnStartedAt),
+           Self.isSameProcess(record, observation) {
+            // The turn ended while the app was not running. In another process
+            // it did not: the session was resumed after its process died (a
+            // window reload, an editor restart), and is adopted silently below.
             let duration = Self.turnDuration(from: record.turnStartedAt, to: observation.stateSince)
             phase.state = .idle
             phase.stateSince = observation.stateSince
             phase.lastTurnDuration = duration
+            phase.lastTurnEnd = observation.turnEnd
+            guard Self.isCompleted(observation.turnEnd),
+                  let end = observation.stateSince, now.timeIntervalSince(end) <= Self.catchUpWindow else {
+                phase.unread = false
+                return (phase, nil)
+            }
             phase.unread = announce && isLongTurn(duration)
             return (phase, .finished)
         }
@@ -148,9 +166,11 @@ public final class Tracker {
             phase.turnStartedAt = observation.stateSince ?? now
             phase.unread = false
         case .waiting:
-            // Getting here took a running stretch, i.e. the user acted on the
-            // session; the new question itself was never announced.
-            phase.unread = false
+            // Not the waiting period the record knew: a question asked while
+            // the app was not running. It blocks the agent and was never
+            // announced, so it is news, as any → waiting is live.
+            phase.unread = announce
+            return (phase, .needsInput)
         case .idle:
             // idle → idle keeps `unread`, as it does live.
             if record.state != .idle { phase.unread = false }
@@ -185,8 +205,15 @@ public final class Tracker {
             case (.running, .idle):
                 let duration = Self.turnDuration(from: before.turnStartedAt, to: observation.stateSince)
                 phase.lastTurnDuration = duration
-                phase.unread = announce && isLongTurn(duration)
-                kind = .finished
+                phase.lastTurnEnd = observation.turnEnd
+                if Self.isCompleted(observation.turnEnd) {
+                    phase.unread = announce && isLongTurn(duration)
+                    kind = .finished
+                } else {
+                    // The user stopped it a moment ago, or its process died:
+                    // there is no answer to look at, so nothing to announce.
+                    phase.unread = false
+                }
             case (.waiting, .idle):
                 phase.unread = false // the user dealt with it
             case (.idle, .idle):
@@ -217,6 +244,7 @@ public final class Tracker {
         }
         entry.session.rawStatus = observation.rawStatus
         entry.session.pid = observation.pid
+        entry.procStart = observation.procStart
         entry.session.entrypoint = observation.entrypoint
         entry.session.host = observation.host
         entry.session.interactive = observation.interactive
@@ -285,11 +313,26 @@ public final class Tracker {
         return session.state == .running ? 2 : 3
     }
 
-    private static func record(of session: TrackedSession, seenAt now: Date) -> StateStore.Record {
-        StateStore.Record(state: session.state, stateSince: session.stateSince,
-                          turnStartedAt: session.turnStartedAt,
-                          lastTurnDuration: session.lastTurnDuration,
-                          unread: session.unread, ended: false, lastSeen: now)
+    private static func record(of entry: Entry, seenAt now: Date) -> StateStore.Record {
+        let session = entry.session
+        return StateStore.Record(state: session.state, stateSince: session.stateSince,
+                                 turnStartedAt: session.turnStartedAt,
+                                 lastTurnDuration: session.lastTurnDuration,
+                                 unread: session.unread, ended: false, lastSeen: now,
+                                 pid: session.pid, procStart: entry.procStart,
+                                 lastTurnEnd: session.lastTurnEnd)
+    }
+
+    /// Whether the session is still in the process the record knew. Codex
+    /// threads have no process of their own: nil on both sides matches.
+    private static func isSameProcess(_ record: StateStore.Record, _ observation: Observation) -> Bool {
+        record.pid == observation.pid && record.procStart == observation.procStart
+    }
+
+    /// Only a completed turn is announced. A source that cannot tell how a
+    /// turn ended reports nil, which counts as completed.
+    private static func isCompleted(_ end: TurnEnd?) -> Bool {
+        end == nil || end == .completed
     }
 
     private static func fallbackTitle(for key: SessionKey) -> String {
@@ -335,6 +378,8 @@ public final class Tracker {
         var session: TrackedSession
         /// The last title a source reported; `session.title` may be the fallback.
         var reportedTitle: String?
+        /// The session's process start, persisted with its pid.
+        var procStart: String?
     }
 
     /// The part of a session the rules table reads and writes.
@@ -343,6 +388,7 @@ public final class Tracker {
         var stateSince: Date?
         var turnStartedAt: Date?
         var lastTurnDuration: TimeInterval?
+        var lastTurnEnd: TurnEnd?
         var unread = false
 
         init(state: ActivityState, stateSince: Date?) {
@@ -355,6 +401,7 @@ public final class Tracker {
             stateSince = session.stateSince
             turnStartedAt = session.turnStartedAt
             lastTurnDuration = session.lastTurnDuration
+            lastTurnEnd = session.lastTurnEnd
             unread = session.unread
         }
 
@@ -363,6 +410,7 @@ public final class Tracker {
             stateSince = record.stateSince
             turnStartedAt = record.turnStartedAt
             lastTurnDuration = record.lastTurnDuration
+            lastTurnEnd = record.lastTurnEnd
             unread = record.unread
         }
 
@@ -371,6 +419,7 @@ public final class Tracker {
             session.stateSince = stateSince
             session.turnStartedAt = turnStartedAt
             session.lastTurnDuration = lastTurnDuration
+            session.lastTurnEnd = lastTurnEnd
             session.unread = unread
         }
     }

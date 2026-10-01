@@ -90,9 +90,10 @@ final class TrackerTests: XCTestCase {
 
     private func obs(_ id: String, _ state: ActivityState, since: Date?, agent: Agent = .claude,
                      title: String? = nil, cwd: String? = "/Users/me/project",
-                     message: String? = nil, interactive: Bool = true) -> Observation {
-        Observation(key: key(id, agent), state: state, stateSince: since, title: title, cwd: cwd,
-                    lastMessage: message, interactive: interactive)
+                     message: String? = nil, interactive: Bool = true, turnEnd: TurnEnd? = nil,
+                     pid: Int32? = nil, procStart: String? = nil) -> Observation {
+        Observation(key: key(id, agent), state: state, stateSince: since, title: title, cwd: cwd, pid: pid,
+                    lastMessage: message, interactive: interactive, procStart: procStart, turnEnd: turnEnd)
     }
 
     /// "finished claude:a", "ended codex:x", … for readable assertions.
@@ -158,6 +159,26 @@ final class TrackerTests: XCTestCase {
         source.observations = [obs("a", .idle, since: t0 + 45)]
         XCTAssertEqual(names(tracker.tick()), ["finished claude:a"])
         XCTAssertEqual(tracker.session(for: key("a"))?.unread, false)
+    }
+
+    func testAnInterruptedOrAbandonedTurnEndsSilently() {
+        let source = FakeSource(.claude, [obs("esc", .running, since: t0), obs("dead", .running, since: t0, agent: .codex),
+                                          obs("done", .running, since: t0)])
+        let tracker = adopted(source)
+        clock.advance(120)
+        source.observations = [obs("esc", .idle, since: t0 + 100, turnEnd: .interrupted),
+                               obs("dead", .idle, since: t0 + 90, agent: .codex, turnEnd: .abandoned),
+                               obs("done", .idle, since: t0 + 110, turnEnd: .completed)]
+        XCTAssertEqual(names(tracker.tick()), ["finished claude:done"], "only a completed turn is news")
+        for (id, agent, end, duration) in [("esc", Agent.claude, TurnEnd.interrupted, 100.0), ("dead", .codex, .abandoned, 90)] {
+            let session = tracker.session(for: key(id, agent))
+            XCTAssertEqual(session?.state, .idle, id)
+            XCTAssertEqual(session?.unread, false, "\(id): there is no answer to look at")
+            XCTAssertEqual(session?.lastTurnEnd, end, id)
+            XCTAssertEqual(session?.lastTurnDuration, duration, "\(id): it did run that long")
+        }
+        XCTAssertEqual(tracker.session(for: key("done"))?.lastTurnEnd, .completed)
+        XCTAssertEqual(tracker.session(for: key("done"))?.unread, true)
     }
 
     func testAnyStateToWaitingNeedsInputAndIsUnread() {
@@ -410,7 +431,9 @@ final class TrackerTests: XCTestCase {
         XCTAssertEqual(tracker.session(for: key("unknown"))?.unread, false)
     }
 
-    func testOtherChangesWhileTheAppWasNotRunningAreAdoptedSilently() {
+    /// Pinned silence for `toWaiting` until review finding 6: a question asked
+    /// while the app was not running blocks the agent and is news.
+    func testAQuestionAskedWhileTheAppWasNotRunningIsAnnouncedAndOtherChangesAdoptedSilently() {
         let source = FakeSource(.claude, [obs("toWaiting", .running, since: t0), obs("toRunning", .idle, since: t0),
                                           obs("stillRunning", .running, since: t0)])
         runAppOnce(source)
@@ -418,9 +441,74 @@ final class TrackerTests: XCTestCase {
                                obs("stillRunning", .running, since: t0)]
         clock.advance(60)
         let tracker = makeTracker([source])
-        XCTAssertEqual(tracker.tick(), [])
+        XCTAssertEqual(names(tracker.tick()), ["needsInput claude:toWaiting"])
+        XCTAssertEqual(tracker.session(for: key("toWaiting"))?.unread, true)
+        XCTAssertEqual(tracker.session(for: key("toWaiting"))?.turnStartedAt, t0, "waiting is part of the turn")
         XCTAssertEqual(tracker.session(for: key("toRunning"))?.turnStartedAt, t0 + 30)
         XCTAssertEqual(tracker.session(for: key("stillRunning"))?.turnStartedAt, t0, "the remembered turn start")
+    }
+
+    func testTheProcessAndTheTurnEndArePersistedAndRestored() {
+        let start = "Thu Oct  1 02:59:07 2026"
+        let source = FakeSource(.claude, [obs("a", .running, since: t0, pid: 42, procStart: start)])
+        let tracker = adopted(source)
+        clock.advance(60)
+        source.observations = [obs("a", .idle, since: t0 + 50, turnEnd: .interrupted, pid: 42, procStart: start)]
+        XCTAssertEqual(tracker.tick(), [])
+        let record = StateStore(url: stateURL).record(for: key("a"))
+        XCTAssertEqual(record?.pid, 42)
+        XCTAssertEqual(record?.procStart, start)
+        XCTAssertEqual(record?.lastTurnEnd, .interrupted)
+        let restarted = makeTracker([source])
+        XCTAssertEqual(restarted.tick(), [])
+        XCTAssertEqual(restarted.session(for: key("a"))?.lastTurnEnd, .interrupted, "restored with its duration")
+        XCTAssertEqual(restarted.session(for: key("a"))?.lastTurnDuration, 50)
+    }
+
+    func testCatchUpNeedsTheSameProcessNotJustTheSamePid() {
+        let start = "Thu Oct  1 02:59:07 2026"
+        let source = FakeSource(.claude, [obs("reused", .running, since: t0, pid: 42, procStart: start),
+                                          obs("same", .running, since: t0, pid: 43, procStart: start)])
+        runAppOnce(source)
+        source.observations = [obs("reused", .idle, since: t0 + 600, pid: 42, procStart: "Thu Oct  1 04:00:00 2026"),
+                               obs("same", .idle, since: t0 + 600, pid: 43, procStart: start)]
+        clock.advance(900)
+        let tracker = makeTracker([source])
+        XCTAssertEqual(names(tracker.tick()), ["finished claude:same"], "pid 42 now belongs to another process")
+        XCTAssertEqual(tracker.session(for: key("reused"))?.unread, false)
+    }
+
+    func testCatchUpOfAnInterruptedTurnIsSilent() {
+        let source = FakeSource(.claude, [obs("a", .running, since: t0, pid: 42)])
+        runAppOnce(source)
+        source.observations = [obs("a", .idle, since: t0 + 600, turnEnd: .interrupted, pid: 42)]
+        clock.advance(900)
+        let tracker = makeTracker([source])
+        XCTAssertEqual(tracker.tick(), [])
+        XCTAssertEqual(tracker.session(for: key("a"))?.lastTurnEnd, .interrupted)
+        XCTAssertEqual(tracker.session(for: key("a"))?.lastTurnDuration, 600)
+        XCTAssertEqual(tracker.session(for: key("a"))?.unread, false)
+    }
+
+    func testCatchUpReachesBackAnHourFromTheTurnsEnd() {
+        let source = FakeSource(.claude, [obs("edge", .running, since: t0), obs("late", .running, since: t0)])
+        runAppOnce(source)
+        source.observations = [obs("edge", .idle, since: t0 + 100), obs("late", .idle, since: t0 + 99)]
+        clock.now = t0 + 100 + Tracker.catchUpWindow
+        let tracker = makeTracker([source])
+        XCTAssertEqual(names(tracker.tick()), ["finished claude:edge"], "exactly an hour ago still counts")
+        XCTAssertEqual(tracker.session(for: key("late"))?.state, .idle)
+        XCTAssertEqual(tracker.session(for: key("late"))?.unread, false)
+    }
+
+    func testAQuestionAskedByAutomationWhileTheAppWasNotRunningStaysSilent() {
+        let source = FakeSource(.claude, [obs("bot", .running, since: t0, interactive: false)])
+        runAppOnce(source)
+        source.observations = [obs("bot", .waiting, since: t0 + 30, interactive: false)]
+        clock.advance(60)
+        let tracker = makeTracker([source])
+        XCTAssertEqual(tracker.tick(), [])
+        XCTAssertEqual(tracker.session(for: key("bot"))?.unread, false)
     }
 
     func testNoCatchUpForASessionThatEndedWhileTheAppWatched() {

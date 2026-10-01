@@ -42,10 +42,11 @@ final class ClaudeSourceTests: XCTestCase {
     @discardableResult
     private func writeRecord(pid: Int32 = getpid(), sessionId: String? = nil, status: String, updatedAt: Double,
                              procStart: String? = F.ownProcStart, entrypoint: String = "claude-vscode",
-                             name: String? = "demo-e1") throws -> URL {
+                             name: String? = "demo-e1", waitingFor: String? = nil) throws -> URL {
         let url = sessionsDir.appendingPathComponent("\(pid).json")
         try F.recordData(pid: pid, sessionId: sessionId ?? session, status: status, updatedAt: updatedAt,
-                         procStart: procStart, entrypoint: entrypoint, name: name, cwd: cwd).write(to: url)
+                         procStart: procStart, entrypoint: entrypoint, name: name, cwd: cwd,
+                         waitingFor: waitingFor).write(to: url)
         return url
     }
 
@@ -80,6 +81,8 @@ final class ClaudeSourceTests: XCTestCase {
         XCTAssertEqual(running.lastMessage, "Working on it.")
         XCTAssertEqual(running.cwd, cwd)
         XCTAssertEqual(running.pid, getpid())
+        XCTAssertEqual(running.procStart, F.ownProcStart, "persisted with the pid, so a restart can tell the process")
+        XCTAssertNil(running.turnEnd)
         XCTAssertEqual(running.entrypoint, "claude-vscode")
         XCTAssertTrue(running.interactive)
         let parent = try XCTUnwrap(ProcessKit.info(getpid())).ppid
@@ -94,6 +97,7 @@ final class ClaudeSourceTests: XCTestCase {
         XCTAssertEqual(idle.first?.stateSince, Date(timeIntervalSince1970: 1_790_000_060))
         XCTAssertEqual(idle.first?.lastMessage, "All done: 3 files changed.",
                        "a status flip re-reads the transcript at once, not after 5 s")
+        XCTAssertEqual(idle.first?.turnEnd, .completed, "the answer stopped with end_turn")
 
         try writeRecord(status: "waiting", updatedAt: 1_790_000_090_000)
         XCTAssertEqual(source.poll(now: t0.addingTimeInterval(2)).map(\.state), [.waiting])
@@ -268,7 +272,10 @@ final class ClaudeSourceTests: XCTestCase {
         XCTAssertEqual(second.map(\.state), [.waiting])
     }
 
-    func testTranscriptIsReReadOnAStatusChangeOrEveryFiveSeconds() throws {
+    /// Busy sessions are re-read every 2 s (an answer given behind background
+    /// work shows only in the transcript), idle ones every 5 s, and a status
+    /// change reads at once.
+    func testTranscriptIsReReadOnAStatusChangeEvery2sWhileBusyAnd5sOtherwise() throws {
         let source = makeSource(probe: FakeProcessTable(alive: [777]).probe)
         try appendTranscript([F.assistant(["one"], session: session)])
         try writeRecord(pid: 777, status: "busy", updatedAt: 1_000)
@@ -277,13 +284,162 @@ final class ClaudeSourceTests: XCTestCase {
 
         try appendTranscript([F.assistant(["two"], session: session)])
         XCTAssertEqual(source.poll(now: t0.addingTimeInterval(1)).first?.lastMessage, "one", "throttled")
-        XCTAssertEqual(source.poll(now: t0.addingTimeInterval(4.9)).first?.lastMessage, "one", "throttled")
-        XCTAssertEqual(source.poll(now: t0.addingTimeInterval(5)).first?.lastMessage, "two", "5 s later")
+        XCTAssertEqual(source.poll(now: t0.addingTimeInterval(1.9)).first?.lastMessage, "one", "throttled")
+        XCTAssertEqual(source.poll(now: t0.addingTimeInterval(2)).first?.lastMessage, "two", "2 s later while busy")
 
         try appendTranscript([F.assistant(["three"], session: session)])
         try writeRecord(pid: 777, status: "idle", updatedAt: 2_000)
-        XCTAssertEqual(source.poll(now: t0.addingTimeInterval(5.5)).first?.lastMessage, "three",
+        XCTAssertEqual(source.poll(now: t0.addingTimeInterval(2.5)).first?.lastMessage, "three",
                        "a status change reads at once")
+
+        try appendTranscript([F.assistant(["four"], session: session)])
+        XCTAssertEqual(source.poll(now: t0.addingTimeInterval(4.6)).first?.lastMessage, "three", "idle: still throttled")
+        XCTAssertEqual(source.poll(now: t0.addingTimeInterval(7.4)).first?.lastMessage, "three", "idle: still throttled")
+        XCTAssertEqual(source.poll(now: t0.addingTimeInterval(7.5)).first?.lastMessage, "four", "5 s later while idle")
+    }
+
+    // MARK: How a turn ended
+
+    private let t0 = Date(timeIntervalSince1970: 1_790_000_000)
+
+    /// `entry`, stamped `millis` (epoch ms, the registry's unit) the way the transcript is.
+    private func at(_ millis: Double, _ entry: [String: Any]) -> [String: Any] {
+        var entry = entry
+        entry["timestamp"] = Date(timeIntervalSince1970: millis / 1000)
+            .formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+        return entry
+    }
+
+    private var escMarker: [String: Any] {
+        ["type": "user", "sessionId": session,
+         "message": ["role": "user", "content": [["type": "text", "text": "[Request interrupted by user]"]]] as [String: Any]]
+    }
+
+    func testAFlipReportsHowTheTurnEnded() throws {
+        let source = makeSource(probe: FakeProcessTable(alive: [777]).probe)
+        try appendTranscript([at(1_000_000, F.user("first", session: session))])
+        try writeRecord(pid: 777, status: "busy", updatedAt: 1_000_000)
+        XCTAssertEqual(source.poll(now: t0).map(\.state), [.running])
+
+        // Esc: its marker reaches the transcript, then the record flips.
+        try appendTranscript([at(1_005_000, escMarker)])
+        try writeRecord(pid: 777, status: "idle", updatedAt: 1_005_200)
+        let stopped = try XCTUnwrap(source.poll(now: t0 + 1).first)
+        XCTAssertEqual(stopped.state, .idle)
+        XCTAssertEqual(stopped.turnEnd, .interrupted)
+        XCTAssertEqual(stopped.stateSince, Date(timeIntervalSince1970: 1_005.2))
+
+        try writeRecord(pid: 777, status: "busy", updatedAt: 1_010_000)
+        XCTAssertEqual(source.poll(now: t0 + 2).map(\.state), [.running])
+        try appendTranscript([at(1_020_000, F.assistant(["Done."], session: session))])
+        try writeRecord(pid: 777, status: "idle", updatedAt: 1_020_200)
+        let done = try XCTUnwrap(source.poll(now: t0 + 3).first)
+        XCTAssertEqual(done.state, .idle)
+        XCTAssertEqual(done.turnEnd, .completed, "this turn's answer, not the earlier Esc")
+        XCTAssertEqual(done.lastMessage, "Done.")
+    }
+
+    func testAFlipAheadOfItsTranscriptIsHeldAsRunningUntilTheTurnsEndArrives() throws {
+        let source = makeSource(probe: FakeProcessTable(alive: [777]).probe)
+        try appendTranscript([at(1_000_000, F.user("go", session: session))])
+        try writeRecord(pid: 777, status: "busy", updatedAt: 1_000_000)
+        XCTAssertEqual(source.poll(now: t0).map(\.state), [.running])
+
+        try writeRecord(pid: 777, status: "idle", updatedAt: 1_030_000)
+        let held = try XCTUnwrap(source.poll(now: t0 + 1).first)
+        XCTAssertEqual(held.state, .running, "the transcript has not caught up yet")
+        XCTAssertEqual(held.stateSince, Date(timeIntervalSince1970: 1_000), "still the turn's start")
+        XCTAssertEqual(held.rawStatus, "idle")
+        XCTAssertNil(held.turnEnd)
+        XCTAssertEqual(source.poll(now: t0 + 2.9).map(\.state), [.running], "1.9 s after the flip was seen")
+
+        // The marker lands: read at once, though the last read was under 5 s ago.
+        try appendTranscript([at(1_030_400, escMarker)])
+        let stopped = try XCTUnwrap(source.poll(now: t0 + 2.95).first)
+        XCTAssertEqual(stopped.state, .idle)
+        XCTAssertEqual(stopped.turnEnd, .interrupted)
+        XCTAssertEqual(stopped.stateSince, Date(timeIntervalSince1970: 1_030), "idle since the flip")
+    }
+
+    func testAFlipWhoseTurnEndNeverArrivesCountsAsCompletedAfterTwoSeconds() throws {
+        let source = makeSource(probe: FakeProcessTable(alive: [777]).probe)
+        // Only an earlier turn's Esc is on disk: it says nothing about this turn.
+        try appendTranscript([at(990_000, escMarker), at(1_000_000, F.user("go", session: session))])
+        try writeRecord(pid: 777, status: "busy", updatedAt: 1_000_000)
+        XCTAssertEqual(source.poll(now: t0).map(\.state), [.running])
+        try writeRecord(pid: 777, status: "idle", updatedAt: 1_030_000)
+        XCTAssertEqual(source.poll(now: t0 + 1).map(\.state), [.running])
+        XCTAssertEqual(source.poll(now: t0 + 2.99).map(\.state), [.running])
+        let idle = try XCTUnwrap(source.poll(now: t0 + 3).first)
+        XCTAssertEqual(idle.state, .idle)
+        XCTAssertEqual(idle.turnEnd, .completed, "not the stale Esc")
+        XCTAssertEqual(idle.stateSince, Date(timeIntervalSince1970: 1_030))
+        XCTAssertEqual(source.poll(now: t0 + 4).map(\.state), [.idle], "and it stays idle")
+    }
+
+    func testWithoutATranscriptAFlipIsNotHeld() throws {
+        let source = makeSource(probe: FakeProcessTable(alive: [777]).probe)
+        try writeRecord(pid: 777, status: "busy", updatedAt: 1_000_000)
+        XCTAssertEqual(source.poll(now: t0).map(\.state), [.running])
+        try writeRecord(pid: 777, status: "idle", updatedAt: 1_030_000)
+        let idle = try XCTUnwrap(source.poll(now: t0 + 1).first)
+        XCTAssertEqual(idle.state, .idle, "nothing on disk to wait for")
+        XCTAssertNil(idle.turnEnd, "unknown, which the tracker treats as completed")
+    }
+
+    func testADialogOverARunningTurnKeepsItRunningUntilTheTranscriptShowsItsEnd() throws {
+        let source = makeSource(probe: FakeProcessTable(alive: [777]).probe)
+        try appendTranscript([at(1_000_000, F.user("go", session: session))])
+        try writeRecord(pid: 777, status: "busy", updatedAt: 1_000_000, entrypoint: "cli")
+        XCTAssertEqual(source.poll(now: t0).map(\.state), [.running])
+
+        try writeRecord(pid: 777, status: "waiting", updatedAt: 1_003_000, entrypoint: "cli", waitingFor: "dialog open")
+        let behindDialog = try XCTUnwrap(source.poll(now: t0 + 1).first)
+        XCTAssertEqual(behindDialog.state, .running, "neither a question nor the end of the turn")
+        XCTAssertEqual(behindDialog.rawStatus, "waiting:dialog open")
+        XCTAssertEqual(behindDialog.stateSince, Date(timeIntervalSince1970: 1_000))
+        XCTAssertEqual(source.poll(now: t0 + 10).map(\.state), [.running], "no time limit while the dialog is open")
+
+        // The turn's answer is on disk: it ended before the dialog opened.
+        try appendTranscript([at(1_002_900, F.assistant(["Ready."], session: session))])
+        let idle = try XCTUnwrap(source.poll(now: t0 + 11).first)
+        XCTAssertEqual(idle.state, .idle)
+        XCTAssertEqual(idle.turnEnd, .completed)
+        XCTAssertEqual(idle.stateSince, Date(timeIntervalSince1970: 1_003))
+    }
+
+    func testADialogOverAnIdleSessionIsIdleAndTheRawStatusSaysWhy() throws {
+        let source = makeSource(probe: FakeProcessTable(alive: [777]).probe)
+        try writeRecord(pid: 777, status: "idle", updatedAt: 1_000_000, entrypoint: "cli")
+        XCTAssertEqual(source.poll(now: t0).map(\.state), [.idle])
+        try writeRecord(pid: 777, status: "waiting", updatedAt: 1_060_000, entrypoint: "cli", waitingFor: "dialog open")
+        let dialog = try XCTUnwrap(source.poll(now: t0 + 1).first)
+        XCTAssertEqual(dialog.state, .idle)
+        XCTAssertEqual(dialog.rawStatus, "waiting:dialog open")
+        try writeRecord(pid: 777, status: "waiting", updatedAt: 1_070_000, entrypoint: "cli", waitingFor: "permission prompt")
+        let asking = try XCTUnwrap(source.poll(now: t0 + 2).first)
+        XCTAssertEqual(asking.state, .waiting)
+        XCTAssertEqual(asking.rawStatus, "waiting:permission prompt")
+    }
+
+    func testARunningSessionTakenOverByAnotherProcessDidNotFinishItsTurn() throws {
+        let source = makeSource(probe: FakeProcessTable(alive: [101, 202]).probe)
+        try appendTranscript([at(1_000_000, F.assistant(["Earlier."], session: session))])
+        try writeRecord(pid: 101, status: "busy", updatedAt: 2_000_000)
+        XCTAssertEqual(source.poll(now: t0).map(\.pid), [101])
+        // A resume in another process races the one that was running.
+        try writeRecord(pid: 202, status: "idle", updatedAt: 3_000_000)
+        let taken = try XCTUnwrap(source.poll(now: t0 + 1).first)
+        XCTAssertEqual(taken.pid, 202)
+        XCTAssertEqual(taken.state, .idle)
+        XCTAssertEqual(taken.turnEnd, .abandoned, "not the earlier answer's end_turn")
+    }
+
+    func testAnIdleSessionSeenForTheFirstTimeReportsItsNewestTurnEnd() throws {
+        try appendTranscript([at(1_000_000, F.assistant(["Earlier."], session: session)), at(1_050_000, escMarker)])
+        try writeRecord(pid: 777, status: "idle", updatedAt: 1_050_200)
+        let idle = try XCTUnwrap(makeSource(probe: FakeProcessTable(alive: [777]).probe).poll(now: t0).first)
+        XCTAssertEqual(idle.turnEnd, .interrupted, "what a restart's catch-up needs to know")
     }
 
     func testTitlePrecedence() {

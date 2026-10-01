@@ -24,7 +24,9 @@ final class LaunchModeTests: XCTestCase {
     func testModes() {
         XCTAssertEqual(LaunchMode.parse([]), .gui)
         XCTAssertEqual(LaunchMode.parse(["-psn_0_1234567"]), .gui, "Finder's process serial number is ignored")
-        XCTAssertEqual(LaunchMode.parse(["--headless"]), .headless)
+        XCTAssertEqual(LaunchMode.parse(["--headless"]), .headless(useAppState: false))
+        XCTAssertEqual(LaunchMode.parse(["--headless", "--use-app-state"]), .headless(useAppState: true))
+        XCTAssertEqual(LaunchMode.parse(["--use-app-state", "--headless"]), .headless(useAppState: true))
         XCTAssertEqual(LaunchMode.parse(["--version"]), .version)
         XCTAssertEqual(LaunchMode.parse(["-h"]), .help)
         XCTAssertEqual(LaunchMode.parse(["--route", "claude:abc"]), .route(query: "claude:abc", open: false))
@@ -34,7 +36,8 @@ final class LaunchModeTests: XCTestCase {
 
     func testInvalidCommandLines() {
         for arguments in [["--open"], ["--route"], ["--route", "--open"], ["--headless", "--route", "x"],
-                          ["--version", "--open"], ["--nope"], ["claude:abc"]] {
+                          ["--version", "--open"], ["--nope"], ["claude:abc"], ["--use-app-state"],
+                          ["--route", "x", "--use-app-state"], ["--headless", "--open"]] {
             guard case .invalid = LaunchMode.parse(arguments) else {
                 return XCTFail("\(arguments) should be rejected, got \(LaunchMode.parse(arguments))")
             }

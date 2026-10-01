@@ -21,13 +21,40 @@ public enum Formatting {
         return duration(seconds) + " ago"
     }
 
-    /// Collapses whitespace and truncates with an ellipsis.
+    /// Drops control characters, collapses whitespace and truncates with an
+    /// ellipsis.
     public static func oneLine(_ text: String?, max: Int) -> String? {
         guard let text else { return nil }
-        let collapsed = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        let collapsed = withoutControlCharacters(text)
+            .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         guard !collapsed.isEmpty else { return nil }
         if collapsed.count <= max { return collapsed }
         return String(collapsed.prefix(max - 1)).trimmingCharacters(in: .whitespaces) + "…"
+    }
+
+    /// `text` without control characters (Unicode Cc: the C0 range with ESC
+    /// and BEL, DEL, the C1 range with the one-byte CSI). The ones that are
+    /// whitespace (tab, line feed, carriage return, NEL…) become spaces, so
+    /// they still separate words. Titles and previews come from transcripts,
+    /// pasted prompts and model output, and `--route`/`--headless` print them
+    /// to a terminal, where an ESC/OSC sequence is a command: retitle,
+    /// recolor, even write the clipboard (OSC 52).
+    public static func withoutControlCharacters(_ text: String) -> String {
+        guard text.unicodeScalars.contains(where: isControl) else { return text }
+        var kept = String.UnicodeScalarView()
+        for scalar in text.unicodeScalars {
+            if !isControl(scalar) {
+                kept.append(scalar)
+            } else if (0x09...0x0D).contains(scalar.value) || scalar.value == 0x85 {
+                kept.append(" ")
+            }
+        }
+        return String(kept)
+    }
+
+    /// General category Cc, which Unicode fixes as exactly these two ranges.
+    private static func isControl(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value < 0x20 || (0x7F...0x9F).contains(scalar.value)
     }
 
     /// Project label for a working directory: the last path component, with

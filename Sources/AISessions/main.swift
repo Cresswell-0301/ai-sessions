@@ -3,21 +3,35 @@ import AppKit
 
 // Entry point: no arguments runs the menu-bar app; `LaunchMode.usage` lists
 // the command-line modes.
-switch LaunchMode.parse(Array(CommandLine.arguments.dropFirst())) {
+let launchMode = LaunchMode.parse(Array(CommandLine.arguments.dropFirst()))
+
+// state/ holds titles, prompts and last messages copied out of ~/.claude,
+// which is 0700: everything this process creates is owner-only, in every
+// mode, and a launch repairs what older versions left world-readable.
+_ = umask(0o077)
+switch launchMode {
+case .gui, .headless, .testNotification: AppPaths.secureStateDirectory(create: true)
+case .route, .version, .help, .invalid: AppPaths.secureStateDirectory(create: false)
+}
+
+switch launchMode {
 case .gui:
     MainActor.assumeIsolated { runMenuBarApp() }
-case .headless:
-    Log.shared.echo = true // before anything logs, config warnings included
-    MainActor.assumeIsolated { HeadlessRunner(config: Config.load()).run() }
+case .headless(let useAppState):
+    let files = HeadlessRunner.Files(useAppState: useAppState)
+    // Before anything logs, config warnings included.
+    Log.shared.file = files.log
+    Log.shared.echo = true
+    MainActor.assumeIsolated { HeadlessRunner(config: Config.load(), files: files).run() }
 case .route(let query, let open):
     let status = MainActor.assumeIsolated { runRoute(query: query, open: open) }
-    Log.shared.flush()
     exit(status)
 case .testNotification(let query):
     do {
         try FileManager.default.createDirectory(at: AppPaths.stateDir, withIntermediateDirectories: true)
         try Data((query + "\n").utf8).write(to: AppDelegate.testTriggerURL, options: .atomic)
-        print("asked the running app for a test notification (\(query.isEmpty ? "first listed session" : query)); it checks every 5 s")
+        print("asked the running app for a test notification (\(query.isEmpty ? "first listed session" : query)); "
+            + "it checks every 5 s and drops a request older than \(Int(AppDelegate.testRequestMaxAge)) s")
     } catch {
         FileHandle.standardError.write(Data("could not write \(AppDelegate.testTriggerURL.path): \(error.localizedDescription)\n".utf8))
         exit(1)
@@ -42,7 +56,7 @@ enum AppInfo {
 /// What the command line asks for.
 enum LaunchMode: Equatable {
     case gui
-    case headless
+    case headless(useAppState: Bool)
     case route(query: String, open: Bool)
     case testNotification(query: String)
     case version
@@ -51,8 +65,13 @@ enum LaunchMode: Equatable {
 
     static let usage = """
         usage: AISessions                       run the menu-bar app
-               AISessions --headless            track sessions without UI: log events,
-                                                print the sessions, write state/snapshot.json
+               AISessions --headless [--use-app-state]
+                                                track sessions without UI: log events and
+                                                print the sessions; keeps its own state.json,
+                                                snapshot.json and headless.log in
+                                                state/headless/, so it can run next to the app;
+                                                --use-app-state uses the app's state/ files
+                                                instead (only while the app is not running)
                AISessions --route <key> [--open]
                                                 print the route back to a session (a key such as
                                                 claude:<uuid> or a unique prefix of one);
@@ -66,15 +85,19 @@ enum LaunchMode: Equatable {
     static func parse(_ arguments: [String]) -> LaunchMode {
         var mode: LaunchMode?
         var open = false
+        var useAppState = false
         var rest = arguments[...]
         while let argument = rest.popFirst() {
             let next: LaunchMode
             switch argument {
-            case "--headless": next = .headless
+            case "--headless": next = .headless(useAppState: false)
             case "--version": next = .version
             case "--help", "-h": next = .help
             case "--open":
                 open = true
+                continue
+            case "--use-app-state":
+                useAppState = true
                 continue
             case "--test-notification":
                 var query = ""
@@ -95,11 +118,15 @@ enum LaunchMode: Equatable {
         }
         switch mode {
         case .route(let query, _)?:
+            guard !useAppState else { return .invalid("--use-app-state only goes with --headless") }
             return .route(query: query, open: open)
-        case let other?:
-            return open ? .invalid("--open only goes with --route") : other
-        case nil:
-            return open ? .invalid("--open only goes with --route") : .gui
+        case .headless?:
+            guard !open else { return .invalid("--open only goes with --route") }
+            return .headless(useAppState: useAppState)
+        case let other:
+            guard !open else { return .invalid("--open only goes with --route") }
+            guard !useAppState else { return .invalid("--use-app-state only goes with --headless") }
+            return other ?? .gui
         }
     }
 }
@@ -137,11 +164,16 @@ private func otherInstance() -> NSRunningApplication? {
 /// Returns the process exit status.
 @MainActor
 func runRoute(query: String, open: Bool) -> Int32 {
-    // A throwaway state file: a look from the command line must not adopt,
-    // close or catch up anything in the running app's own state.
+    // A throwaway state file and log: a look from the command line must not
+    // adopt, close or catch up anything in the running app's own state, nor
+    // log "first run: adopted…" into its log as if the app had lost its state.
     let scratch = FileManager.default.temporaryDirectory
         .appendingPathComponent("ai-sessions-route-\(UUID().uuidString)", isDirectory: true)
-    defer { try? FileManager.default.removeItem(at: scratch) }
+    Log.shared.file = scratch.appendingPathComponent("route.log")
+    defer {
+        Log.shared.flush() // before the directory goes, or a late line recreates it
+        try? FileManager.default.removeItem(at: scratch)
+    }
     let engine = SessionEngine(config: Config.load(),
                                store: StateStore(url: scratch.appendingPathComponent("state.json")))
     let sessions = engine.tickNow()
@@ -151,28 +183,29 @@ func runRoute(query: String, open: Bool) -> Int32 {
     case .found(let found):
         session = found
     case .none:
-        let known = sessions.map { "  \($0.key)  \($0.title)" }.joined(separator: "\n")
-        printError("no live session matches \"\(query)\""
+        let known = sessions.map(SessionListing.keyAndTitle).joined(separator: "\n")
+        printError("no live session matches \"\(SessionListing.printable(query))\""
             + (known.isEmpty ? " (no sessions are live)" : ". Live sessions:\n\(known)"))
         return 1
     case .ambiguous(let candidates):
-        printError("\"\(query)\" matches several sessions:\n"
-            + candidates.map { "  \($0.key)  \($0.title)" }.joined(separator: "\n"))
+        printError("\"\(SessionListing.printable(query))\" matches several sessions:\n"
+            + candidates.map(SessionListing.keyAndTitle).joined(separator: "\n"))
         return 1
     }
 
     let plan = Router.plan(for: session)
-    print("session   \(session.key)")
-    print("title     \(session.title)")
-    print("state     \(SessionListing.stateLabel(session)) · \(SessionListing.detail(session, now: Date()))")
-    print("plan      \(plan.summary)")
+    let printable = SessionListing.printable
+    print("session   \(printable(session.key.description))")
+    print("title     \(printable(session.title))")
+    print("state     \(SessionListing.stateLabel(session)) · \(printable(SessionListing.detail(session, now: Date())))")
+    print("plan      \(printable(plan.summary))")
     if let url = plan.url { print("url       \(url.absoluteString)") }
     if let pid = plan.activatePid { print("activate  pid \(pid)") }
-    if let bundle = plan.activateBundleIdentifier { print("activate  \(bundle)") }
+    if let bundle = plan.activateBundleIdentifier { print("activate  \(printable(bundle))") }
     guard open else { return 0 }
 
     let outcome = RouteExecutor().execute(plan, for: session.key)
-    print("result    \(outcome)")
+    print("result    \(printable(outcome.description))")
     return outcome.succeeded ? 0 : 1
 }
 
@@ -203,25 +236,62 @@ private func printError(_ message: String) {
 // MARK: - --headless
 
 /// The engine without UI: ticks on a timer, logs every event (echoed to
-/// stderr), prints the session list when it changes and keeps
-/// `state/snapshot.json` current. SIGINT/SIGTERM save and exit 0.
+/// stderr), prints the session list when it changes and keeps a snapshot
+/// current. SIGINT/SIGTERM save and exit 0.
 @MainActor
 final class HeadlessRunner {
+    /// Where a run keeps its tracker state, snapshot and log.
+    struct Files: Equatable {
+        var state: URL
+        var snapshot: URL
+        /// Nil: the app's log.
+        var log: URL?
+
+        /// Its own `state/headless/` by default: README suggests running it
+        /// next to the menu-bar app, and on a shared state.json its saves
+        /// would undo the app's read marks (a session read in the menu comes
+        /// back unread at the next launch) or replay a turn the app already
+        /// announced. `useAppState` takes the app's files, for when the app
+        /// is not running.
+        init(useAppState: Bool, stateDir: URL = AppPaths.stateDir) {
+            if useAppState {
+                state = stateDir.appendingPathComponent("state.json")
+                snapshot = stateDir.appendingPathComponent("snapshot.json")
+                log = nil
+            } else {
+                let own = stateDir.appendingPathComponent("headless", isDirectory: true)
+                state = own.appendingPathComponent("state.json")
+                snapshot = own.appendingPathComponent("snapshot.json")
+                log = own.appendingPathComponent("headless.log")
+            }
+        }
+    }
+
     private let config: Config
+    private let files: Files
     private let engine: SessionEngine
     private var timer: Timer?
     private var signalSources: [DispatchSourceSignal] = []
     private var tickInFlight = false
     private var printed: [SessionListing.Line]?
 
-    init(config: Config) {
+    init(config: Config, files: Files) {
         self.config = config
-        engine = SessionEngine(config: config, store: .standard(),
-                               snapshot: SnapshotWriter(url: SnapshotWriter.standardURL, delay: 0))
+        self.files = files
+        engine = SessionEngine(config: config, store: StateStore(url: files.state),
+                               snapshot: SnapshotWriter(url: files.snapshot, delay: 0))
     }
 
     func run() -> Never {
-        Log.shared.info("headless: home \(AppPaths.home.path), polling every \(config.pollIntervalSeconds)s; Ctrl-C stops")
+        Log.shared.info("headless: home \(AppPaths.home.path), state in \(files.state.deletingLastPathComponent().path), "
+            + "polling every \(config.pollIntervalSeconds)s; Ctrl-C stops")
+        // --use-app-state next to the running app (in its home): say what it costs.
+        if files.log == nil, AppPaths.home.standardizedFileURL == AppPaths.defaultHome.standardizedFileURL,
+           let app = NSRunningApplication.runningApplications(withBundleIdentifier: AppInfo.bundleIdentifier)
+            .first(where: { !$0.isTerminated }) {
+            Log.shared.warn("headless: the menu-bar app is running (pid \(app.processIdentifier)) on these files; "
+                + "sessions read in its menu can come back unread. Without --use-app-state this run keeps its own.")
+        }
         for signalNumber in [SIGINT, SIGTERM] {
             signal(signalNumber, SIG_IGN) // delivered through the dispatch source instead
             let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
@@ -265,7 +335,9 @@ final class HeadlessRunner {
         var text = "\(sessions.count) session\(sessions.count == 1 ? "" : "s")\n"
         for session in sessions {
             let state = SessionListing.stateLabel(session).padding(toLength: 8, withPad: " ", startingAt: 0)
-            text += "  \(state) \(session.key)  \(session.title) — \(SessionListing.detail(session, now: now))\n"
+            let printable = SessionListing.printable
+            text += "  \(state) \(printable(session.key.description))  \(printable(session.title))"
+                + " — \(printable(SessionListing.detail(session, now: now)))\n"
         }
         FileHandle.standardOutput.write(Data(text.utf8))
     }
@@ -306,5 +378,18 @@ enum SessionListing {
 
     static func detail(_ session: TrackedSession, now: Date) -> String {
         MenuRowText.detail(for: session, now: now)
+    }
+
+    /// "  claude:9eb4…  AI Track", as the listings print it.
+    static func keyAndTitle(_ session: TrackedSession) -> String {
+        "  \(printable(session.key.description))  \(printable(session.title))"
+    }
+
+    /// `text` without the control characters a terminal would act on.
+    /// Titles come from transcripts, pasted prompts and model output, ids and
+    /// projects from files and directory names (see
+    /// `Formatting.withoutControlCharacters`).
+    static func printable(_ text: String) -> String {
+        Formatting.withoutControlCharacters(text)
     }
 }

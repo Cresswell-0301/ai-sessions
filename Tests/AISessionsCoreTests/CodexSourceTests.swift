@@ -25,9 +25,13 @@ final class CodexSourceTests: XCTestCase {
 
     // MARK: Fixtures
 
-    private func makeSource(recentHours: Double = 12, homes: [URL]? = nil) -> CodexSource {
+    /// `codexAlive` stands in for the process table: by default a Codex
+    /// app-server is running, as it is while VS Code is open.
+    private func makeSource(recentHours: Double = 12, homes: [URL]? = nil,
+                            codexAlive: @escaping () -> Bool = { true }) -> CodexSource {
         let source = CodexSource(homes: homes ?? [home], recentHours: recentHours)
         source.logger = { _ in }
+        source.codexProcessExists = codexAlive
         return source
     }
 
@@ -148,6 +152,9 @@ final class CodexSourceTests: XCTestCase {
         XCTAssertEqual(source.poll(now: t0 + 10).map(\.key.id), [idA])
     }
 
+    /// Pinned "running: kept" for a thread quiet for 13 h until review
+    /// finding 2: a turn that has written nothing for 3 h is abandoned, and
+    /// then dropped with the idle ones once the recency window has passed.
     func testRecencyWindowAndRunningThreads() throws {
         let now = Date()
         try writeRollout(idA, completed(idA), modified: now - 13 * 3600)
@@ -156,9 +163,16 @@ final class CodexSourceTests: XCTestCase {
         let source = makeSource(recentHours: 12)
 
         XCTAssertEqual(source.poll(now: now).map(\.key.id), [idB, idC], "a rollout quiet for 13 h is not picked up")
+        let quiet = source.poll(now: now + 2 * 3600)
+        XCTAssertEqual(quiet.map(\.key.id), [idB, idC])
+        XCTAssertEqual(quiet.last?.state, .running, "2 h of quiet with an app-server alive: a long turn, maybe")
+        let abandoned = source.poll(now: now + 4 * 3600)
+        XCTAssertEqual(abandoned.map(\.key.id), [idB, idC], "still within the recency window")
+        XCTAssertEqual(abandoned.last?.state, .idle, "4 h without a write: the turn died with its app-server")
+        XCTAssertEqual(abandoned.last?.turnEnd, .abandoned)
         let later = now + 13 * 3600
-        XCTAssertEqual(source.poll(now: later).map(\.key.id), [idC], "idle and quiet: dropped; running: kept")
-        XCTAssertEqual(source.poll(now: later + 10).map(\.key.id), [idC], "a dropped thread is not rediscovered")
+        XCTAssertEqual(source.poll(now: later).map(\.key.id), [], "quiet for 13 h: dropped, the abandoned one too")
+        XCTAssertEqual(source.poll(now: later + 10).map(\.key.id), [], "a dropped thread is not rediscovered")
     }
 
     func testDeletedRolloutEndsTheThread() throws {
@@ -174,7 +188,7 @@ final class CodexSourceTests: XCTestCase {
         try writeRollout(idA, "this is not a rollout\n" + F.taskStarted("2026-10-01T03:00:01.000Z"))
         try writeRollout(idB, "")
         try writeRollout(idC, F.meta(id: idC) + "{\"half\n" + "[1,2]\n" + F.taskStarted("2026-10-01T03:00:01.000Z"))
-        let source = makeSource()
+        let source = makeSource(recentHours: 1)
         let t0 = Date()
         XCTAssertEqual(source.poll(now: t0).map(\.key.id), [idC])
         XCTAssertEqual(source.poll(now: t0).first?.state, .running)
@@ -185,9 +199,12 @@ final class CodexSourceTests: XCTestCase {
         XCTAssertEqual(source.poll(now: t0 + 1).map(\.key.id), [idB, idC])
         XCTAssertEqual(source.trackedRolloutCount, 3)
 
-        // Once quiet, the unreadable one is let go; the running ones stay.
-        XCTAssertEqual(source.poll(now: t0 + 13 * 3600).map(\.key.id), [idB, idC])
+        // Once quiet, the unreadable one is let go; the running ones stay
+        // while an app-server lives, until they have been quiet for 3 h.
+        XCTAssertEqual(source.poll(now: t0 + 2 * 3600).map(\.key.id), [idB, idC])
         XCTAssertEqual(source.trackedRolloutCount, 2)
+        XCTAssertEqual(source.poll(now: t0 + 4 * 3600).map(\.key.id), [], "abandoned, and outside the 1 h window")
+        XCTAssertEqual(source.trackedRolloutCount, 0)
     }
 
     func testOneObservationPerThreadAcrossHomes() throws {
@@ -197,6 +214,115 @@ final class CodexSourceTests: XCTestCase {
         let observations = makeSource(homes: [home, second]).poll(now: Date())
         XCTAssertEqual(observations.count, 1)
         XCTAssertEqual(observations.first?.state, .running, "the rollout written last wins")
+    }
+
+    // MARK: Abandoned turns
+
+    private func setModified(_ url: URL, _ date: Date) throws {
+        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
+    }
+
+    /// The current time on a whole second: an mtime set from a fractional
+    /// date reads back a few nanoseconds off, which matters at a boundary.
+    private func wholeSecondNow() -> Date {
+        Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
+    }
+
+    func testAQuietUnfinishedTurnIsAbandonedAfterThreeHours() throws {
+        let now = wholeSecondNow()
+        let modified = now - 60
+        try writeRollout(idA, running(idA), modified: modified)
+        try writeRollout(idB, running(idB) + F.approvalRequest("2026-10-01T03:00:04.000Z"), modified: modified)
+        let source = makeSource()
+        XCTAssertEqual(source.poll(now: now).map(\.state), [.running, .waiting])
+
+        let almost = source.poll(now: modified + 3 * 3600 - 1)
+        XCTAssertEqual(almost.map(\.state), [.running, .waiting], "an app-server is alive: a long turn, maybe")
+        XCTAssertEqual(almost.map(\.turnEnd), [nil, nil])
+
+        let given = source.poll(now: modified + 3 * 3600)
+        XCTAssertEqual(given.map(\.state), [.idle, .idle], "3 h without a single write")
+        XCTAssertEqual(given.map(\.turnEnd), [.abandoned, .abandoned])
+        XCTAssertEqual(given.map(\.rawStatus), ["abandoned", "abandoned"])
+        let since = try XCTUnwrap(given.first?.stateSince)
+        XCTAssertEqual(since, modified, "idle since the rollout went quiet")
+        XCTAssertEqual(source.poll(now: modified + 5 * 3600).first?.stateSince, since, "a time that stays put")
+    }
+
+    func testWithNoCodexProcessLeftAQuietTurnIsAbandonedAfterTwoMinutes() throws {
+        let now = wholeSecondNow()
+        try writeRollout(idA, running(idA), modified: now)
+        var scans = 0
+        let source = makeSource(codexAlive: { scans += 1; return false })
+        XCTAssertEqual(source.poll(now: now + 119).map(\.state), [.running])
+        XCTAssertEqual(scans, 0, "quiet for less than 2 min: no reason to look")
+        let given = try XCTUnwrap(source.poll(now: now + 120).first)
+        XCTAssertEqual(given.state, .idle)
+        XCTAssertEqual(given.turnEnd, .abandoned)
+        XCTAssertEqual(scans, 1)
+    }
+
+    func testTheProcessTableIsScannedAtMostEvery30Seconds() throws {
+        let now = wholeSecondNow()
+        try writeRollout(idA, running(idA), modified: now)
+        try writeRollout(idB, running(idB), modified: now)
+        try writeRollout(idC, completed(idC), modified: now - 3600)
+        var scans = 0
+        let source = makeSource(codexAlive: { scans += 1; return true })
+        for second in stride(from: 0.0, to: 120, by: 7) { _ = source.poll(now: now + second) }
+        XCTAssertEqual(scans, 0, "finished threads and fresh turns never need it")
+        for second in stride(from: 120.0, to: 150, by: 1) { _ = source.poll(now: now + second) }
+        XCTAssertEqual(scans, 1, "one scan for both quiet turns, not again within 30 s")
+        _ = source.poll(now: now + 150)
+        XCTAssertEqual(scans, 2)
+    }
+
+    func testAnAbandonedTurnStaysAbandonedUntilTheThreadShowsActivity() throws {
+        let now = wholeSecondNow()
+        let url = try writeRollout(idA, running(idA), modified: now)
+        let source = makeSource(codexAlive: { false })
+        let given = try XCTUnwrap(source.poll(now: now + 180).first)
+        XCTAssertEqual(given.turnEnd, .abandoned)
+
+        // Opening the thread again re-writes its meta line: not a sign of life.
+        try append(F.meta(id: idA, time: "2026-10-01T05:00:00.000Z"), to: url)
+        try setModified(url, now + 185)
+        let reopened = try XCTUnwrap(source.poll(now: now + 190).first)
+        XCTAssertEqual(reopened.state, .idle)
+        XCTAssertEqual(reopened.turnEnd, .abandoned)
+        XCTAssertEqual(reopened.stateSince, given.stateSince, "still idle since the turn went quiet")
+
+        // A message is: the turn was alive after all.
+        try append(F.agentMessage("2026-10-01T05:00:01.000Z", "Back at it."), to: url)
+        try setModified(url, now + 189)
+        let alive = try XCTUnwrap(source.poll(now: now + 191).first)
+        XCTAssertEqual(alive.state, .running)
+        XCTAssertNil(alive.turnEnd)
+        XCTAssertEqual(alive.lastMessage, "Back at it.")
+
+        try append(F.taskComplete("2026-10-01T05:00:09.000Z", message: "Finished."), to: url)
+        try setModified(url, now + 191.5)
+        let done = try XCTUnwrap(source.poll(now: now + 192).first)
+        XCTAssertEqual(done.state, .idle)
+        XCTAssertEqual(done.turnEnd, .completed)
+    }
+
+    func testStopAndCompletionAreReportedAsTurnEnds() throws {
+        try writeRollout(idA, completed(idA))
+        try writeRollout(idB, running(idB) + F.turnAborted("2026-10-01T03:00:05.000Z"))
+        try writeRollout(idC, running(idC))
+        let byId = Dictionary(uniqueKeysWithValues: makeSource().poll(now: Date()).map { ($0.key.id, $0) })
+        XCTAssertEqual(byId[idA]?.turnEnd, .completed)
+        XCTAssertEqual(byId[idB]?.turnEnd, .interrupted)
+        XCTAssertEqual(byId[idB]?.rawStatus, "turn_aborted")
+        XCTAssertNil(byId[idC]?.turnEnd)
+    }
+
+    func testTheProcessScanFindsALiveExecutableByItsPathSuffix() throws {
+        let own = try XCTUnwrap(ProcessKit.path(getpid()))
+        XCTAssertTrue(CodexProcesses.anyRunning(executableSuffix: "/" + (own as NSString).lastPathComponent),
+                      "this test runner, among every process on the machine")
+        XCTAssertFalse(CodexProcesses.anyRunning(executableSuffix: "/no-such-executable-\(UUID().uuidString)"))
     }
 
     // MARK: Discovery

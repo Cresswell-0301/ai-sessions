@@ -43,7 +43,8 @@ final class ClaudeTranscriptTests: XCTestCase {
         ]))
         XCTAssertEqual(try ClaudeTranscript.readTail(of: url), TranscriptInfo(
             customTitle: "AI Track", aiTitle: "Session tracking and notifications system",
-            lastPrompt: "second prompt", lastAssistantText: "Newest answer"))
+            lastPrompt: "second prompt", lastAssistantText: "Newest answer",
+            lastTurnEnd: TranscriptTurnEnd(.completed)))
     }
 
     func testLastAssistantTextIsTheNewestEntryThatHasText() throws {
@@ -106,7 +107,9 @@ final class ClaudeTranscriptTests: XCTestCase {
                 + F.lines([F.lastPrompt("latest", session: session), F.assistant(["latest answer"], session: session)]))
         XCTAssertNil(try ClaudeTranscript.readTail(of: url).aiTitle, "precondition: the title is not in the tail")
         XCTAssertEqual(try ClaudeTranscript.read(url), TranscriptInfo(
-            aiTitle: "Deep title", lastPrompt: "latest", lastAssistantText: "latest answer"))
+            aiTitle: "Deep title", lastPrompt: "latest", lastAssistantText: "latest answer",
+            lastTurnEnd: TranscriptTurnEnd(.completed), restingTurnEnd: TranscriptTurnEnd(.completed)),
+            "nothing was said after the answer, so the conversation rests on it")
     }
 
     func testBackwardScanStopsAtFourMegabytes() throws {
@@ -134,13 +137,15 @@ final class ClaudeTranscriptTests: XCTestCase {
         let cache = ClaudeTranscriptCache(sessionId: session, configDir: configDir, cwd: "/p")
         XCTAssertNotNil(cache.currentStamp(now: Date()))
         try cache.refresh()
-        XCTAssertEqual(cache.info, TranscriptInfo(lastAssistantText: "hello"))
+        XCTAssertEqual(cache.info, TranscriptInfo(lastAssistantText: "hello", lastTurnEnd: TranscriptTurnEnd(.completed),
+                                                  restingTurnEnd: TranscriptTurnEnd(.completed)))
         XCTAssertEqual(cache.titleScanCount, 1, "no title in the tail: one backward scan")
 
         try append(F.filler(totalBytes: 300_000, session: session), to: url)
         try cache.refresh()
         XCTAssertEqual(cache.titleScanCount, 1, "the scan found nothing; it is not repeated for this file")
         XCTAssertEqual(cache.info.lastAssistantText, "hello", "kept after scrolling out of the tail")
+        XCTAssertEqual(cache.info.lastTurnEnd, TranscriptTurnEnd(.completed), "so is how the last turn ended")
 
         try append(F.line(F.aiTitle("Named later", session: session)), to: url)
         try cache.refresh()
@@ -157,6 +162,76 @@ final class ClaudeTranscriptTests: XCTestCase {
         XCTAssertNotNil(cache.currentStamp(now: Date()))
         try cache.refresh()
         XCTAssertEqual(cache.info, TranscriptInfo(aiTitle: "Fresh"))
+    }
+
+    // MARK: Turn ends
+
+    /// An assistant entry as Claude writes it, with an explicit stop reason
+    /// (null while a turn goes on) and timestamp.
+    private func answer(_ text: String, stop: String?, at time: String? = nil,
+                        sidechain: Bool = false) -> [String: Any] {
+        var entry = F.assistant([text], session: session, sidechain: sidechain)
+        var message = entry["message"] as! [String: Any]
+        message["stop_reason"] = stop ?? NSNull()
+        entry["message"] = message
+        entry["timestamp"] = time
+        return entry
+    }
+
+    private func user(_ content: Any, at time: String? = nil, sidechain: Bool = false) -> [String: Any] {
+        var entry: [String: Any] = ["type": "user", "sessionId": session, "isSidechain": sidechain,
+                                    "message": ["role": "user", "content": content] as [String: Any]]
+        entry["timestamp"] = time
+        return entry
+    }
+
+    private func date(_ text: String) -> Date { CodexLine.date(text)! }
+
+    func testTheNewestTurnEndIsTheLaterOfAnEndTurnAnswerAndAnInterruptMarker() throws {
+        let interruptedThenAnswered = try write(F.lines([
+            user("[Request interrupted by user]", at: "2026-10-01T03:00:00.000Z"),
+            user("try again", at: "2026-10-01T03:01:00.000Z"),
+            answer("Done.", stop: "end_turn", at: "2026-10-01T03:02:00.250Z"),
+            user("thanks"),
+        ]), name: "answered.jsonl")
+        XCTAssertEqual(try ClaudeTranscript.readTail(of: interruptedThenAnswered).lastTurnEnd,
+                       TranscriptTurnEnd(.completed, at: date("2026-10-01T03:02:00.250Z")))
+
+        let answeredThenInterrupted = try write(F.lines([
+            answer("Earlier answer.", stop: "end_turn", at: "2026-10-01T03:00:00.000Z"),
+            user("run the migration", at: "2026-10-01T03:01:00.000Z"),
+            answer("Running it.", stop: "tool_use", at: "2026-10-01T03:01:05.000Z"),
+            user([["type": "tool_result", "tool_use_id": "toolu_1", "is_error": true,
+                   "content": "The user doesn't want to proceed with this tool use."]],
+                 at: "2026-10-01T03:01:09.000Z"),
+            user([["type": "text", "text": "[Request interrupted by user for tool use]"]], at: "2026-10-01T03:01:09.000Z"),
+        ]), name: "interrupted.jsonl")
+        XCTAssertEqual(try ClaudeTranscript.readTail(of: answeredThenInterrupted).lastTurnEnd,
+                       TranscriptTurnEnd(.interrupted, at: date("2026-10-01T03:01:09.000Z")))
+    }
+
+    func testOnlyRealTurnEndsCount() throws {
+        let url = try write(F.lines([
+            answer("The real end.", stop: "end_turn", at: "2026-10-01T03:00:00.000Z"),
+            // None of these ends the session's turn:
+            answer("Mid-turn, about to call a tool.", stop: "tool_use", at: "2026-10-01T03:01:00.000Z"),
+            answer("Streamed before its stop reason.", stop: nil, at: "2026-10-01T03:01:01.000Z"),
+            answer("A sub-agent finished.", stop: "end_turn", at: "2026-10-01T03:01:02.000Z", sidechain: true),
+            user("[Request interrupted by user]", at: "2026-10-01T03:01:03.000Z", sidechain: true),
+            user([["type": "tool_result", "tool_use_id": "toolu_1",
+                   "content": "[Request interrupted by user] quoted in a file the agent read"]],
+                 at: "2026-10-01T03:01:04.000Z"),
+            user("why did you print [Request interrupted by user]?", at: "2026-10-01T03:01:05.000Z"),
+        ]))
+        XCTAssertEqual(try ClaudeTranscript.readTail(of: url).lastTurnEnd,
+                       TranscriptTurnEnd(.completed, at: date("2026-10-01T03:00:00.000Z")))
+    }
+
+    func testATurnEndWithoutATimestampIsStillATurnEnd() throws {
+        let url = try write(F.lines([user("[Request interrupted by user]")]))
+        XCTAssertEqual(try ClaudeTranscript.readTail(of: url).lastTurnEnd, TranscriptTurnEnd(.interrupted))
+        let none = try write(F.lines([user("hello"), answer("Thinking out loud.", stop: nil)]), name: "none.jsonl")
+        XCTAssertNil(try ClaudeTranscript.readTail(of: none).lastTurnEnd)
     }
 
     // MARK: Locating

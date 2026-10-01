@@ -51,7 +51,7 @@ enum ClaudeFixtures {
     static func recordData(pid: Int32, sessionId: String, status: String, updatedAt: Double,
                            procStart: String?, entrypoint: String = "claude-vscode",
                            kind: String = "interactive", name: String? = nil,
-                           cwd: String = "/work/demo-app") -> Data {
+                           cwd: String = "/work/demo-app", waitingFor: String? = nil) -> Data {
         var record: [String: Any] = [
             "pid": pid, "sessionId": sessionId, "cwd": cwd, "startedAt": updatedAt - 60_000,
             "version": "2.1.284", "peerProtocol": 1, "kind": kind, "entrypoint": entrypoint,
@@ -59,6 +59,7 @@ enum ClaudeFixtures {
         ]
         record["procStart"] = procStart
         record["name"] = name
+        record["waitingFor"] = waitingFor
         return try! JSONSerialization.data(withJSONObject: record, options: [.withoutEscapingSlashes])
     }
 
@@ -244,6 +245,39 @@ final class ClaudeRegistryTests: XCTestCase {
         XCTAssertEqual(ClaudeRegistry.activityState(status: "idle"), .idle)
         XCTAssertEqual(ClaudeRegistry.activityState(status: nil), .idle)
         XCTAssertEqual(ClaudeRegistry.activityState(status: "compacting"), .idle, "unknown future values are idle")
+    }
+
+    /// What claude 2.1.284 writes as `waitingFor`: only "dialog open" (a
+    /// slash-command dialog the user opened in the terminal) waits on nobody.
+    func testOnlyAnOpenDialogIsNotWaiting() throws {
+        let table: [(status: String?, waitingFor: String?, state: ActivityState, raw: String?)] = [
+            ("waiting", "dialog open", .idle, "waiting:dialog open"),
+            ("waiting", "permission prompt", .waiting, "waiting:permission prompt"),
+            ("waiting", "input needed", .waiting, "waiting:input needed"),
+            ("waiting", "worker request", .waiting, "waiting:worker request"),
+            ("waiting", "sandbox request", .waiting, "waiting:sandbox request"),
+            ("waiting", "some future reason", .waiting, "waiting:some future reason"),
+            ("waiting", nil, .waiting, "waiting"),
+            ("waiting", "", .waiting, "waiting"),
+            ("busy", "dialog open", .running, "busy"),
+            ("idle", nil, .idle, "idle"),
+            (nil, nil, .idle, nil),
+        ]
+        for row in table {
+            let label = "\(row.status ?? "nil") / \(row.waitingFor ?? "nil")"
+            XCTAssertEqual(ClaudeRegistry.activityState(status: row.status, waitingFor: row.waitingFor), row.state, label)
+            XCTAssertEqual(ClaudeRegistry.rawStatus(status: row.status, waitingFor: row.waitingFor), row.raw, label)
+        }
+
+        let dialog = try XCTUnwrap(parse(#"{"pid":12,"sessionId":"abc-1","status":"waiting","waitingFor":"dialog open"}"#))
+        XCTAssertEqual(dialog.waitingFor, "dialog open")
+        XCTAssertTrue(dialog.isShowingDialog)
+        let prompt = try XCTUnwrap(parse(#"{"pid":12,"sessionId":"abc-1","status":"waiting","waitingFor":"permission prompt"}"#))
+        XCTAssertFalse(prompt.isShowingDialog)
+        let odd = try XCTUnwrap(parse(#"{"pid":12,"sessionId":"abc-1","status":"waiting","waitingFor":3}"#),
+                                "a waitingFor of another type does not hide the session")
+        XCTAssertNil(odd.waitingFor)
+        XCTAssertEqual(ClaudeRegistry.activityState(status: odd.status, waitingFor: odd.waitingFor), .waiting)
     }
 
     func testInteractiveClassificationMirrorsTheExtension() {

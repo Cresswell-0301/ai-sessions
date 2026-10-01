@@ -42,12 +42,13 @@ public enum Router {
         }
         var hostPid = extensionHostPid(of: session)
         var family = hostPid.flatMap(ProcessKit.path).map(EditorFamily.forAppBundle) ?? .vscode
+        let route: RoutePlan
         switch session.key.agent {
         case .claude:
             let windowId = hostPid.flatMap {
                 VSCodeWindowIndex.windowId(forExtensionHostPid: $0, family: family, logsRoot: lookup.logsRoot)
             }
-            return plan(for: session, family: family, windowId: windowId, liveWindows: 0)
+            route = plan(for: session, family: family, windowId: windowId, liveWindows: 0)
         case .codex:
             var live = VSCodeWindowIndex.liveWindowCount(family: family, logsRoot: lookup.logsRoot)
             // One live window needs no window id. None suggests the thread is in
@@ -65,8 +66,41 @@ public enum Router {
             let windowId = live > 1 ? hostPid.flatMap {
                 VSCodeWindowIndex.windowId(forExtensionHostPid: $0, family: family, logsRoot: lookup.logsRoot)
             } : nil
-            return plan(for: session, family: family, windowId: windowId, liveWindows: live)
+            route = plan(for: session, family: family, windowId: windowId, liveWindows: live)
         }
+        return flaggingPrefixMatches(route, key: session.key, family: family, lookup: lookup)
+    }
+
+    /// VS Code's `URLHandlerRouter` (main process) finds the window for
+    /// `windowId=<n>` with the unanchored regex `window:<n>` and takes the
+    /// first IPC connection that matches, so a link for window 1 reaches
+    /// window 12 when 12 connected first (a window reconnects at the end on
+    /// Reload Window or Open Folder; ids are never reused while VS Code runs).
+    /// No link can avoid that, so the plan and the log say when it can happen.
+    private static func flaggingPrefixMatches(_ route: RoutePlan, key: SessionKey, family: EditorFamily, lookup: Lookup) -> RoutePlan {
+        guard let target = linkedWindowId(route.url) else { return route }
+        let rivals = confusableWindowIds(
+            for: target, among: VSCodeWindowIndex.liveWindowIds(family: family, logsRoot: lookup.logsRoot))
+        guard !rivals.isEmpty else { return route }
+        let windows = rivals.count == 1 ? "window \(rivals[0])" : "windows " + rivals.map(String.init).joined(separator: ", ")
+        let warning = "\(family.appName) may deliver windowId=\(target) to \(windows) (it matches window ids by prefix)"
+        Log.shared.warn("route \(key): \(warning)")
+        var flagged = route
+        flagged.summary += "; warning: " + warning
+        return flagged
+    }
+
+    /// The live window ids, other than `windowId`, that VS Code's unanchored
+    /// `window:<id>` match also accepts: those whose decimal id starts with it.
+    static func confusableWindowIds(for windowId: Int, among liveIds: [Int]) -> [Int] {
+        let target = String(windowId)
+        return Set(liveIds).filter { $0 != windowId && String($0).hasPrefix(target) }.sorted()
+    }
+
+    /// The `windowId` a deep link carries, as VS Code reads it from the query.
+    static func linkedWindowId(_ url: URL?) -> Int? {
+        guard let url, let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return nil }
+        return items.first { $0.name == "windowId" }?.value.flatMap { Int($0) }
     }
 
     /// Pure planning from already-resolved facts. `liveWindows` only matters
@@ -90,6 +124,11 @@ public enum Router {
             if url != nil {
                 let place = linkWindow.map { "\(family.appName) window \($0)" } ?? "\(family.appName) (last active window)"
                 summary = "Open \(what) in \(place)"
+            } else if family.urlScheme.isEmpty {
+                // An editor whose own files named no usable scheme (see EditorFamily).
+                summary = family.bundleIdentifier != nil
+                    ? "Activate \(family.appName): it has no known URL scheme to deep-link with"
+                    : "Nothing to route to: \(family.appName) has no known URL scheme or bundle id"
             } else if family.bundleIdentifier != nil {
                 summary = "Activate \(family.appName): \(what) id \"\(session.key.id)\" cannot be deep-linked"
             } else {
@@ -165,9 +204,7 @@ public enum Router {
 
     private static func deepLink(scheme: String, host: String, path: String, query: [URLQueryItem]) -> URL? {
         // URLComponents raises on an invalid scheme rather than returning nil.
-        guard let first = scheme.unicodeScalars.first, first.isASCII, CharacterSet.letters.contains(first),
-              scheme.unicodeScalars.allSatisfy({ $0.isASCII && (CharacterSet.alphanumerics.contains($0) || "+-.".unicodeScalars.contains($0)) })
-        else { return nil }
+        guard EditorFamily.isURLScheme(scheme) else { return nil }
         var components = URLComponents()
         components.scheme = scheme
         components.host = host

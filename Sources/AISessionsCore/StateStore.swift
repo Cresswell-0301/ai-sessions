@@ -15,6 +15,8 @@ public final class StateStore {
         public var turnStartedAt: Date?
         /// Lets a restored unread row still say how long its turn took.
         public var lastTurnDuration: TimeInterval?
+        /// How that turn ended, restored with it.
+        public var lastTurnEnd: TurnEnd?
         public var unread: Bool
         /// The session stopped being reported while the app was watching, or
         /// was already gone when the app came back. Such a record still
@@ -23,17 +25,30 @@ public final class StateStore {
         /// reload) rather than finishing a turn while the app was away.
         public var ended: Bool
         public var lastSeen: Date
+        /// The process that was running the session (Claude; Codex threads
+        /// have none). A turn that "finished" while the app was down counts
+        /// only if the same process still holds the session: a resumed one
+        /// in a new process means the turn died with the old process.
+        /// Optional, so files written before it existed still load.
+        public var pid: Int32?
+        /// That process's start time as the source wrote it, so a reused pid
+        /// is not mistaken for the same process.
+        public var procStart: String?
 
         public init(state: ActivityState, stateSince: Date? = nil, turnStartedAt: Date? = nil,
                     lastTurnDuration: TimeInterval? = nil, unread: Bool = false,
-                    ended: Bool = false, lastSeen: Date) {
+                    ended: Bool = false, lastSeen: Date, pid: Int32? = nil, procStart: String? = nil,
+                    lastTurnEnd: TurnEnd? = nil) {
             self.state = state
             self.stateSince = stateSince
             self.turnStartedAt = turnStartedAt
             self.lastTurnDuration = lastTurnDuration
+            self.lastTurnEnd = lastTurnEnd
             self.unread = unread
             self.ended = ended
             self.lastSeen = lastSeen
+            self.pid = pid
+            self.procStart = procStart
         }
     }
 

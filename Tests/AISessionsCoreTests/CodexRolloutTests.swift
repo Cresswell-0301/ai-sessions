@@ -172,6 +172,7 @@ final class CodexRolloutTests: XCTestCase {
         XCTAssertEqual(reader.state, .idle)
         XCTAssertEqual(reader.stateSince, F.date("2026-10-01T03:00:09.316Z"))
         XCTAssertEqual(reader.rawStatus, "task_complete")
+        XCTAssertEqual(reader.turnEnd, .completed)
         XCTAssertEqual(reader.lastMessage, "Pulled 3 commits; the tree is clean.")
         XCTAssertEqual(reader.firstUserMessage, "pull the latest changes")
         XCTAssertEqual(reader.offset, try size(of: url))
@@ -207,8 +208,20 @@ final class CodexRolloutTests: XCTestCase {
 
         XCTAssertEqual(reader.state, .idle)
         XCTAssertEqual(reader.rawStatus, "turn_aborted")
+        XCTAssertEqual(reader.turnEnd, .interrupted, "Stop: the turn did not finish its answer")
         XCTAssertEqual(reader.stateSince, F.date("2026-10-01T03:00:05.500Z"))
         XCTAssertEqual(reader.lastMessage, "Starting.")
+
+        try append(F.taskStarted("2026-10-01T03:01:00.000Z"), to: url)
+        reader.update()
+        XCTAssertNil(reader.turnEnd, "a new turn has not ended")
+        try append(F.approvalRequest("2026-10-01T03:01:05.000Z"), to: url)
+        reader.update()
+        XCTAssertNil(reader.turnEnd)
+        try append(F.responseItem("2026-10-01T03:01:30.000Z", type: "function_call_output")
+                   + F.taskComplete("2026-10-01T03:02:00.000Z", message: "Done."), to: url)
+        reader.update()
+        XCTAssertEqual(reader.turnEnd, .completed)
     }
 
     func testThreadWithoutTurnsIsIdleSinceCreationThenCapturesFirstPrompt() throws {
@@ -218,6 +231,7 @@ final class CodexRolloutTests: XCTestCase {
         XCTAssertEqual(reader.state, .idle)
         XCTAssertEqual(reader.stateSince, F.date("2026-10-01T02:59:59.000Z"))
         XCTAssertNil(reader.rawStatus)
+        XCTAssertNil(reader.turnEnd, "no turn has ended")
         XCTAssertNil(reader.firstUserMessage)
 
         try append(F.taskStarted("2026-10-01T03:00:01.000Z")
@@ -527,6 +541,7 @@ final class CodexRolloutTests: XCTestCase {
         XCTAssertEqual(reader.state, .idle)
         XCTAssertEqual(reader.stateSince, F.date("2026-10-01T03:20:01.000Z"))
         XCTAssertEqual(reader.rawStatus, "task_complete")
+        XCTAssertEqual(reader.turnEnd, .completed, "found before the tail")
         // The turn ended with a null message; the agent's last words sit before the tail.
         XCTAssertEqual(reader.lastMessage, "Final notes.")
         XCTAssertEqual(reader.firstUserMessage, "audit the ledger")
@@ -565,6 +580,7 @@ final class CodexRolloutTests: XCTestCase {
 
         XCTAssertEqual(reader.state, .running)
         XCTAssertNil(reader.stateSince)
+        XCTAssertNil(reader.turnEnd)
         XCTAssertLessThan(reader.bytesRead, 2_000_000)
     }
 

@@ -106,12 +106,27 @@ struct MenuSections: Equatable {
     }
 }
 
+/// config.json cannot be used (unreadable, or not a JSON object): why, and
+/// what runs instead. A menu row says so until the file reads again, since a
+/// log line alone goes unseen while settings quietly differ from the file.
+struct ConfigProblem: Equatable {
+    var reason: String
+    /// Nothing better to keep: a launch with a broken file and no last good
+    /// copy runs on the defaults.
+    var usingDefaults: Bool
+
+    var menuTitle: String {
+        "config.json has an error — using \(usingDefaults ? "default" : "previous") settings"
+    }
+}
+
 /// The text and icon of one session row.
 enum MenuRowText {
     /// "coreOS · Claude · 4m": project, agent, time in the current state.
     static func detail(for session: TrackedSession, now: Date) -> String {
         var parts = [session.project, session.key.agent.displayName].filter { !$0.isEmpty }
         if let since = session.stateSince { parts.append(Formatting.duration(now.timeIntervalSince(since))) }
+        if session.rawStatus == ClaudeSource.answeredWhileBusy { parts.append("background work running") }
         return parts.joined(separator: " · ")
     }
 
@@ -142,6 +157,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     private var paused = false
     private var shown: StatusSummary?
     private var permission: Notifier.Permission = .unknown
+    private var configProblem: ConfigProblem?
 
     static let autosaveName = "ai-sessions"
     /// Where a first launch places the item: macOS orders status items by
@@ -172,6 +188,11 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     /// Shown as a fix-it row at the top of the menu when banners cannot appear.
     func setNotificationPermission(_ permission: Notifier.Permission) {
         self.permission = permission
+    }
+
+    /// Shown as a row that opens config.json while the file cannot be used.
+    func setConfigProblem(_ problem: ConfigProblem?) {
+        configProblem = problem
     }
 
     static func permissionFixTitle(_ permission: Notifier.Permission) -> String? {
@@ -207,6 +228,13 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
             let row = item(fix, #selector(openNotificationSettings))
             row.image = Self.image("exclamationmark.triangle.fill", tint: .attention, pointSize: 13,
                                    description: "Notifications need attention")
+            menu.addItem(row)
+        }
+        if let problem = configProblem {
+            let row = item(problem.menuTitle, #selector(openConfig))
+            row.image = Self.image("exclamationmark.triangle.fill", tint: .attention, pointSize: 13,
+                                   description: "config.json has an error")
+            row.toolTip = problem.reason
             menu.addItem(row)
         }
 
@@ -271,7 +299,10 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     private static func image(_ name: String, tint: SymbolTint, pointSize: CGFloat, description: String) -> NSImage? {
         var configuration = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .regular)
         if let color = tint.color {
-            configuration = configuration.applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+            // Two colors: the glyph inside (a count, a check, a "!") stays
+            // white. With one, it takes the shape's color and vanishes,
+            // leaving a plain dot in the menu bar.
+            configuration = configuration.applying(NSImage.SymbolConfiguration(paletteColors: [.white, color]))
         }
         let image = NSImage(systemSymbolName: name, accessibilityDescription: description)?
             .withSymbolConfiguration(configuration)
@@ -313,6 +344,12 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
 
     @objc private func openFolder() {
         NSWorkspace.shared.open(AppPaths.home)
+    }
+
+    /// In the app that opens JSON; in Finder when there is none.
+    @objc private func openConfig() {
+        let url = AppPaths.home.appendingPathComponent("config.json")
+        if !NSWorkspace.shared.open(url) { NSWorkspace.shared.activateFileViewerSelecting([url]) }
     }
 
     @objc private func openNotificationSettings() {

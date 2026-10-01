@@ -1,6 +1,32 @@
 import XCTest
 @testable import AISessionsCore
 
+/// Editor app bundles for the family tests, shared with RouterTests.
+enum EditorBundleFixture {
+    /// An app bundle `<root>/Applications/<name>.app` with an Info.plist,
+    /// Electron's framework unless `electron` is false, and, when `product`
+    /// is given, VS Code's `Contents/Resources/app/product.json`. Returns the
+    /// path of its extension host, a helper app deep inside it.
+    static func make(in root: URL, _ name: String, bundleIdentifier: String?, product: [String: String]?,
+                     electron: Bool = true) throws -> String {
+        let contents = root.appendingPathComponent("Applications/\(name).app/Contents", isDirectory: true)
+        let app = contents.appendingPathComponent("Resources/app", isDirectory: true)
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        if electron {
+            try FileManager.default.createDirectory(
+                at: contents.appendingPathComponent("Frameworks/Electron Framework.framework"), withIntermediateDirectories: true)
+        }
+        var info: [String: Any] = ["CFBundleName": name, "CFBundlePackageType": "APPL"]
+        if let bundleIdentifier { info["CFBundleIdentifier"] = bundleIdentifier }
+        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            .write(to: contents.appendingPathComponent("Info.plist"))
+        if let product {
+            try JSONSerialization.data(withJSONObject: product).write(to: app.appendingPathComponent("product.json"))
+        }
+        return contents.path + "/Frameworks/\(name) Helper (Plugin).app/Contents/MacOS/\(name) Helper (Plugin)"
+    }
+}
+
 final class VSCodeWindowsTests: XCTestCase {
     private var tmp: URL!
     private var logsRoot: URL { tmp.appendingPathComponent("logs", isDirectory: true) }
@@ -40,8 +66,28 @@ final class VSCodeWindowsTests: XCTestCase {
         try handle.write(contentsOf: Data(text.utf8))
     }
 
+    /// What a `code <path>` launch (or `git commit` with `code --wait` as the
+    /// editor) leaves while VS Code runs: a newer session dir holding only
+    /// main.log. VS Code prunes old dirs only at startup, so they pile up.
+    private func cliLaunch(_ session: String) throws {
+        let dir = logsRoot.appendingPathComponent(session, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data("2099-01-01 10:10:00.000 [info] Sending env to running instance...\n".utf8)
+            .write(to: dir.appendingPathComponent("main.log"))
+    }
+
+    /// Session dir names newer than the fixtures' "20990101T000000" launch.
+    private func cliSession(_ n: Int) -> String {
+        String(format: "20990101T0010%02d", n)
+    }
+
     private func load() -> VSCodeWindowIndex {
         VSCodeWindowIndex.load(family: .vscode, logsRoot: logsRoot)
+    }
+
+    private func makeBundle(_ name: String, bundleIdentifier: String?, product: [String: String]?,
+                            electron: Bool = true) throws -> String {
+        try EditorBundleFixture.make(in: tmp, name, bundleIdentifier: bundleIdentifier, product: product, electron: electron)
     }
 
     // MARK: Editor family
@@ -71,9 +117,64 @@ final class VSCodeWindowsTests: XCTestCase {
         // The bundle path itself, and the outermost bundle deciding over a helper's name.
         XCTAssertEqual(EditorFamily.forAppBundle(path: "/Users/me/Applications/Cursor.app"), .cursor)
         XCTAssertEqual(EditorFamily.forAppBundle(path: "/Applications/Cursor.app/Contents/Frameworks/Code - Insiders Helper.app/Contents/MacOS/x"), .cursor)
-        // Unknown apps and non-app executables default to VS Code.
+        // Neither a non-Electron app nor a non-app executable names the editor:
+        // VS Code, the common case.
         XCTAssertEqual(EditorFamily.forAppBundle(path: "/Applications/Xcode.app/Contents/MacOS/Xcode"), .vscode)
         XCTAssertEqual(EditorFamily.forAppBundle(path: "/bin/zsh"), .vscode)
+    }
+
+    func testUnknownForkTakesItsSchemeAndDataFolderFromItsOwnBundle() throws {
+        // Antigravity, Kiro, Trae, Positron…: VS Code forks the table does not
+        // know. Their Claude extension still reports entrypoint claude-vscode.
+        let helper = try makeBundle("Antigravity", bundleIdentifier: "com.google.antigravity",
+                                    product: ["nameShort": "Antigravity", "nameLong": "Antigravity", "urlProtocol": "antigravity"])
+        let family = EditorFamily.forAppBundle(path: helper)
+        XCTAssertEqual(family, EditorFamily(appName: "Antigravity", urlScheme: "antigravity",
+                                            appSupportName: "Antigravity", bundleIdentifier: "com.google.antigravity"),
+                       "a fork must not be routed as VS Code")
+        XCTAssertTrue(family.defaultLogsRoot.path.hasSuffix("/Library/Application Support/Antigravity/logs"),
+                      family.defaultLogsRoot.path)
+    }
+
+    func testUnknownAppWithoutProductJSONHasNoDeepLinkScheme() throws {
+        let helper = try makeBundle("Mystery Editor", bundleIdentifier: "com.example.mystery", product: nil)
+        let family = EditorFamily.forAppBundle(path: helper)
+        XCTAssertEqual(family.urlScheme, "", "no scheme: the plan only activates the app")
+        XCTAssertEqual(family.bundleIdentifier, "com.example.mystery")
+        XCTAssertEqual(family.appName, "Mystery Editor")
+    }
+
+    func testForkClaimingAnotherEditorsSchemeIsNotDeepLinked() throws {
+        // LaunchServices would hand its vscode:// link to VS Code just as well.
+        let helper = try makeBundle("Lookalike", bundleIdentifier: "com.example.lookalike",
+                                    product: ["nameShort": "Lookalike", "urlProtocol": "vscode"])
+        let family = EditorFamily.forAppBundle(path: helper)
+        XCTAssertEqual(family.urlScheme, "")
+        XCTAssertEqual(family.bundleIdentifier, "com.example.lookalike")
+    }
+
+    func testRenamedCopyOfAKnownEditorIsKnownByItsBundleId() throws {
+        let helper = try makeBundle("VS Code", bundleIdentifier: "com.microsoft.VSCode",
+                                    product: ["nameShort": "Code", "urlProtocol": "vscode"])
+        XCTAssertEqual(EditorFamily.forAppBundle(path: helper), .vscode)
+    }
+
+    func testUnusableProductValuesFallBackToTheBundle() throws {
+        let helper = try makeBundle("Odd", bundleIdentifier: nil,
+                                    product: ["nameShort": "../../Odd", "urlProtocol": "not a scheme"])
+        XCTAssertEqual(EditorFamily.forAppBundle(path: helper),
+                       EditorFamily(appName: "Odd", urlScheme: "", appSupportName: "Odd", bundleIdentifier: nil))
+        // The bundle path itself works too.
+        XCTAssertEqual(EditorFamily.forAppBundle(path: tmp.appendingPathComponent("Applications/Odd.app").path).appSupportName, "Odd")
+    }
+
+    func testABundleThatIsNotAnElectronAppDoesNotNameTheEditor() throws {
+        // Only Electron apps run VS Code extension hosts. A tool inside another
+        // bundle (this test runner lives in Xcode.app) leaves the common case.
+        let tool = try makeBundle("Toolbox", bundleIdentifier: "com.example.toolbox",
+                                  product: ["nameShort": "Toolbox", "urlProtocol": "toolbox"], electron: false)
+        XCTAssertEqual(EditorFamily.forAppBundle(path: tool), .vscode)
+        XCTAssertEqual(EditorFamily.forAppBundle(path: "/nonexistent/Gone.app/Contents/MacOS/Gone"), .vscode)
     }
 
     // MARK: Parsers
@@ -159,6 +260,21 @@ final class VSCodeWindowsTests: XCTestCase {
         XCTAssertNil(index.windowId(forExtensionHostPid: deadPid(1)))
     }
 
+    func testOnlyLaunchesWithWindowsCountTowardsTheThree() throws {
+        try writeLog(started(deadPid(4)), session: "20990101T000040", window: 1)
+        try writeLog(started(deadPid(3)), session: "20990101T000030", window: 1)
+        try writeLog(started(deadPid(2)), session: "20990101T000020", window: 2)
+        try writeLog(started(deadPid(1)), session: "20990101T000010", window: 1)
+        // `code` launches between and after them.
+        for session in ["20990101T000045", "20990101T000035", "20990101T000025"] { try cliLaunch(session) }
+
+        XCTAssertEqual(load().windows, [
+            .init(id: 1, extensionHostPid: deadPid(4), sessionDir: "20990101T000040"),
+            .init(id: 1, extensionHostPid: deadPid(3), sessionDir: "20990101T000030"),
+            .init(id: 2, extensionHostPid: deadPid(2), sessionDir: "20990101T000020"),
+        ])
+    }
+
     func testLogChangesAreFollowedIncrementally() throws {
         let log = try writeLog(started(deadPid(1)), window: 1)
         XCTAssertEqual(load().windows.first?.extensionHostPid, deadPid(1))
@@ -198,6 +314,25 @@ final class VSCodeWindowsTests: XCTestCase {
             at: logsRoot.appendingPathComponent("20990101T000003"), withIntermediateDirectories: true)
         XCTAssertEqual(VSCodeWindowIndex.liveWindowCount(family: .vscode, logsRoot: logsRoot), 2)
         XCTAssertEqual(VSCodeWindowIndex.liveWindowCount(family: .vscode, logsRoot: tmp.appendingPathComponent("missing")), 0)
+    }
+
+    func testCLILaunchesSinceTheEditorStartedDoNotHideItsLiveWindows() throws {
+        // The running launch: window 1 is the parent process, window 2 this one.
+        try writeLog(started(getppid()), window: 1)
+        try writeLog(started(getpid()), window: 2)
+        for n in 1...3 { try cliLaunch(cliSession(n)) }
+        XCTAssertEqual(VSCodeWindowIndex.liveWindowCount(family: .vscode, logsRoot: logsRoot), 2, "live window count")
+        XCTAssertEqual(VSCodeWindowIndex.windowId(forExtensionHostPid: getppid(), family: .vscode, logsRoot: logsRoot), 1,
+                       "the logs lookup reaches past the launches too")
+    }
+
+    func testTheWalkStopsAfterFifteenSessionDirs() throws {
+        // A bound on the cost of a lookup: each session dir is one listing.
+        try writeLog(started(getppid()), window: 1)
+        for n in 1...14 { try cliLaunch(cliSession(n)) }
+        XCTAssertEqual(VSCodeWindowIndex.liveWindowCount(family: .vscode, logsRoot: logsRoot), 1, "behind 14 launches")
+        try cliLaunch(cliSession(15))
+        XCTAssertEqual(VSCodeWindowIndex.liveWindowCount(family: .vscode, logsRoot: logsRoot), 0, "behind 15 launches")
     }
 
     func testLiveWindowsComeFromTheNewestLaunchWithALiveWindow() {

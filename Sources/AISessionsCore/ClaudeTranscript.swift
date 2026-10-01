@@ -9,13 +9,44 @@ public struct TranscriptInfo: Equatable, Sendable {
     public var lastPrompt: String?
     /// The newest assistant entry that has any text, its text blocks joined.
     public var lastAssistantText: String?
+    /// The newest entry that ended a turn: an answer that stopped with
+    /// "end_turn" (completed) or the marker Claude writes when the user
+    /// presses Esc (interrupted), whichever came later.
+    public var lastTurnEnd: TranscriptTurnEnd?
+    /// `lastTurnEnd` when nothing was said after it: the conversation rests
+    /// on Claude's answer (or the user's Esc). Claude keeps a session "busy"
+    /// while background work it started still runs, so this is how an
+    /// answered turn is told from one still in progress.
+    public var restingTurnEnd: TranscriptTurnEnd?
+    /// When the turn in progress began: the oldest message after the newest
+    /// turn end. nil while resting, or when the tail holds no message at all.
+    public var turnStartedAt: Date?
 
     public init(customTitle: String? = nil, aiTitle: String? = nil,
-                lastPrompt: String? = nil, lastAssistantText: String? = nil) {
+                lastPrompt: String? = nil, lastAssistantText: String? = nil,
+                lastTurnEnd: TranscriptTurnEnd? = nil, restingTurnEnd: TranscriptTurnEnd? = nil,
+                turnStartedAt: Date? = nil) {
         self.customTitle = customTitle
         self.aiTitle = aiTitle
         self.lastPrompt = lastPrompt
         self.lastAssistantText = lastAssistantText
+        self.lastTurnEnd = lastTurnEnd
+        self.restingTurnEnd = restingTurnEnd
+        self.turnStartedAt = turnStartedAt
+    }
+}
+
+/// A transcript entry that ended a turn.
+public struct TranscriptTurnEnd: Equatable, Sendable {
+    /// `.completed` or `.interrupted`.
+    public var kind: TurnEnd
+    /// The entry's own `timestamp`, which says whether it ended the current
+    /// turn or an earlier one; nil when the entry has none.
+    public var at: Date?
+
+    public init(_ kind: TurnEnd, at: Date? = nil) {
+        self.kind = kind
+        self.at = at
     }
 }
 
@@ -210,21 +241,20 @@ public enum ClaudeTranscript {
 /// wanted kind settles it.
 struct ClaudeTranscriptScan {
     enum Kind: CaseIterable, Hashable {
-        case customTitle, aiTitle, lastPrompt, assistantText
-
-        var field: WritableKeyPath<TranscriptInfo, String?> {
-            switch self {
-            case .customTitle: return \.customTitle
-            case .aiTitle: return \.aiTitle
-            case .lastPrompt: return \.lastPrompt
-            case .assistantText: return \.lastAssistantText
-            }
-        }
+        case customTitle, aiTitle, lastPrompt, assistantText, turnEnd
     }
+
+    /// What Claude Code writes as a user entry when the user interrupts a
+    /// turn: "[Request interrupted by user]", or "… for tool use]" when a
+    /// tool call was cut short or a permission prompt declined.
+    static let interruptPrefix: StaticString = "[Request interrupted by user"
 
     let wanted: Set<Kind>
     private(set) var settled: Set<Kind> = []
     private(set) var info = TranscriptInfo()
+    /// Whether a main-thread message (a user or assistant entry) was seen:
+    /// only then does this scan know `restingTurnEnd` and `turnStartedAt`.
+    private var sawMessage = false
 
     init(wanted: Set<Kind> = Set(Kind.allCases)) {
         self.wanted = wanted
@@ -234,26 +264,62 @@ struct ClaudeTranscriptScan {
 
     /// Copies every settled kind into `known`; unsettled kinds keep their value.
     func apply(to known: inout TranscriptInfo) {
-        for kind in settled { known[keyPath: kind.field] = info[keyPath: kind.field] }
+        for kind in settled {
+            switch kind {
+            case .customTitle: known.customTitle = info.customTitle
+            case .aiTitle: known.aiTitle = info.aiTitle
+            case .lastPrompt: known.lastPrompt = info.lastPrompt
+            case .assistantText: known.lastAssistantText = info.lastAssistantText
+            case .turnEnd: known.lastTurnEnd = info.lastTurnEnd
+            }
+        }
+        if sawMessage {
+            known.restingTurnEnd = info.restingTurnEnd
+            known.turnStartedAt = info.turnStartedAt
+        }
     }
 
     mutating func consider(_ line: UnsafeRawBufferPointer) {
         guard isCandidate(line), let entry = Self.parse(line) else { return }
         switch entry["type"] as? String {
         case "custom-title":
-            settle(.customTitle, entry["customTitle"], maxLength: ClaudeTranscript.maxTitleLength)
+            settle(.customTitle, \.customTitle, entry["customTitle"], maxLength: ClaudeTranscript.maxTitleLength)
         case "ai-title":
-            settle(.aiTitle, entry["aiTitle"], maxLength: ClaudeTranscript.maxTitleLength)
+            settle(.aiTitle, \.aiTitle, entry["aiTitle"], maxLength: ClaudeTranscript.maxTitleLength)
         case "last-prompt":
-            settle(.lastPrompt, entry["lastPrompt"], maxLength: ClaudeTranscript.maxTextLength)
+            settle(.lastPrompt, \.lastPrompt, entry["lastPrompt"], maxLength: ClaudeTranscript.maxTextLength)
         case "assistant":
-            // Sub-agent (sidechain) chatter is not the session's last word.
-            guard isPending(.assistantText), entry["isSidechain"] as? Bool != true,
-                  let text = Self.assistantText(entry) else { return }
-            info.lastAssistantText = ClaudeTranscript.clean(text, maxLength: ClaudeTranscript.maxTextLength)
-            settled.insert(.assistantText)
+            // Sub-agent (sidechain) chatter is neither the session's last word
+            // nor the end of its turn.
+            guard entry["isSidechain"] as? Bool != true else { return }
+            if isPending(.assistantText), let text = Self.assistantText(entry) {
+                info.lastAssistantText = ClaudeTranscript.clean(text, maxLength: ClaudeTranscript.maxTextLength)
+                settled.insert(.assistantText)
+            }
+            noteMessage(entry, ending: Self.stopReason(entry) == "end_turn" ? .completed : nil)
+        case "user":
+            guard entry["isSidechain"] as? Bool != true else { return }
+            noteMessage(entry, ending: Self.isInterruptMarker(entry) ? .interrupted : nil)
         default:
             break
+        }
+    }
+
+    /// Newest first, until the newest turn end: that end settles `.turnEnd`;
+    /// whether it came before any other message says if the conversation
+    /// rests on it; the messages after it date the turn in progress. Any
+    /// user entry counts as one (a prompt, a tool result, a background
+    /// task's notice), which errs towards "still running".
+    private mutating func noteMessage(_ entry: [String: Any], ending: TurnEnd?) {
+        guard isPending(.turnEnd) else { return }
+        let newest = !sawMessage
+        sawMessage = true
+        if let ending {
+            settleTurnEnd(ending, entry)
+            info.restingTurnEnd = newest ? info.lastTurnEnd : nil
+        } else {
+            info.restingTurnEnd = nil
+            if let at = (entry["timestamp"] as? String).flatMap(Self.date) { info.turnStartedAt = at }
         }
     }
 
@@ -268,14 +334,47 @@ struct ClaudeTranscriptScan {
             || (isPending(.aiTitle) && Self.contains(line, "\"ai-title\""))
             || (isPending(.lastPrompt) && Self.contains(line, "\"last-prompt\""))
             || (isPending(.assistantText) && Self.contains(line, "\"assistant\"") && Self.contains(line, "\"text\""))
+            || (isPending(.turnEnd)
+                && (Self.contains(line, "\"type\":\"user\"") || Self.contains(line, "\"type\":\"assistant\"")))
     }
 
     /// An entry without its payload string (older formats write some) does
     /// not settle anything; an empty one does, as "none".
-    private mutating func settle(_ kind: Kind, _ value: Any?, maxLength: Int) {
+    private mutating func settle(_ kind: Kind, _ field: WritableKeyPath<TranscriptInfo, String?>, _ value: Any?,
+                                 maxLength: Int) {
         guard isPending(kind), let text = value as? String else { return }
-        info[keyPath: kind.field] = ClaudeTranscript.clean(text, maxLength: maxLength)
+        info[keyPath: field] = ClaudeTranscript.clean(text, maxLength: maxLength)
         settled.insert(kind)
+    }
+
+    private mutating func settleTurnEnd(_ kind: TurnEnd, _ entry: [String: Any]) {
+        info.lastTurnEnd = TranscriptTurnEnd(kind, at: (entry["timestamp"] as? String).flatMap(Self.date))
+        settled.insert(.turnEnd)
+    }
+
+    static func stopReason(_ entry: [String: Any]) -> String? {
+        (entry["message"] as? [String: Any])?["stop_reason"] as? String
+    }
+
+    /// A user entry whose text, a plain string or a text block, starts with
+    /// the interrupt marker. Tool results quoting it are not text blocks.
+    static func isInterruptMarker(_ entry: [String: Any]) -> Bool {
+        guard let message = entry["message"] as? [String: Any] else { return false }
+        let prefix = interruptPrefix.description
+        if let text = message["content"] as? String { return text.hasPrefix(prefix) }
+        guard let blocks = message["content"] as? [Any] else { return false }
+        return blocks.contains { block in
+            guard let block = block as? [String: Any], block["type"] as? String == "text",
+                  let text = block["text"] as? String else { return false }
+            return text.hasPrefix(prefix)
+        }
+    }
+
+    private static let dateStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+
+    /// "2026-10-01T02:59:07.123Z", with or without the fraction.
+    static func date(_ text: String) -> Date? {
+        try? dateStyle.parse(text)
     }
 
     static func parse(_ line: UnsafeRawBufferPointer) -> [String: Any]? {

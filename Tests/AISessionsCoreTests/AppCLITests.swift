@@ -145,8 +145,24 @@ final class AppCLITests: XCTestCase {
         XCTAssertTrue(run.stderr.contains("headless: stopped by SIGTERM"), run.stderr)
         XCTAssertTrue(run.stdout.contains("1 session\n"), run.stdout)
         XCTAssertTrue(run.stdout.contains("waiting  \(key)  Fixture tab — demo-app · Claude"), run.stdout)
-        let state = try String(contentsOf: stateDir.appendingPathComponent("state.json"), encoding: .utf8)
-        XCTAssertTrue(state.contains(key), "the tracker state is saved under AI_SESSIONS_HOME")
+        let state = try String(contentsOf: stateDir.appendingPathComponent("headless/state.json"), encoding: .utf8)
+        XCTAssertTrue(state.contains(key), "the tracker state is saved under AI_SESSIONS_HOME, in state/headless/")
+        let log = try String(contentsOf: stateDir.appendingPathComponent("headless/headless.log"), encoding: .utf8)
+        XCTAssertTrue(log.contains("\(key) needs input: Fixture tab"), log)
+    }
+
+    /// `--use-app-state`: the app's own files, for when it is not running.
+    func testHeadlessWithUseAppStateUsesTheAppsFiles() throws {
+        let run = try Background(Self.executable(), ["--headless", "--use-app-state"], environment: environment, in: root)
+        defer { run.kill() }
+        _ = try waitForSnapshot(appState: true) { !$0.isEmpty }
+
+        run.signal(SIGTERM)
+        XCTAssertEqual(try run.wait(), 0, run.stderr)
+        for name in ["state.json", "snapshot.json", "ai-sessions.log"] {
+            XCTAssertTrue(exists(stateDir.appendingPathComponent(name)), "no state/\(name)")
+        }
+        XCTAssertFalse(exists(stateDir.appendingPathComponent("headless")))
     }
 
     func testHeadlessStopsCleanlyOnSIGINT() throws {
@@ -160,7 +176,159 @@ final class AppCLITests: XCTestCase {
         XCTAssertTrue(run.stderr.contains("headless: stopped by SIGINT"), run.stderr)
     }
 
+    // MARK: - Review regressions
+
+    /// [9] `--headless` runs next to the menu-bar app (README): its saves
+    /// must not undo the app's read marks, nor its log lines clobber the app's.
+    func testHeadlessLeavesTheAppsStateAlone() throws {
+        let run = try Background(Self.executable(), ["--headless"], environment: environment, in: root)
+        defer { run.kill() }
+        _ = try waitForAnySnapshot { !$0.isEmpty }
+
+        run.signal(SIGTERM)
+        XCTAssertEqual(try run.wait(), 0, run.stderr)
+        for name in ["state.json", "snapshot.json", "ai-sessions.log"] {
+            XCTAssertFalse(exists(stateDir.appendingPathComponent(name)), "--headless wrote the app's \(name)")
+        }
+        for name in ["state.json", "snapshot.json", "headless.log"] {
+            XCTAssertTrue(exists(stateDir.appendingPathComponent("headless/\(name)")), "no state/headless/\(name)")
+        }
+    }
+
+    /// [9] A look from the command line must not log "first run: adopted…"
+    /// into the app's log, where it reads as if the app had lost its state.
+    func testRouteLeavesTheAppsLogAlone() throws {
+        let run = try execute(["--route", key])
+
+        XCTAssertEqual(run.status, 0, run.stderr)
+        let log = (try? String(contentsOf: stateDir.appendingPathComponent("ai-sessions.log"), encoding: .utf8)) ?? ""
+        XCTAssertFalse(log.contains("first run: adopted"), "--route's throwaway tracker wrote to the app's log:\n\(log)")
+    }
+
+    /// [17] state/ holds titles, prompts and last messages copied out of
+    /// ~/.claude (0700). A launch repairs what an older version left readable.
+    func testALaunchMakesTheStateDirectoryOwnerOnly() throws {
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        let old = stateDir.appendingPathComponent("snapshot.json")
+        try Data("{}".utf8).write(to: old)
+        XCTAssertEqual(chmod(stateDir.path, 0o755), 0)
+        XCTAssertEqual(chmod(old.path, 0o644), 0)
+
+        let run = try execute(["--route", key])
+
+        XCTAssertEqual(run.status, 0, run.stderr)
+        XCTAssertEqual(mode(of: stateDir), 0o700, "state/ must be owner-only")
+        XCTAssertEqual(mode(of: old), 0o600, "a file an older version left world-readable")
+    }
+
+    /// [17] Whatever a run writes under state/ is owner-only from the start.
+    func testEverythingARunWritesUnderStateIsOwnerOnly() throws {
+        let run = try Background(Self.executable(), ["--headless"], environment: environment, in: root)
+        defer { run.kill() }
+        _ = try waitForAnySnapshot { !$0.isEmpty }
+        run.signal(SIGTERM)
+        XCTAssertEqual(try run.wait(), 0, run.stderr)
+
+        var checked = 0
+        let items = FileManager.default.enumerator(at: stateDir, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? []
+        for item in [stateDir] + items {
+            let isDirectory = (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            XCTAssertEqual(mode(of: item), isDirectory ? 0o700 : 0o600, item.path)
+            checked += 1
+        }
+        XCTAssertGreaterThanOrEqual(checked, 4, "state/ itself, its snapshot, its state and its log")
+    }
+
+    /// [19] A title with a terminal escape (a pasted prompt, a model-made
+    /// title) must reach the terminal as text, not as a command.
+    func testRoutePrintsTitlesWithoutTerminalEscapes() throws {
+        try writeTranscript(title: "fix bug \u{1B}]0;PWNED\u{07}\u{1B}[31mred")
+
+        let run = try execute(["--route", key])
+
+        XCTAssertEqual(run.status, 0, run.stderr)
+        XCTAssertFalse(Self.hasControlCharacter(run.stdout), "an escape reached the terminal: \(run.stdout.debugDescription)")
+        XCTAssertTrue(run.stdout.contains("title     fix bug ]0;PWNED[31mred\n"), run.stdout.debugDescription)
+    }
+
+    /// [19] An id is printed too, and a Codex thread id is not validated:
+    /// with no name it is also the title ("Codex " + its first 8 characters),
+    /// which never passes through `Formatting.oneLine` at the source.
+    func testRoutePrintsACodexIdWithoutTerminalEscapes() throws {
+        let codexHome = root.appendingPathComponent("codex", isDirectory: true)
+        let day = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        let dayDirectory = codexHome.appendingPathComponent(
+            String(format: "sessions/%04d/%02d/%02d", day.year!, day.month!, day.day!), isDirectory: true)
+        try FileManager.default.createDirectory(at: dayDirectory, withIntermediateDirectories: true)
+        let id = #"ab\u001b]0;PWNED\u0007cd-7b12-aef3-21e7666556fc"# // JSON escapes: ESC and BEL once decoded
+        try Data((CodexFixture.meta(id: id, cwd: "/work/codex-app")
+                  + CodexFixture.taskStarted("2026-10-01T03:00:01.000Z")
+                  + CodexFixture.taskComplete("2026-10-01T03:00:09.000Z", message: nil)).utf8)
+            .write(to: dayDirectory.appendingPathComponent("rollout-2026-10-01T11-00-00-crafted.jsonl"))
+        var environment = self.environment
+        environment["AI_SESSIONS_CODEX_HOMES"] = codexHome.path
+
+        let run = try execute(["--route", "codex:ab"], environment: environment)
+
+        XCTAssertEqual(run.status, 0, run.stderr)
+        XCTAssertFalse(Self.hasControlCharacter(run.stdout), "an escape reached the terminal: \(run.stdout.debugDescription)")
+        XCTAssertTrue(run.stdout.contains("session   codex:ab]0;PWNEDcd-7b12"), run.stdout.debugDescription)
+        XCTAssertTrue(run.stdout.contains("title     Codex ab]0;PW\n"), run.stdout.debugDescription) // 8 characters, ESC among them
+    }
+
+    /// [19] Same for the `--headless` listing and its log echo on stderr.
+    func testHeadlessPrintsTitlesWithoutTerminalEscapes() throws {
+        try writeTranscript(title: "deploy \u{1B}[2J\u{1B}]52;c;aGk=\u{07}now")
+        let run = try Background(Self.executable(), ["--headless"], environment: environment, in: root)
+        defer { run.kill() }
+        _ = try waitForAnySnapshot { $0.first?.state == .idle }
+        try writeRecord(status: "waiting", at: Date())
+        try waitUntil("the needs-input event is logged") { run.stderr.contains("\(key) needs input:") }
+
+        run.signal(SIGTERM)
+        XCTAssertEqual(try run.wait(), 0, run.stderr)
+        XCTAssertFalse(Self.hasControlCharacter(run.stdout), "listing: \(run.stdout.debugDescription)")
+        XCTAssertFalse(Self.hasControlCharacter(run.stderr), "log echo: \(run.stderr.debugDescription)")
+        XCTAssertTrue(run.stdout.contains("deploy [2J]52;c;aGk=now"), run.stdout.debugDescription)
+    }
+
     // MARK: - Fixtures
+
+    private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
+
+    private func mode(of url: URL) -> Int? {
+        ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.posixPermissions] as? NSNumber)
+            .map { $0.intValue & 0o777 }
+    }
+
+    /// Control characters other than the newlines that end lines.
+    private static func hasControlCharacter(_ text: String) -> Bool {
+        text.unicodeScalars.contains { $0 != "\n" && $0.properties.generalCategory == .control }
+    }
+
+    private func writeTranscript(title: String) throws {
+        let transcript = claudeDir.appendingPathComponent("projects/-work-demo-app/\(sessionId).jsonl")
+        try ClaudeFixtures.lines([
+            ClaudeFixtures.customTitle(title, session: sessionId),
+            ClaudeFixtures.assistant(["All done: three files changed."], session: sessionId),
+        ]).write(to: transcript)
+    }
+
+    /// The headless snapshot wherever this build writes it.
+    private func waitForAnySnapshot(until condition: ([TrackedSession]) -> Bool) throws -> [TrackedSession] {
+        let urls = ["headless/snapshot.json", "snapshot.json"].map { stateDir.appendingPathComponent($0) }
+        var sessions: [TrackedSession] = []
+        try waitUntil("a snapshot satisfies the condition") {
+            for url in urls {
+                guard let data = try? Data(contentsOf: url),
+                      let snapshot = try? Self.decoder.decode(Snapshot.self, from: data) else { continue }
+                sessions = snapshot.sessions
+                if condition(sessions) { return true }
+            }
+            return false
+        }
+        return sessions
+    }
 
     private var environment: [String: String] {
         var environment = ProcessInfo.processInfo.environment
@@ -182,9 +350,11 @@ final class AppCLITests: XCTestCase {
         return try XCTUnwrap(URLComponents(string: line.dropFirst(4).trimmingCharacters(in: .whitespaces)))
     }
 
-    private func waitForSnapshot(timeout: TimeInterval = 15,
+    /// `--headless`'s snapshot: its own in state/headless/, or with
+    /// `appState` (`--use-app-state`) the app's in state/.
+    private func waitForSnapshot(appState: Bool = false, timeout: TimeInterval = 15,
                                  until condition: ([TrackedSession]) -> Bool) throws -> [TrackedSession] {
-        let url = stateDir.appendingPathComponent("snapshot.json")
+        let url = stateDir.appendingPathComponent(appState ? "snapshot.json" : "headless/snapshot.json")
         var sessions: [TrackedSession] = []
         try waitUntil("snapshot.json satisfies the condition", timeout: timeout) {
             guard let data = try? Data(contentsOf: url),

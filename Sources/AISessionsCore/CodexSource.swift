@@ -23,9 +23,24 @@ public final class CodexSource: SessionSource {
     /// `session_index.jsonl`, whose change refreshes them at once.
     static let titleRefreshInterval: TimeInterval = 120
     static let maxScanDays = 31
+    /// A running or waiting thread whose rollout has been quiet this long is
+    /// over. Codex writes as a turn works, so a live turn is not silent for
+    /// hours; this one's app-server died without writing a turn end (VS Code
+    /// quit or reloaded, a crash, a SIGKILL). It is reported idle, abandoned,
+    /// which is never announced.
+    static let abandonedAfterQuiet: TimeInterval = 3 * 3600
+    /// Sooner when not a single codex process is left to be running it. A
+    /// long model call, a long tool run or an approval prompt (which Codex
+    /// does not persist) is quiet for minutes, but needs its app-server.
+    static let abandonedWithoutProcessAfterQuiet: TimeInterval = 2 * 60
+    /// The process table is scanned at most this often, and only while some
+    /// unfinished turn has been quiet that long.
+    static let processCheckInterval: TimeInterval = 30
 
     /// Where discovery and drops are logged; tests silence it.
     var logger: (String) -> Void = { Log.shared.info($0) }
+    /// Whether any codex process is alive; tests replace it.
+    var codexProcessExists: () -> Bool = { CodexProcesses.anyRunning() }
     /// Rollouts being followed, ready or not.
     var trackedRolloutCount: Int { rollouts.count }
 
@@ -35,6 +50,7 @@ public final class CodexSource: SessionSource {
     private var titles: [String: StoredTitle] = [:]
     private var titleMemo: [String: (inputs: TitleInputs, title: String)] = [:]
     private var lastScan: Date?
+    private var processCheck: (at: Date, exists: Bool)?
 
     public init(homes: [URL], recentHours: Double) {
         self.homes = homes
@@ -44,7 +60,7 @@ public final class CodexSource: SessionSource {
     }
 
     /// A thread is reported while its rollout changed within `recentHours`, or
-    /// while it is running or waiting, and dropped afterwards.
+    /// while it is running or waiting (and not abandoned), and dropped afterwards.
     public func poll(now: Date) -> [Observation] {
         let cutoff = now.addingTimeInterval(-recentHours * 3600)
         var databases: [Int: CodexStateDB?] = [:]
@@ -56,25 +72,42 @@ public final class CodexSource: SessionSource {
         }
 
         var live: [(rollout: TrackedRollout, meta: CodexSessionMeta)] = []
-        for (path, rollout) in rollouts {
+        for (path, tracked) in rollouts {
+            var rollout = tracked
             let reader = rollout.reader
-            if reader.update() == .missing {
+            let update = reader.update()
+            if update == .missing {
                 forget(path, because: "its rollout is gone")
                 continue
             }
+            // New events (a message, a turn end, a new turn): whatever was
+            // given up on shows signs of life. Other appended lines do not
+            // count: a reopened thread re-writes its meta line, for one.
+            if update == .changed { rollout.abandonedSince = nil }
             let recent = (reader.modifiedAt ?? .distantPast) >= cutoff
             guard let meta = reader.meta else {
                 // Not a readable rollout (yet): give up once it goes quiet.
                 if !recent { forget(path, because: "it never became readable") }
                 continue
             }
-            guard recent || reader.state != .idle else {
+            if rollout.abandonedSince == nil, reader.state != .idle, let quietSince = reader.modifiedAt,
+               isAbandoned(quietSince: quietSince, now: now) {
+                rollout.abandonedSince = quietSince
+                logger("codex: \(meta.id) has written nothing for \(Formatting.duration(now.timeIntervalSince(quietSince)))"
+                    + "; its \(reader.state.rawValue) turn is abandoned")
+            }
+            guard recent || (reader.state != .idle && rollout.abandonedSince == nil) else {
                 forget(path, because: "it has been idle for \(Formatting.duration(recentHours * 3600))")
                 continue
             }
             if !rollout.announced {
-                rollouts[path]?.announced = true
+                rollout.announced = true
                 logger("codex: tracking \(meta.id) (\(meta.originator ?? "?"), \(meta.sourceKind)) \(reader.state.rawValue)")
+            }
+            // Written back only on a change: the loop iterates a copy, and a
+            // write per poll would copy the whole dictionary every second.
+            if rollout.announced != tracked.announced || rollout.abandonedSince != tracked.abandonedSince {
+                rollouts[path] = rollout
             }
             live.append((rollout, meta))
         }
@@ -86,20 +119,42 @@ public final class CodexSource: SessionSource {
             let reader = rollout.reader
             let modified = reader.modifiedAt ?? .distantPast
             if let other = newest[meta.id], other.modified >= modified { continue }
+            // Abandoned: idle since the rollout went quiet, which stays put
+            // however long it stays abandoned.
+            let abandoned = rollout.abandonedSince
             let observation = Observation(
                 key: SessionKey(agent: .codex, id: meta.id),
-                state: reader.state,
-                rawStatus: reader.rawStatus,
-                stateSince: reader.stateSince,
+                state: abandoned == nil ? reader.state : .idle,
+                rawStatus: abandoned == nil ? reader.rawStatus : "abandoned",
+                stateSince: abandoned ?? reader.stateSince,
                 title: title(for: meta.id, reader: reader, home: rollout.home),
                 cwd: meta.cwd,
                 entrypoint: meta.originator,
                 lastMessage: reader.lastMessage,
                 host: meta.host,
-                interactive: meta.isInteractive)
+                interactive: meta.isInteractive,
+                turnEnd: abandoned == nil ? reader.turnEnd : .abandoned)
             newest[meta.id] = (observation, modified)
         }
         return newest.values.map(\.observation).sorted { $0.key < $1.key }
+    }
+
+    /// Whether an unfinished turn whose rollout was last written at
+    /// `quietSince` is dead by now.
+    private func isAbandoned(quietSince: Date, now: Date) -> Bool {
+        let quiet = now.timeIntervalSince(quietSince)
+        if quiet >= Self.abandonedAfterQuiet { return true }
+        return quiet >= Self.abandonedWithoutProcessAfterQuiet && !anyCodexProcess(now: now)
+    }
+
+    private func anyCodexProcess(now: Date) -> Bool {
+        if let check = processCheck {
+            let age = now.timeIntervalSince(check.at)
+            if age >= 0, age < Self.processCheckInterval { return check.exists }
+        }
+        let exists = codexProcessExists()
+        processCheck = (now, exists)
+        return exists
     }
 
     // MARK: Discovery
@@ -246,6 +301,9 @@ public final class CodexSource: SessionSource {
         let reader: CodexRolloutReader
         let home: Int
         var announced = false
+        /// Set when its unfinished turn was given up on: the rollout's last
+        /// write. Cleared by the next event that changes the thread.
+        var abandonedSince: Date?
     }
 
     private struct StoredTitle {
@@ -261,6 +319,30 @@ public final class CodexSource: SessionSource {
         var indexName: String?
         var storedTitle: String?
         var firstUserMessage: String?
+    }
+}
+
+// MARK: - Processes
+
+/// Codex's own processes: one `codex app-server` per editor window (child of
+/// its extension host), or a `codex` CLI. Every one runs an executable named
+/// `codex`, so the path tells them apart from everything else.
+enum CodexProcesses {
+    /// Whether any live process runs an executable whose path ends in
+    /// `executableSuffix`. A process table that cannot be read counts as
+    /// yes: an unanswered question must not end anyone's turn.
+    static func anyRunning(executableSuffix: String = "/codex") -> Bool {
+        let estimate = proc_listallpids(nil, 0)
+        guard estimate > 0 else { return true }
+        // Headroom for processes started between the two calls.
+        var pids = [Int32](repeating: 0, count: Int(estimate) + 64)
+        let count = pids.withUnsafeMutableBytes { buffer in
+            proc_listallpids(buffer.baseAddress, Int32(buffer.count))
+        }
+        guard count > 0 else { return true }
+        return pids.prefix(Int(count)).contains { pid in
+            pid > 0 && ProcessKit.path(pid)?.hasSuffix(executableSuffix) == true
+        }
     }
 }
 

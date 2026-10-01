@@ -1,9 +1,10 @@
 import Darwin
 import Foundation
 
-/// A VS Code-family editor: the URL scheme its URI handlers answer to, the
-/// folder under `~/Library/Application Support` that holds its logs, and its
-/// bundle id (for activating the app when there is no deep link).
+/// A VS Code-family editor: the URL scheme its URI handlers answer to (empty
+/// when unknown: such an editor gets no deep link), the folder under
+/// `~/Library/Application Support` that holds its logs, and its bundle id
+/// (for activating the app when there is no deep link).
 public struct EditorFamily: Equatable, Sendable {
     public let appName: String
     public let urlScheme: String
@@ -37,18 +38,70 @@ public struct EditorFamily: Equatable, Sendable {
 
     /// The family of the app bundle that contains `path`: an executable deep
     /// inside it (a helper resolves to its outermost app) or the bundle itself.
-    /// Anything unrecognised is treated as VS Code, the common case.
+    /// An Electron app the table does not know is described by its own files
+    /// (see `describing(bundleAt:)`). Only an Electron app runs a VS Code
+    /// extension host, so any other path (in no bundle, or in one like
+    /// Xcode.app) does not name the editor: it is treated as VS Code, the
+    /// common case.
     public static func forAppBundle(path: String) -> EditorFamily {
-        guard let bundle = path.split(separator: "/").first(where: { $0.hasSuffix(".app") }) else {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard let bundle = parts.firstIndex(where: { $0.hasSuffix(".app") }) else {
             return .vscode
         }
-        let name = bundle.dropLast(".app".count).lowercased()
+        let name = parts[bundle].dropLast(".app".count).lowercased()
         // Most specific first: "VSCodium - Insiders" is VSCodium, not VS Code Insiders.
         if name.contains("codium") { return .vscodium }
         if name.contains("cursor") { return .cursor }
         if name.contains("windsurf") { return .windsurf }
         if name.contains("insiders") { return .vscodeInsiders }
-        return .vscode
+        if name.contains("visual studio code") { return .vscode }
+        let bundlePath = parts[...bundle].joined(separator: "/")
+        guard FileManager.default.fileExists(atPath: bundlePath + "/Contents/Frameworks/Electron Framework.framework") else {
+            return .vscode
+        }
+        return describing(bundleAt: bundlePath)
+    }
+
+    /// A fork the table does not know (Antigravity, Kiro, Trae, Positron…),
+    /// from the keys VS Code itself derives these from: `urlProtocol` and
+    /// `nameShort` (the data folder) in `Contents/Resources/app/product.json`,
+    /// and `CFBundleIdentifier` in `Contents/Info.plist`. Routing it as VS Code
+    /// would send the fork's window id into an unrelated VS Code window (or
+    /// launch VS Code) and never bring the fork forward. With no product.json,
+    /// or a scheme another editor owns (LaunchServices could hand the link to
+    /// either app), the family has no scheme and the plan only activates it.
+    static func describing(bundleAt bundlePath: String) -> EditorFamily {
+        let contents = URL(fileURLWithPath: bundlePath, isDirectory: true)
+            .appendingPathComponent("Contents", isDirectory: true)
+        let bundleName = ((bundlePath as NSString).lastPathComponent as NSString).deletingPathExtension
+        let info = (try? Data(contentsOf: contents.appendingPathComponent("Info.plist")))
+            .flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] }
+        let bundleIdentifier = info?["CFBundleIdentifier"] as? String
+        // A renamed copy of a known editor ("VS Code.app") is still that editor.
+        if let bundleIdentifier, let known = all.first(where: { $0.bundleIdentifier == bundleIdentifier }) {
+            return known
+        }
+        let product = (try? Data(contentsOf: contents.appendingPathComponent("Resources/app/product.json")))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        var scheme = product?["urlProtocol"] as? String ?? ""
+        if !isURLScheme(scheme) || all.contains(where: { $0.urlScheme.caseInsensitiveCompare(scheme) == .orderedSame }) {
+            scheme = ""
+        }
+        // A path component under Application Support, so nothing that climbs out.
+        let dataFolder = (product?["nameShort"] as? String)
+            .flatMap { !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") ? $0 : nil }
+        return EditorFamily(appName: bundleName, urlScheme: scheme,
+                            appSupportName: dataFolder ?? bundleName, bundleIdentifier: bundleIdentifier)
+    }
+
+    /// RFC 3986: a letter, then letters, digits, "+", "-" or ".".
+    static func isURLScheme(_ scheme: String) -> Bool {
+        guard let first = scheme.unicodeScalars.first, first.isASCII, CharacterSet.letters.contains(first) else {
+            return false
+        }
+        return scheme.unicodeScalars.allSatisfy {
+            $0.isASCII && (CharacterSet.alphanumerics.contains($0) || "+-.".unicodeScalars.contains($0))
+        }
     }
 
     /// `~/Library/Application Support/<appSupportName>/logs`.
@@ -65,8 +118,9 @@ public struct EditorFamily: Equatable, Sendable {
 /// use to reach that window.
 ///
 /// An instance is a snapshot of the editor's log folder: every window of the
-/// newest session dirs with the pid of its latest extension host. The static
-/// lookups add the primary source, the extension host's own open files.
+/// newest launches that had windows, with the pid of its latest extension
+/// host. The static lookups add the primary source, the extension host's own
+/// open files.
 public struct VSCodeWindowIndex: Sendable {
     public struct Window: Equatable, Sendable {
         public let id: Int
@@ -88,9 +142,15 @@ public struct VSCodeWindowIndex: Sendable {
         self.windows = windows
     }
 
-    /// A `code` CLI launch creates a session dir with no windows, so the live
-    /// windows are not always in the newest one.
+    /// Launches with windows that are read: the running one, plus older ones
+    /// in case the clock (DST, a new time zone) made a newer name sort lower.
     static let maxSessionDirs = 3
+    /// Session dirs listed at most, newest first. A `code` CLI launch (`code
+    /// <path>`, or `git commit` with `code --wait` as the editor) leaves a dir
+    /// with no windows, and VS Code prunes old dirs only at startup, so any
+    /// number of them can sit above the running launch's dir: they are
+    /// skipped without counting. The cap bounds a lookup to that many listings.
+    static let maxSessionDirsListed = 15
     static let maxLogTailBytes: Int64 = 2 << 20
 
     private static let cache = Cache()
@@ -98,8 +158,9 @@ public struct VSCodeWindowIndex: Sendable {
     // MARK: Snapshot
 
     /// Reads the newest ≤3 session dirs under `logsRoot` (default: the
-    /// family's), using the last "Extension host with pid N started" line of
-    /// each `window<N>/exthost/exthost.log`. Unchanged files are not re-read.
+    /// family's) that have windows, among the newest ≤15, using the last
+    /// "Extension host with pid N started" line of each
+    /// `window<N>/exthost/exthost.log`. Unchanged files are not re-read.
     public static func load(family: EditorFamily, logsRoot: URL? = nil) -> VSCodeWindowIndex {
         let root = (logsRoot ?? family.defaultLogsRoot).path
         let fm = FileManager.default
@@ -108,16 +169,21 @@ public struct VSCodeWindowIndex: Sendable {
         }
         var windows: [Window] = []
         var visited: Set<String> = []
-        for session in names.filter(isSessionDirName).sorted(by: >).prefix(maxSessionDirs) {
+        var launches = 0
+        for session in names.filter(isSessionDirName).sorted(by: >).prefix(maxSessionDirsListed) {
             let dir = root + "/" + session
             guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
-            for id in entries.compactMap(windowNumber).sorted() {
+            let ids = entries.compactMap(windowNumber).sorted()
+            if ids.isEmpty { continue }
+            for id in ids {
                 let log = "\(dir)/window\(id)/exthost/exthost.log"
                 visited.insert(log)
                 if let pid = cache.latestStartedPid(atPath: log) {
                     windows.append(Window(id: id, extensionHostPid: pid, sessionDir: session))
                 }
             }
+            launches += 1
+            if launches == maxSessionDirs { break }
         }
         cache.forgetLogs(under: root + "/", except: visited)
         return VSCodeWindowIndex(windows: windows)
@@ -154,7 +220,12 @@ public struct VSCodeWindowIndex: Sendable {
 
     /// Number of editor windows whose latest extension host is alive.
     public static func liveWindowCount(family: EditorFamily, logsRoot: URL? = nil) -> Int {
-        load(family: family, logsRoot: logsRoot).liveWindows().count
+        liveWindowIds(family: family, logsRoot: logsRoot).count
+    }
+
+    /// Ids of the editor windows whose latest extension host is alive.
+    static func liveWindowIds(family: EditorFamily, logsRoot: URL? = nil) -> [Int] {
+        load(family: family, logsRoot: logsRoot).liveWindows().map(\.id)
     }
 
     /// The extension host whose window hosts Codex thread `threadId`: the

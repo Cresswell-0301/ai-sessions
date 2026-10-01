@@ -11,30 +11,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let housekeepingInterval: TimeInterval = 5
     /// Coalesces snapshot.json writes; the file is for other tools, not the UI.
     static let snapshotDelay: TimeInterval = 2
+    /// A test-notification request older than this was left while the app
+    /// was not running; it is dropped rather than posted at a later launch.
+    nonisolated static let testRequestMaxAge: TimeInterval = 60
 
-    private var config: Config
+    private(set) var config: Config
+    /// Set while config.json cannot be used; the menu shows it.
+    private(set) var configProblem: ConfigProblem?
     private let engine: SessionEngine
     private var configWatcher = ConfigWatcher(url: AppPaths.home.appendingPathComponent("config.json"))
     private let pauseFlag = PauseFlag.standard
     private var paused: Bool
-    private var notifier: Notifier?
+    /// Nil outside an .app bundle. Tests install one over a recording center.
+    private(set) var notifier: Notifier?
+    /// Takes the route back to a session. Tests substitute a recorder, so
+    /// nothing is opened or activated.
+    var route: @MainActor (TrackedSession) -> Void = AppDelegate.takeRoute
     private var statusMenu: StatusMenuController?
     private var timer: Timer?
-    private var tickInFlight = false
+    private(set) var tickInFlight = false
     private var lastHousekeeping = Date()
     private var housekeepingRounds = 0
-    private var sessions: [TrackedSession] = []
+    private(set) var sessions: [TrackedSession] = []
     /// Last view of every session seen this run, so a click on the
     /// notification of a session that has since ended can still route.
     private var lastKnown: [SessionKey: TrackedSession] = [:]
-    private var notificationsReconciled = false
+    /// The first tick has been delivered: `sessions` is the live list.
+    private var hasDelivered = false
+    /// Clicks that came before that, the one that launched the app among
+    /// them. Routed right after the first delivery, so they use the live
+    /// session's host and pid (the window id comes from them) and not the
+    /// placeholder's, which sends Claude's link to the last active window.
+    private var pendingOpens: [(key: SessionKey, markingRead: Bool)] = []
     private var activity: NSObjectProtocol?
 
-    override init() {
-        let config = Config.load()
-        self.config = config
-        engine = SessionEngine(config: config, store: .standard(),
-                               snapshot: SnapshotWriter(url: SnapshotWriter.standardURL, delay: Self.snapshotDelay))
+    override convenience init() {
+        self.init { config in
+            SessionEngine(config: config, store: .standard(),
+                          snapshot: SnapshotWriter(url: SnapshotWriter.standardURL, delay: Self.snapshotDelay))
+        }
+    }
+
+    /// `makeEngine` builds the engine for the loaded config; tests pass one
+    /// over fake sources and a scratch store.
+    init(makeEngine: (Config) -> SessionEngine) {
+        let launch = Config.launch()
+        config = launch.config
+        switch launch.file {
+        case .valid(_, let data): Config.rememberLastGood(data)
+        case .missing: Config.forgetLastGood()
+        case .invalid(let reason): configProblem = ConfigProblem(reason: reason, usingDefaults: !launch.usedLastGood)
+        }
+        engine = makeEngine(launch.config)
         paused = pauseFlag.isPaused
         super.init()
     }
@@ -47,8 +75,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.shared.warn("not running from an .app bundle (\(Bundle.main.bundleURL.path)); notifications are off")
             return
         }
-        let notifier = Notifier(center: .current())
-        notifier.onOpen = { [weak self] key in self?.open(key) }
+        install(Notifier(center: UNUserNotificationCenter.current()))
+    }
+
+    /// Wires the notifier's clicks and permission reports to the app.
+    func install(_ notifier: Notifier) {
+        notifier.onOpen = { [weak self] key, markingRead in self?.open(key, markingRead: markingRead) }
         notifier.onMarkRead = { [weak self] key in self?.markRead(key) }
         notifier.onPermissionChange = { [weak self] permission in
             self?.statusMenu?.setNotificationPermission(permission)
@@ -69,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sendTestNotification: { [weak self] in self?.sendTestNotification(query: "") }
         ))
         statusMenu?.update(sessions: [], paused: paused)
+        statusMenu?.setConfigProblem(configProblem)
         notifier?.requestAuthorization()
         Log.shared.info("\(AppInfo.name) \(AppInfo.version) started (pid \(getpid())); home \(AppPaths.home.path)"
             + (paused ? "; notifications paused" : ""))
@@ -97,21 +130,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.timer = timer
     }
 
-    private func tick() {
+    func tick() {
         housekeepIfDue()
         guard !tickInFlight else { return }
         tickInFlight = true
-        engine.tick { [weak self] update in
-            guard let self else { return }
-            tickInFlight = false
-            notifier?.handle(update.events, config: config, paused: paused)
-            show(update.sessions)
-            if !notificationsReconciled {
-                notificationsReconciled = true
-                // Banners left from before a restart for sessions read since.
-                notifier?.removeDelivered(keeping: Set(update.sessions.filter(\.unread).map(\.key)))
-            }
+        engine.tick { [weak self] update in self?.deliver(update) }
+    }
+
+    /// One tick's result, on the main queue.
+    func deliver(_ update: SessionEngine.Update) {
+        tickInFlight = false
+        if let notifier {
+            let posted = notifier.handle(update.events, config: config, paused: paused)
+            notifier.withdraw(Self.staleBanners(before: sessions, after: update.sessions, posted: posted))
         }
+        show(update.sessions)
+        guard !hasDelivered else { return }
+        hasDelivered = true
+        // Banners left from before a restart for sessions read since.
+        notifier?.removeDelivered(keeping: Set(update.sessions.filter(\.unread).map(\.key)))
+        let queued = pendingOpens
+        pendingOpens = []
+        for click in queued { open(click.key, markingRead: click.markingRead) }
+    }
+
+    /// Banners of sessions that needed you in the last delivered list and,
+    /// still listed, no longer do, though no event said so: a question
+    /// answered in the editor (waiting → idle), a turn stopped or abandoned.
+    /// What was posted this tick is current whatever the list says. A session
+    /// that left the list keeps its banner (see `Notifier.handle`, `.ended`).
+    static func staleBanners(before: [TrackedSession], after: [TrackedSession],
+                             posted: Set<SessionKey>) -> [SessionKey] {
+        let needed = Set(before.lazy.filter(\.needsAttention).map(\.key))
+        guard !needed.isEmpty else { return [] }
+        return after.filter { needed.contains($0.key) && !$0.needsAttention && !posted.contains($0.key) }.map(\.key)
     }
 
     private func show(_ sessions: [TrackedSession]) {
@@ -124,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusMenu?.update(sessions: sessions, paused: paused)
     }
 
-    private func housekeepIfDue(now: Date = Date()) {
+    func housekeepIfDue(now: Date = Date()) {
         guard abs(now.timeIntervalSince(lastHousekeeping)) >= Self.housekeepingInterval else { return }
         lastHousekeeping = now
         // Turning notifications on in System Settings must clear the fix-it row.
@@ -132,10 +184,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if housekeepingRounds % 6 == 0 { notifier?.refreshPermission() }
         // `echo <key> > state/test-notification` (or --test-notification) asks
         // the running app for a sample banner through its own notifier.
-        if let data = try? Data(contentsOf: Self.testTriggerURL) {
-            try? FileManager.default.removeItem(at: Self.testTriggerURL)
-            sendTestNotification(query: String(decoding: data, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines))
+        switch Self.takeTestRequest(at: Self.testTriggerURL, now: now) {
+        case .fresh(let query)?:
+            sendTestNotification(query: query)
+        case .stale(let age)?:
+            Log.shared.info("test notification: dropped a request left \(Formatting.duration(age)) ago")
+        case nil:
+            break
         }
         if configWatcher.checkForChange() { reloadConfig() }
         // The flag is a file so that a script can pause notifications too.
@@ -147,8 +202,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Runs once per change of the file's stamp, so a broken file is logged
+    /// once, not every 5 s.
     private func reloadConfig() {
-        let new = Config.load()
+        let environment = ProcessInfo.processInfo.environment
+        switch Config.read() {
+        case .invalid(let reason):
+            // A comment, a half-typed value, an unclosed brace: keep what runs.
+            // The defaults would turn the notifications and sound the user
+            // turned off back on, and drop their watched dirs.
+            Log.shared.warn("config.json has an error (\(reason)); keeping the settings in use")
+            setConfigProblem(ConfigProblem(reason: reason, usingDefaults: configProblem?.usingDefaults ?? false))
+        case .missing:
+            Config.forgetLastGood()
+            setConfigProblem(nil)
+            apply(Config().overridden(by: environment))
+        case .valid(let new, let data):
+            Config.rememberLastGood(data)
+            setConfigProblem(nil)
+            apply(new.overridden(by: environment))
+        }
+    }
+
+    private func apply(_ new: Config) {
         guard new != config else { return }
         let old = config
         config = new
@@ -157,19 +233,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if new.pollIntervalSeconds != old.pollIntervalSeconds { scheduleTimer() }
     }
 
+    private func setConfigProblem(_ problem: ConfigProblem?) {
+        guard problem != configProblem else { return }
+        configProblem = problem
+        statusMenu?.setConfigProblem(problem)
+    }
+
     // MARK: Actions
 
-    /// Back to the session (menu row or notification), which also reads it.
-    private func open(_ key: SessionKey) {
-        markRead(key)
+    /// Back to the session (menu row or notification), which also reads it
+    /// unless the click came from a sample banner.
+    func open(_ key: SessionKey, markingRead: Bool = true) {
+        guard hasDelivered else {
+            pendingOpens.append((key, markingRead))
+            return
+        }
+        if markingRead { markRead(key) }
         // An ended session (tab closed, app restarted since the banner) still
         // routes: its deep link reopens the conversation in the editor.
-        let session = sessions.first { $0.key == key } ?? lastKnown[key] ?? Self.placeholder(for: key)
-        // Planning reads process tables and editor logs: keep it off the main thread.
+        route(sessions.first { $0.key == key } ?? lastKnown[key] ?? Self.placeholder(for: key))
+    }
+
+    /// Plans the route and takes it. Planning reads process tables and
+    /// editor logs: keep it off the main thread.
+    static func takeRoute(_ session: TrackedSession) {
         DispatchQueue.global(qos: .userInitiated).async {
             let plan = Router.plan(for: session)
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { _ = RouteExecutor().execute(plan, for: key) }
+                MainActor.assumeIsolated { _ = RouteExecutor().execute(plan, for: session.key) }
             }
         }
     }
@@ -195,8 +286,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     nonisolated static var testTriggerURL: URL { AppPaths.stateDir.appendingPathComponent("test-notification") }
 
+    enum TestRequest: Equatable {
+        case fresh(query: String)
+        case stale(age: TimeInterval)
+    }
+
+    /// Reads and removes the request at `url`, if any. One written more than
+    /// `testRequestMaxAge` from `now` (by the file's date) was left while the
+    /// app was not running: a sample banner popping up at a later launch,
+    /// maybe days later, would only puzzle.
+    nonisolated static func takeTestRequest(at url: URL, now: Date) -> TestRequest? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let written = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        try? FileManager.default.removeItem(at: url)
+        let age = written.map { now.timeIntervalSince($0) } ?? 0
+        guard abs(age) <= testRequestMaxAge else { return .stale(age: age) }
+        return .fresh(query: String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     /// An empty query means the first listed session.
-    private func sendTestNotification(query: String) {
+    func sendTestNotification(query: String) {
         guard let notifier else {
             Log.shared.warn("test notification: notifications are unavailable outside the .app bundle")
             return
@@ -243,14 +352,19 @@ final class SessionEngine: @unchecked Sendable {
     private let queue = DispatchQueue(label: "ai-sessions.engine", qos: .utility)
     private let store: StateStore
     private let snapshot: SnapshotWriter?
+    private let makeSources: (Config) -> [SessionSource]
     private var config: Config
     private var tracker: Tracker
 
-    init(config: Config, store: StateStore, snapshot: SnapshotWriter? = nil) {
+    /// `makeSources` is for tests (fake sources); the app reads the
+    /// configured Claude dirs and Codex homes.
+    init(config: Config, store: StateStore, snapshot: SnapshotWriter? = nil,
+         makeSources: @escaping (Config) -> [SessionSource] = SessionEngine.makeSources(for:)) {
         self.config = config
         self.store = store
         self.snapshot = snapshot
-        tracker = Tracker(sources: Self.makeSources(for: config), store: store, config: config)
+        self.makeSources = makeSources
+        tracker = Tracker(sources: makeSources(config), store: store, config: config)
     }
 
     /// One tick on the engine queue; `deliver` runs on the main queue.
@@ -293,7 +407,7 @@ final class SessionEngine: @unchecked Sendable {
             config = new
             if new.claudeConfigDirs != old.claudeConfigDirs || new.codexHomes != old.codexHomes
                 || new.codexRecentHours != old.codexRecentHours {
-                tracker = Tracker(sources: Self.makeSources(for: new), store: store, config: new)
+                tracker = Tracker(sources: makeSources(new), store: store, config: new)
             } else {
                 tracker.config = new
             }

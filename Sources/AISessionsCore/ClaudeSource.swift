@@ -21,6 +21,18 @@ public final class ClaudeSource: SessionSource {
 
     /// Without a status change, a growing transcript is re-read at most this often.
     static let transcriptRefreshInterval: TimeInterval = 5
+    /// …and this often while the session is busy: an answer given while
+    /// background work keeps the record "busy" shows only in the transcript.
+    static let busyTranscriptRefreshInterval: TimeInterval = 2
+    /// The raw status of a session that has answered while its background
+    /// work (agents, workflows, shells) still keeps the record busy.
+    public static let answeredWhileBusy = "busy:background"
+    /// Claude writes a turn's last transcript entry ~200 ms before its record
+    /// flips busy → idle. A flip seen before the transcript shows how the
+    /// turn ended is held as running for at most this long, the transcript
+    /// re-read every poll, before it counts as a completed turn: an Esc whose
+    /// marker lands late must not be announced as "done".
+    static let transcriptLagAllowance: TimeInterval = 2
     static let maxRecordBytes = 64 * 1024
     /// A record still unparseable after this long is broken, not mid-write.
     static let unparseableReportDelay: TimeInterval = 5
@@ -57,14 +69,31 @@ public final class ClaudeSource: SessionSource {
         let sessionId: String
     }
 
-    private final class TranscriptState {
+    /// One session as the source follows it: its transcript, and what the
+    /// previous poll reported.
+    private final class FollowedSession {
         let cache: ClaudeTranscriptCache
         var refreshedAt: Date?
         var refreshedStatus: String?
+        /// Lets a dialog over a turn, or a transcript that lags the registry,
+        /// keep the turn running.
+        var lastReport: Report?
+        /// The first poll that saw busy → idle before the transcript showed
+        /// how the turn ended.
+        var flipSeenAt: Date?
 
         init(cache: ClaudeTranscriptCache) {
             self.cache = cache
         }
+    }
+
+    /// The state part of an observation, and the process it came from.
+    private struct Report {
+        var state: ActivityState
+        var rawStatus: String?
+        var stateSince: Date?
+        var pid: Int32
+        var procStart: String?
     }
 
     private typealias Winner = (record: ClaudeRegistryRecord, configDir: URL)
@@ -77,7 +106,7 @@ public final class ClaudeSource: SessionSource {
     private var registryChanged = false
     private var startVerdicts: [ProcessIdentity: Bool] = [:]
     private var hosts: [HostKey: SessionHost] = [:]
-    private var transcripts: [TranscriptKey: TranscriptState] = [:]
+    private var followed: [TranscriptKey: FollowedSession] = [:]
     private var reported: Set<String> = []
 
     public convenience init(configDirs: [URL]) {
@@ -196,20 +225,99 @@ public final class ClaudeSource: SessionSource {
     // MARK: Observations
 
     private func observation(for record: ClaudeRegistryRecord, configDir: URL, now: Date) -> Observation {
-        let transcript = transcriptInfo(for: record, configDir: configDir, now: now)
+        let session = followedSession(for: record, configDir: configDir)
+        let previous = session.lastReport
+        var report = Report(state: ClaudeRegistry.activityState(status: record.status, waitingFor: record.waitingFor),
+                            rawStatus: ClaudeRegistry.rawStatus(status: record.status, waitingFor: record.waitingFor),
+                            stateSince: record.stateSince, pid: record.pid, procStart: record.procStart)
+        // The record left busy, or shows a dialog over the turn: whether and
+        // how the turn ended is in the transcript, read now and every poll
+        // until it says.
+        let turnMayHaveEnded = report.state == .idle && previous?.state == .running
+        let transcript = transcriptInfo(of: session, record: record, now: now, urgent: turnMayHaveEnded)
+        var turnEnd: TurnEnd?
+        if record.status == "busy", report.state == .running {
+            // Claude keeps the record busy while background work it started
+            // runs, even after answering. A transcript resting on this turn's
+            // end means it has answered: that is the "done" worth announcing.
+            session.flipSeenAt = nil
+            // Only a dated answer from inside this busy stretch counts: an
+            // undated one could be the previous turn's, and announcing it would
+            // be a false "done" (the record cannot tell; the transcript must).
+            if let resting = transcript.restingTurnEnd, let answeredAt = resting.at,
+               let busySince = report.stateSince, answeredAt >= busySince {
+                report.state = .idle
+                report.rawStatus = Self.answeredWhileBusy
+                report.stateSince = answeredAt
+                turnEnd = resting.kind
+            } else if let started = transcript.turnStartedAt, let since = report.stateSince, started > since {
+                // A later turn of the same busy stretch (background work woke
+                // Claude up): time it from its own first message.
+                report.stateSince = started
+            }
+        } else if turnMayHaveEnded, let previous {
+            (report, turnEnd) = endOfTurn(report, after: previous, record: record, transcript: transcript,
+                                          session: session, now: now)
+        } else {
+            session.flipSeenAt = nil
+            if report.state == .idle { turnEnd = transcript.lastTurnEnd?.kind }
+        }
+        session.lastReport = report
         return Observation(
             key: SessionKey(agent: .claude, id: record.sessionId),
-            state: ClaudeRegistry.activityState(status: record.status),
-            rawStatus: record.status,
-            stateSince: record.stateSince,
+            state: report.state,
+            rawStatus: report.rawStatus,
+            stateSince: report.stateSince,
             title: Self.title(record: record, transcript: transcript),
             cwd: record.cwd,
             pid: record.pid,
             entrypoint: record.entrypoint,
             lastMessage: transcript.lastAssistantText,
             host: host(for: record),
-            interactive: ClaudeRegistry.isInteractive(kind: record.kind, entrypoint: record.entrypoint)
+            interactive: ClaudeRegistry.isInteractive(kind: record.kind, entrypoint: record.entrypoint),
+            procStart: record.procStart,
+            turnEnd: turnEnd
         )
+    }
+
+    /// busy → idle, or a dialog opened over a running turn. The turn ended
+    /// if the transcript's newest turn-ending entry (an "end_turn" answer or
+    /// the Esc marker) is not older than the turn's start. Without one, a
+    /// dialog keeps the turn running (it can open mid-turn), and a plain flip
+    /// is held as running for `transcriptLagAllowance` before it counts as
+    /// completed (the entry may still be on its way to disk).
+    private func endOfTurn(_ idle: Report, after running: Report, record: ClaudeRegistryRecord,
+                           transcript: TranscriptInfo, session: FollowedSession, now: Date) -> (Report, TurnEnd?) {
+        // Another process holds the session now (a resume raced the one that
+        // was running): whatever became of that turn, it did not end here.
+        if running.pid != idle.pid || running.procStart != idle.procStart {
+            session.flipSeenAt = nil
+            return (idle, .abandoned)
+        }
+        if let end = transcript.lastTurnEnd, Self.ends(end, turnStartedAt: running.stateSince) {
+            session.flipSeenAt = nil
+            return (idle, end.kind)
+        }
+        var held = running
+        held.rawStatus = idle.rawStatus
+        if record.isShowingDialog { return (held, nil) }
+        // No transcript read yet: there is nothing to wait for.
+        guard session.cache.readStamp != nil else {
+            session.flipSeenAt = nil
+            return (idle, nil)
+        }
+        let seen = session.flipSeenAt ?? now
+        session.flipSeenAt = seen
+        if Self.elapsed(from: seen, to: now) < Self.transcriptLagAllowance { return (held, nil) }
+        session.flipSeenAt = nil
+        return (idle, .completed)
+    }
+
+    /// Whether `end` ended the turn that started at `start` rather than an
+    /// earlier one. Without both times there is no telling: it counts.
+    private static func ends(_ end: TranscriptTurnEnd, turnStartedAt start: Date?) -> Bool {
+        guard let at = end.at, let start else { return true }
+        return at >= start
     }
 
     /// customTitle > aiTitle > registry name > last prompt > "Claude <id prefix>".
@@ -221,23 +329,26 @@ public final class ClaudeSource: SessionSource {
         return "Claude " + record.sessionId.prefix(8)
     }
 
-    private func transcriptInfo(for record: ClaudeRegistryRecord, configDir: URL, now: Date) -> TranscriptInfo {
+    private func followedSession(for record: ClaudeRegistryRecord, configDir: URL) -> FollowedSession {
         let key = TranscriptKey(configDir: configDir.path, sessionId: record.sessionId)
-        let state: TranscriptState
-        if let existing = transcripts[key] {
-            state = existing
-        } else {
-            state = TranscriptState(cache: ClaudeTranscriptCache(
-                sessionId: record.sessionId, configDir: configDir, cwd: record.cwd))
-            transcripts[key] = state
-        }
-        let cache = state.cache
+        if let existing = followed[key] { return existing }
+        let session = FollowedSession(cache: ClaudeTranscriptCache(
+            sessionId: record.sessionId, configDir: configDir, cwd: record.cwd))
+        followed[key] = session
+        return session
+    }
+
+    /// The session's transcript, re-read when its stamp changed and either
+    /// `urgent`, the status flipped (the turn just ended, so the last message
+    /// matters now) or 5 s passed since the last read.
+    private func transcriptInfo(of session: FollowedSession, record: ClaudeRegistryRecord, now: Date,
+                                urgent: Bool) -> TranscriptInfo {
+        let cache = session.cache
         guard let stamp = cache.currentStamp(now: now), stamp != cache.readStamp else { return cache.info }
-        // A status flip is when the last message matters (the turn just ended),
-        // so it is read at once; otherwise a growing file is read every 5 s.
-        let statusChanged = state.refreshedAt != nil && state.refreshedStatus != record.status
-        let due = state.refreshedAt.map { Self.elapsed(from: $0, to: now) >= Self.transcriptRefreshInterval } ?? true
-        guard statusChanged || due else { return cache.info }
+        let statusChanged = session.refreshedAt != nil && session.refreshedStatus != record.status
+        let interval = record.status == "busy" ? Self.busyTranscriptRefreshInterval : Self.transcriptRefreshInterval
+        let due = session.refreshedAt.map { Self.elapsed(from: $0, to: now) >= interval } ?? true
+        guard urgent || statusChanged || due else { return cache.info }
         do {
             try cache.refresh()
         } catch where !ClaudeFileIO.isNotFound(error) {
@@ -246,8 +357,8 @@ public final class ClaudeSource: SessionSource {
         } catch {
             // Gone since the stat: the next poll locates it again.
         }
-        state.refreshedAt = now
-        state.refreshedStatus = record.status
+        session.refreshedAt = now
+        session.refreshedStatus = record.status
         return cache.info
     }
 
@@ -270,8 +381,8 @@ public final class ClaudeSource: SessionSource {
             startVerdicts = startVerdicts.filter { identities.contains($0.key) }
             hosts = hosts.filter { identities.contains($0.key.process) }
         }
-        if transcripts.keys.contains(where: { winners[$0.sessionId]?.configDir.path != $0.configDir }) {
-            transcripts = transcripts.filter { winners[$0.key.sessionId]?.configDir.path == $0.key.configDir }
+        if followed.keys.contains(where: { winners[$0.sessionId]?.configDir.path != $0.configDir }) {
+            followed = followed.filter { winners[$0.key.sessionId]?.configDir.path == $0.key.configDir }
         }
     }
 

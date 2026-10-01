@@ -29,6 +29,18 @@ Every live Claude process writes `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`
   itself maps `busy → running`, `waiting → waiting`, anything else → `idle`
   (function `jI0` in its `extension.js`). Unknown future values → idle, keep
   the raw string.
+- `waitingFor` (only with `"waiting"`; CLI 2.1.284, functions `ife`/`d9t`)
+  says why: `"permission prompt"` (the default for a top dialog: a tool
+  permission, a plan approval), `"input needed"`, `"worker request"`,
+  `"sandbox request"`, `"goal proposal"`, or `"dialog open"`. The terminal UI
+  writes `"dialog open"` while the user has a slash-command dialog open
+  (/model, /config, /resume, /usage, /help…: `isShowingLocalJSXCommand`).
+  The user is typing in it and nothing waits on them, so **`waiting` with
+  `"dialog open"` counts as idle, never needs-input**. The same value also
+  marks a few blocking notices ("Session paused" to retry on a fallback model
+  or continue on usage credits, managed-settings review, auto-mode notices),
+  which are therefore not announced either: the registry carries no finer
+  reason.
 - A turn end was observed live: `busy → idle` written ~200 ms after the final
   assistant message hit the transcript. `statusUpdatedAt` (epoch **ms**) is
   the transition time. `updatedAt` does NOT heartbeat — it only moves on
@@ -69,6 +81,12 @@ Title precedence: `customTitle` > `aiTitle` > registry `name` (e.g.
 `coreos-e1`) > `lastPrompt` > short session id. Last message preview: text of
 the last `assistant` entry that has a non-empty text block.
 
+**Interrupted turn**: when the user presses Esc, the CLI appends a `user`
+entry whose text is `[Request interrupted by user]` (or `[Request interrupted
+by user for tool use]`; the CLI's own pattern is
+`\[Request interrupted by user[^\]]*\]`) after the last assistant text, then
+goes `busy → idle`. That turn was stopped, not finished: it is never announced.
+
 ### Codex: rollout files + state DB (verified)
 
 - Default home `~/.codex` (VS Code extension, originator `codex_vscode`).
@@ -83,11 +101,18 @@ the last `assistant` entry that has a non-empty text block.
     `{"subagent":…}` for sub-agents), `thread_source`, `cli_version`.
   - `type:"event_msg"` with `payload.type`:
     `task_started` → running; `task_complete` (has `turn_id`,
-    `last_agent_message`, often empty) → idle; `turn_aborted` → idle (user
-    interrupted); `agent_message` (`payload.message`) → preview text;
+    `last_agent_message`, often empty) → idle; `turn_aborted` → idle, an
+    interrupted turn (Stop, whatever the reason given): never announced;
+    `agent_message` (`payload.message`) → preview text;
     `user_message` (`payload.message`). Approval requests may not be
     persisted; if a `*approval_request*`/`request_user_input` event appears,
     treat as waiting.
+- **Abandoned turns**: a turn whose rollout gets no new line for ≥ 3 h, or
+  for ≥ 2 min while no `codex` process is alive, is reported idle as
+  abandoned: its app-server was killed (VS Code quit or reloaded mid-turn, a
+  crash) and no turn end will ever be written. Silent, like an interruption.
+  Without it such a thread stayed "running" for as long as the app ran, and
+  was adopted as running again after a restart.
 - Titles: `<home>/state_<N>.sqlite` (highest N; currently `state_5.sqlite`),
   table `threads(id, title, cwd, source, originator, updated_at, archived,
   rollout_path, first_user_message, preview, …)`. Open read-only
@@ -104,29 +129,74 @@ VS Code routes a `vscode://` URI to a specific window when the query contains
 active window. After the target window handles it, VS Code **force-focuses
 that window** (`URLService.handleURL → focusWindow({mode: Force})`).
 
+- **The window match is a prefix match** (VS Code 1.139.1 `main.js`): the
+  router tests ``new RegExp(`window:${id}`)``, unanchored, against each IPC
+  connection's ctx (`window:<n>`) and takes the first match in the
+  connections' insertion order. So `windowId=1` also matches `window:12` (2
+  matches 20–29, …), and a window that reloads or opens a folder reconnects
+  at the end of that order. Window ids are Electron BrowserWindow ids, never
+  reused while VS Code runs, so ids of 10 and more appear in a long session.
+  No link can avoid it (an upstream bug: the regex wants `^…$`). When another
+  live window's id starts with the target's digits, the plan's summary
+  carries a warning and the log a WARN line
+  (`may deliver windowId=1 to window 12`); nothing else changes.
+- **Every link may ask once.** The workbench (`handleURL`) asks "Allow
+  '<extension display name>' extension to open this URI?" unless the URI is
+  marked trusted (one from the OS is not), the extension is in product.json
+  `trustedExtensionProtocolHandlers` (only `vscode.git`,
+  `vscode.github-authentication`, `vscode.microsoft-authentication`,
+  `github.vscode-pull-request-github`), or the user trusts it. Neither
+  Anthropic nor OpenAI is listed, so the first Claude link ('Claude Code for
+  VS Code') and the first Codex link ('Codex – OpenAI's coding agent') each
+  ask; dismissing the question opens nothing. Trust comes from ticking "Do
+  not ask me again for this extension" (stored in
+  `extensionUrlHandler.confirmedExtensions`) or, ahead of time, the user
+  setting
+  `"extensions.confirmedUriHandlerExtensionIds": ["anthropic.claude-code", "openai.chatgpt"]`.
 - **Claude tab**: `vscode://anthropic.claude-code/open?session=<uuid>[&windowId=<n>]`
   → `claude-vscode.primaryEditor.open(session)` → `createPanel`: if that window
   already has a panel for the session it calls `panel.reveal()` (no duplicate);
   a remembered tab after reload is revealed via group focus +
   `workbench.action.openEditorAtIndex`; only otherwise does it open a new tab
   that resumes the session. So the URI must reach the window that owns the
-  tab → always add `windowId` when known.
-  First use shows VS Code's "Allow 'Claude Code' to open this URI?" dialog
-  (Anthropic is not a trusted publisher); tick "Don't ask again" once.
+  tab → always add `windowId` when known. `createPanel` knows only editor
+  panels: a session kept in the Claude sidebar
+  (`claudeCode.preferredLocation: "sidebar"`) opens as an editor tab, since
+  only the extension's own `editor.open` consults the preferred location.
 - **Codex thread**: `vscode://openai.chatgpt/local/<threadId>` → the extension
-  focuses the Codex sidebar and navigates its webview to the thread. OpenAI
-  is a trusted publisher: no dialog. Add `?windowId=<n>` only when more than
-  one window is open (the query is forwarded into the webview route).
-- **Window id of an extension host**: the newest session dir under
+  focuses the Codex sidebar and navigates its webview to the thread. Add
+  `?windowId=<n>` only when more than one window is open (the query is
+  forwarded into the webview route).
+- **Window id of an extension host**: first the log the extension host
+  keeps open on one fd for life (`…/logs/<session>/window<N>/exthost/…`, via
+  libproc), else the logs folder: a session dir
   `~/Library/Application Support/Code/logs/<yyyymmddThhmmss>/` has
   `window<N>/exthost/exthost.log` containing
   `Extension host with pid <PID> started` (verified: window1 ↔ 3819).
   Use the LAST such line per window file (reloads append). Live window count =
-  windows whose pid is alive.
-- Other editors in the same family use their own scheme and app-data folder
-  (Insiders: `vscode-insiders` / `Code - Insiders`; Cursor: `cursor` /
-  `Cursor`; Windsurf: `windsurf` / `Windsurf`; VSCodium: `vscodium` /
-  `VSCodium`) — derive them from the extension host's app bundle path.
+  windows whose pid is alive, in the newest launch that has any.
+  A `code` CLI launch (`code <path>`, `git commit` with `code --wait` as the
+  editor) creates a session dir with no windows before it hands off to the
+  running instance, and VS Code prunes old dirs only at startup, so such dirs
+  pile up above the running launch's. The walk therefore lists the newest
+  ≤ 15 session dirs, skips those with no `window<N>` entry, and reads the
+  first ≤ 3 that have one (more than one only in case a clock change made
+  a newer launch sort lower).
+- **Editor family** (URL scheme, app-data folder, bundle id), from the
+  outermost `.app` of the extension host's path. Known by name: VS Code
+  (`vscode` / `Code`), Insiders (`vscode-insiders` / `Code - Insiders`),
+  Cursor (`cursor` / `Cursor`), Windsurf (`windsurf` / `Windsurf`), VSCodium
+  (`vscodium` / `VSCodium`). Any other Electron app (a fork: Antigravity,
+  Kiro, Trae, Positron…) is read from the keys VS Code derives these from:
+  `Contents/Resources/app/product.json` `urlProtocol` and `nameShort`, and
+  `Contents/Info.plist` `CFBundleIdentifier` (verified on VS Code 1.139.1:
+  `vscode`, `Code`, `com.microsoft.VSCode`). A renamed copy of a known editor
+  is known by its bundle id. Without a product.json, or with a scheme a
+  known editor owns, the family has no scheme and the plan only activates
+  the app by bundle id; routing a fork as VS Code would send its window id
+  into an unrelated VS Code window. Only Electron apps run extension hosts,
+  so a path in no bundle, or in a non-Electron one, names no editor:
+  VS Code is assumed.
 - **Terminal CLI sessions**: activate the nearest GUI-app ancestor of the
   claude process (Terminal, iTerm2, Ghostty…). No tab-level focus (it would
   need Automation permission).
@@ -168,16 +238,31 @@ Per `SessionKey`, compare the new observation with the stored one:
 
 | from → to | event | unread |
 |---|---|---|
-| running → idle | `.finished` (duration = idle.stateSince − turnStartedAt) | true iff duration ≥ `minTurnSecondsToNotify` |
+| running → idle, the turn completed | `.finished` (duration = idle.stateSince − turnStartedAt) | true iff duration ≥ `minTurnSecondsToNotify` |
+| running → idle, the turn was interrupted or abandoned | none | false |
 | any → waiting | `.needsInput` | true |
 | any → running | `.resumed` | false (user or agent started a new turn) |
-| waiting → idle | none | false (the user dealt with it) |
+| waiting → idle | none; its banner is withdrawn | false (the user dealt with it) |
 | idle → idle with a newer `stateSince` | none (a turn too short to see) | unchanged |
-| present → missing | `.ended` | entry removed |
+| present → missing | `.ended` | entry removed; its banners stay |
 
-- A session seen for the first time is adopted silently (no event), unless
-  the persisted state says it was `running` and it is now `idle` with a newer
-  `stateSince` — a turn finished while the app was not running → `.finished`.
+- **Interrupted**: the user stopped the turn (Esc in Claude, which leaves
+  `[Request interrupted by user…]` in the transcript; Stop in Codex, which
+  writes `turn_aborted`). **Abandoned**: a Codex turn that will never end
+  (see Codex). Neither left an answer to look at, so neither is announced.
+- A registry `waiting` with `waitingFor: "dialog open"` (a slash-command
+  dialog in the terminal) is idle, not waiting, so it never raises
+  `.needsInput`.
+- A session seen for the first time is adopted silently (no event), with two
+  exceptions read from the persisted state:
+  - it was `running` and is now `idle` with a newer `stateSince`: a turn
+    finished while the app was not running → `.finished`, but only if the
+    turn completed, ended at most 60 min ago, and, for Claude, ended in the
+    process the record names (pid and `procStart`). A session resumed in a
+    new process did not finish its turn; it died with the old one. Codex
+    threads have no process, so only the age applies.
+  - it is `waiting` in a waiting period the record did not know: a question
+    asked while the app was not running → `.needsInput`.
 - On the very first run (no `state.json`) nothing is announced.
 - `markRead(key)` / `markAllRead()` clear `unread`. Persist on change
   (atomic write), keep records of ended sessions for 24 h then prune.
@@ -199,12 +284,22 @@ Per `SessionKey`, compare the new observation with the stored one:
   title + secondary "project · Claude · 4m"; tooltip = last message; click →
   route + mark read; ⌥-click (alternate) → mark read only. Footer: Mark All as
   Read, Pause/Resume Notifications, Open Log, Open Folder, Notification
-  Settings…, Quit.
+  Settings…, Send Test Notification, Quit. When macOS will not show the
+  banners, a fix-it row at the top ("Notifications are off — Turn On…", or
+  "Notifications are silent (style: None) — Change…") opens their settings.
 - Notifications (UserNotifications): one per session (identifier = key, so
   a newer one replaces the older), title = session title, subtitle =
   "Claude · coreOS · done in 4m" / "needs your input", body = last message
   preview. Click → route + mark read. Delivered notifications for a session
-  are removed when it is read or resumes.
+  are withdrawn when it stops needing attention (read, resumed, or a question
+  answered: waiting → idle), but not when it ends: a window reload or an
+  editor quit leaves its "done" banner in place.
+- `config.json` is re-read when it changes. A file that no longer decodes
+  keeps the previous settings (and logs a warning) instead of resetting
+  every setting to its default.
+- `state/` is private: the folder is 0700 and every file in it 0600. It
+  holds titles (often the user's own prompt), last messages and cwds copied
+  out of `~/.claude`, which is 0700.
 - Requires a real `.app` bundle, ad-hoc signed, registered with
   LaunchServices, outside `/var/folders`; installed at
   `~/Applications/AISessions.app`. The first launch asks for notification
@@ -218,5 +313,8 @@ Per `SessionKey`, compare the new observation with the stored one:
 
 `swift test` covers parsing, the tracker state machine, routing plans and
 window mapping with fixture files and fake processes. `AISessions --headless`
-runs the engine without UI (logs events, writes `state/snapshot.json`);
-`AISessions --route <key>` prints (or with `--open`, executes) the route plan.
+runs the engine without UI (logs events, writes a snapshot). It keeps its own
+state, snapshot and log under `state/headless/`, so it can run next to the
+menu-bar app without undoing its read marks; `--use-app-state` makes it use
+the app's files instead. `AISessions --route <key>` prints (or with `--open`,
+executes) the route plan.

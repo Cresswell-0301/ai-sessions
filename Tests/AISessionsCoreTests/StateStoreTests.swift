@@ -67,7 +67,8 @@ final class StateStoreTests: XCTestCase {
         let saved = StateStore.Record(
             state: .running, stateSince: Date(timeIntervalSince1970: 1_790_823_673.8216789),
             turnStartedAt: Date(timeIntervalSince1970: 1_790_823_600.123), lastTurnDuration: 12.5,
-            unread: true, ended: false, lastSeen: t0)
+            unread: true, ended: false, lastSeen: t0, pid: 48433, procStart: "Thu Oct  1 02:59:07 2026",
+            lastTurnEnd: .interrupted)
         store.update(saved, for: codexB)
         store.update(record(.idle, seen: t0, ended: true), for: claudeA)
         store.markInitialized()
@@ -106,6 +107,20 @@ final class StateStoreTests: XCTestCase {
         store.markInitialized()
         try store.save(now: t0)
         XCTAssertFalse(StateStore(url: url).isFirstRun, "the next save starts a clean file")
+    }
+
+    func testARecordWrittenBeforeTheProcessWasRememberedStillLoads() throws {
+        try writeRaw("""
+        {"version": 1, "initialized": true, "sessions": {
+          "claude:c": {"state": "running", "stateSince": 1790800000, "turnStartedAt": 1790800000,
+                       "unread": false, "ended": false, "lastSeen": 1790800000}
+        }}
+        """)
+        let record = try XCTUnwrap(StateStore(url: url).record(for: claudeC))
+        XCTAssertEqual(record.state, .running)
+        XCTAssertNil(record.pid)
+        XCTAssertNil(record.procStart)
+        XCTAssertNil(record.lastTurnEnd)
     }
 
     func testOtherUnusableContentAlsoReadsAsAFirstRun() throws {

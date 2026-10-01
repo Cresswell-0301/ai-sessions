@@ -15,6 +15,10 @@ public struct ClaudeRegistryRecord: Decodable, Equatable, Sendable {
     public var entrypoint: String?
     public var name: String?
     public var status: String?
+    /// Why a "waiting" session waits: "permission prompt", "input needed",
+    /// "worker request", "sandbox request", or "dialog open" (the terminal
+    /// UI shows a slash-command dialog such as /model). Absent otherwise.
+    public var waitingFor: String?
     /// Epoch milliseconds of the last write. It does not heartbeat.
     public var updatedAt: Double?
     /// Epoch milliseconds of the last status transition.
@@ -31,7 +35,8 @@ public struct ClaudeRegistryRecord: Decodable, Equatable, Sendable {
         name: String? = nil,
         status: String? = nil,
         updatedAt: Double? = nil,
-        statusUpdatedAt: Double? = nil
+        statusUpdatedAt: Double? = nil,
+        waitingFor: String? = nil
     ) {
         self.pid = pid
         self.sessionId = sessionId
@@ -42,12 +47,13 @@ public struct ClaudeRegistryRecord: Decodable, Equatable, Sendable {
         self.entrypoint = entrypoint
         self.name = name
         self.status = status
+        self.waitingFor = waitingFor
         self.updatedAt = updatedAt
         self.statusUpdatedAt = statusUpdatedAt
     }
 
     private enum CodingKeys: String, CodingKey {
-        case pid, sessionId, cwd, startedAt, procStart, kind, entrypoint, name, status,
+        case pid, sessionId, cwd, startedAt, procStart, kind, entrypoint, name, status, waitingFor,
              updatedAt, statusUpdatedAt
     }
 
@@ -64,12 +70,18 @@ public struct ClaudeRegistryRecord: Decodable, Equatable, Sendable {
         entrypoint = Self.optional(c, .entrypoint)
         name = Self.optional(c, .name)
         status = Self.optional(c, .status)
+        waitingFor = Self.optional(c, .waitingFor)
         updatedAt = Self.optional(c, .updatedAt)
         statusUpdatedAt = Self.optional(c, .statusUpdatedAt)
     }
 
     private static func optional<T: Decodable>(_ c: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> T? {
         try? c.decodeIfPresent(T.self, forKey: key)
+    }
+
+    /// The terminal UI shows a slash-command dialog: "waiting", on nobody.
+    public var isShowingDialog: Bool {
+        status == "waiting" && waitingFor == ClaudeRegistry.dialogOpen
     }
 
     /// When the current status was entered.
@@ -151,14 +163,29 @@ public enum ClaudeRegistry {
         return delay >= -startedAtSlack && delay <= startedAtWindow
     }
 
+    /// The `waitingFor` of a terminal session showing a slash-command dialog
+    /// (/model, /config, /resume, /usage, … — every "local-jsx" command).
+    static let dialogOpen = "dialog open"
+
     /// The extension's own mapping: busy → running, waiting → waiting,
-    /// anything else (including future values) → idle.
-    public static func activityState(status: String?) -> ActivityState {
+    /// anything else (including future values) → idle. Except that a waiting
+    /// session showing a dialog is idle: the terminal UI writes "waiting"
+    /// while one is open, but the user opened it and is typing in it, and
+    /// nothing waits on them. Every other reason, or none, still waits.
+    public static func activityState(status: String?, waitingFor: String? = nil) -> ActivityState {
         switch status {
         case "busy": return .running
-        case "waiting": return .waiting
+        case "waiting": return waitingFor == dialogOpen ? .idle : .waiting
         default: return .idle
         }
+    }
+
+    /// `status`, with the reason a waiting session waits appended
+    /// ("waiting:permission prompt", "waiting:dialog open"), so the raw
+    /// status still tells a dialog from a question.
+    public static func rawStatus(status: String?, waitingFor: String?) -> String? {
+        guard let status, status == "waiting", let waitingFor, !waitingFor.isEmpty else { return status }
+        return status + ":" + waitingFor
     }
 
     /// Mirrors the extension's classification: a `kind` other than
