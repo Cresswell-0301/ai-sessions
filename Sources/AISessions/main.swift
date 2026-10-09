@@ -11,7 +11,7 @@ let launchMode = LaunchMode.parse(Array(CommandLine.arguments.dropFirst()))
 _ = umask(0o077)
 switch launchMode {
 case .gui, .headless, .testNotification: AppPaths.secureStateDirectory(create: true)
-case .route, .version, .help, .invalid: AppPaths.secureStateDirectory(create: false)
+case .route, .showUsage, .telegramTest, .version, .help, .invalid: AppPaths.secureStateDirectory(create: false)
 }
 
 switch launchMode {
@@ -36,6 +36,10 @@ case .testNotification(let query):
         FileHandle.standardError.write(Data("could not write \(AppDelegate.testTriggerURL.path): \(error.localizedDescription)\n".utf8))
         exit(1)
     }
+case .showUsage:
+    exit(runUsage())
+case .telegramTest:
+    exit(runTelegramTest())
 case .version:
     print("\(AppInfo.name) \(AppInfo.version)")
 case .help:
@@ -59,6 +63,8 @@ enum LaunchMode: Equatable {
     case headless(useAppState: Bool)
     case route(query: String, open: Bool)
     case testNotification(query: String)
+    case showUsage
+    case telegramTest
     case version
     case help
     case invalid(String)
@@ -79,6 +85,9 @@ enum LaunchMode: Equatable {
                AISessions --test-notification [<key>]
                                                 ask the running app to post a sample notification
                                                 for a session (default: the first listed one)
+               AISessions --usage                print every account's usage limits as the alerts
+                                                see them (read-only: the dashboard's last scan)
+               AISessions --telegram-test        send a test message to the connected Telegram chat
                AISessions --version
         """
 
@@ -92,6 +101,8 @@ enum LaunchMode: Equatable {
             switch argument {
             case "--headless": next = .headless(useAppState: false)
             case "--version": next = .version
+            case "--usage": next = .showUsage
+            case "--telegram-test": next = .telegramTest
             case "--help", "-h": next = .help
             case "--open":
                 open = true
@@ -113,7 +124,9 @@ enum LaunchMode: Equatable {
                 if argument.hasPrefix("-psn_") { continue }
                 return .invalid("unknown argument: \(argument)")
             }
-            guard mode == nil else { return .invalid("choose one of --headless, --route, --test-notification, --version") }
+            guard mode == nil else {
+                return .invalid("choose one of --headless, --route, --test-notification, --usage, --telegram-test, --version")
+            }
             mode = next
         }
         switch mode {
@@ -129,6 +142,97 @@ enum LaunchMode: Equatable {
             return other ?? .gui
         }
     }
+}
+
+// MARK: - --usage / --telegram-test
+
+/// Blocks on one async step: these command-line modes have no run loop.
+private func waitFor<T: Sendable>(_ body: @escaping @Sendable () async -> T) -> T {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = ResultBox<T>()
+    Task.detached {
+        box.value = await body()
+        semaphore.signal()
+    }
+    semaphore.wait()
+    return box.value!
+}
+
+private final class ResultBox<T>: @unchecked Sendable { var value: T? }
+
+private enum UsageFetch: Sendable {
+    case success(UsageSnapshot)
+    case failure(String)
+}
+
+/// The dashboard's last scan, or why it could not be read.
+private func fetchUsage(_ config: Config) -> UsageFetch {
+    guard let base = URL(string: config.usageDashboardURL) else {
+        return .failure("usageDashboardURL is not a URL: \(config.usageDashboardURL)")
+    }
+    let url = base.appendingPathComponent("data.json")
+    return waitFor {
+        do {
+            let data = try await UsageMonitor.urlFetch(url)
+            guard let snapshot = UsageSnapshot.parse(data, fetchedAt: Date()) else {
+                return .failure("\(url.absoluteString) did not answer in the dashboard's shape")
+            }
+            return .success(snapshot)
+        } catch {
+            return .failure("the usage dashboard is not reachable at \(base.absoluteString)")
+        }
+    }
+}
+
+func runUsage() -> Int32 {
+    let config = Config.load()
+    switch fetchUsage(config) {
+    case .failure(let problem):
+        FileHandle.standardError.write(Data("\(problem)\n".utf8))
+        return 1
+    case .success(let snapshot):
+        let threshold = config.usageAlertThreshold
+        let now = Date()
+        print("usage limits (alert at \(Int(threshold))%; \(config.usageAlertsEnabled ? "alerts on" : "alerts OFF"))")
+        for account in UsageMenu.sorted(snapshot.accounts) {
+            let over = account.readable && account.windows.contains { $0.pct.rounded() >= threshold }
+            let resets = UsageMenu.resetsTooltip(account, now: now).map { "  (\($0))" } ?? ""
+            print("  \(over ? "⚠" : " ") \(account.toolName.padding(toLength: 7, withPad: " ", startingAt: 0))"
+                + "\(Formatting.oneLine(UsageText.menuRow(account), max: 120) ?? "")\(resets)")
+        }
+        if let room = snapshot.mostRoom(threshold: threshold) { print("most room now: \(room.label)") }
+        let telegram = TelegramSettings.load()
+        print("telegram: \(telegram.map { $0.summary } ?? "not connected (menu: Usage limits › Set Up Telegram Alerts…)")"
+            + (config.telegramAlerts ? "" : " — telegramAlerts is off"))
+        return 0
+    }
+}
+
+func runTelegramTest() -> Int32 {
+    guard let settings = TelegramSettings.load() else {
+        FileHandle.standardError.write(Data("Telegram is not connected: use the menu, Usage limits › Set Up Telegram Alerts…\n".utf8))
+        return 1
+    }
+    let config = Config.load()
+    var text = "🧪 <b>Test from AI Sessions</b> (command line)\nUsage alerts reach this chat."
+    if case .success(let snapshot) = fetchUsage(config) {
+        text += "\n\n" + UsageText.summary(snapshot, threshold: config.usageAlertThreshold)
+    }
+    let message = text
+    let outcome: String? = waitFor {
+        do {
+            try await TelegramClient(token: settings.botToken).send(html: message, to: settings.chatId)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+    if let outcome {
+        FileHandle.standardError.write(Data("not sent: \(outcome)\n".utf8))
+        return 1
+    }
+    print("sent to \(settings.summary)")
+    return 0
 }
 
 // MARK: - Menu-bar app

@@ -107,10 +107,14 @@ extension UNUserNotificationCenter: NotificationCenterClient {
 @MainActor
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     static let categoryIdentifier = "session"
+    /// Usage-limit alerts: no session behind them; a click opens the dashboard.
+    static let usageCategoryIdentifier = "usage"
+    static let usageIdentifierPrefix = "usage:"
 
     enum Action {
         static let open = "open"
         static let markRead = "mark-read"
+        static let openDashboard = "open-dashboard"
     }
 
     /// What a click on a notification (or one of its buttons) asks for.
@@ -139,6 +143,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// a sample banner, which says nothing about the session's state.
     var onOpen: (_ key: SessionKey, _ markingRead: Bool) -> Void = { _, _ in }
     var onMarkRead: (SessionKey) -> Void = { _ in }
+    /// A click on a usage alert: open its page (the dashboard).
+    var onOpenURL: (URL) -> Void = { _ in }
     var onPermissionChange: (Permission) -> Void = { _ in }
     private(set) var permission: Permission = .unknown
 
@@ -148,13 +154,20 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     init(center: NotificationCenterClient) {
         self.center = center
         super.init()
-        center.install(delegate: self, categories: [UNNotificationCategory(
-            identifier: Self.categoryIdentifier,
-            actions: [
-                UNNotificationAction(identifier: Action.open, title: "Open", options: [.foreground]),
-                UNNotificationAction(identifier: Action.markRead, title: "Mark as Read", options: []),
-            ],
-            intentIdentifiers: [])])
+        center.install(delegate: self, categories: [
+            UNNotificationCategory(
+                identifier: Self.categoryIdentifier,
+                actions: [
+                    UNNotificationAction(identifier: Action.open, title: "Open", options: [.foreground]),
+                    UNNotificationAction(identifier: Action.markRead, title: "Mark as Read", options: []),
+                ],
+                intentIdentifiers: []),
+            UNNotificationCategory(
+                identifier: Self.usageCategoryIdentifier,
+                actions: [UNNotificationAction(identifier: Action.openDashboard, title: "Open Dashboard",
+                                               options: [.foreground])],
+                intentIdentifiers: []),
+        ])
     }
 
     /// Once per launch. macOS asks the user only the first time; afterwards
@@ -251,8 +264,29 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     func removeDelivered(keeping keys: Set<SessionKey>) {
         let keep = Set(keys.map(\.description))
         center.deliveredIdentifiers { [center] delivered in
-            let stale = delivered.filter { !keep.contains($0) }
+            // Usage alerts belong to no session: they stay until dismissed.
+            let stale = delivered.filter { !keep.contains($0) && !$0.hasPrefix(Notifier.usageIdentifierPrefix) }
             if !stale.isEmpty { center.removeDelivered(stale) }
+        }
+    }
+
+    /// A usage-limit alert. One banner per window (`id`), so a newer reading
+    /// of the same window replaces the older; a click opens `url`.
+    func postUsage(id: String, title: String, subtitle: String, body: String, url: URL, sound: Bool) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.subtitle = subtitle
+        content.body = body
+        content.sound = sound ? .default : nil
+        content.categoryIdentifier = Self.usageCategoryIdentifier
+        content.threadIdentifier = "usage"
+        content.userInfo = ["openURL": url.absoluteString]
+        let request = UNNotificationRequest(identifier: Self.usageIdentifierPrefix + id, content: content, trigger: nil)
+        center.post(request) { error in
+            guard let error else { return }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self.report(error) }
+            }
         }
     }
 
@@ -296,7 +330,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     nonisolated static func intent(forAction action: String) -> Intent? {
         switch action {
-        case UNNotificationDefaultActionIdentifier, Action.open: return .open
+        case UNNotificationDefaultActionIdentifier, Action.open, Action.openDashboard: return .open
         case Action.markRead: return .markRead
         default: return nil // dismissed, or an action this version does not know
         }
@@ -317,8 +351,15 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let request = response.notification.request
         let identifier = request.identifier
         let key = request.content.userInfo["key"] as? String
+        let openURL = request.content.userInfo["openURL"] as? String
         DispatchQueue.main.async {
-            MainActor.assumeIsolated { self.respond(action: action, identifier: identifier, key: key) }
+            MainActor.assumeIsolated {
+                if let openURL {
+                    self.respond(action: action, openURL: openURL)
+                } else {
+                    self.respond(action: action, identifier: identifier, key: key)
+                }
+            }
             completionHandler()
         }
     }
@@ -327,6 +368,13 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// like a real one but leaves the session unread: testing the path back
     /// must not clear what the session is waiting to tell. Its "Mark as
     /// Read" button is an explicit request and still marks the session read.
+    /// A click on a usage alert (or its "Open Dashboard" button).
+    func respond(action: String, openURL: String) {
+        guard Self.intent(forAction: action) == .open, let url = URL(string: openURL),
+              url.scheme == "http" || url.scheme == "https" else { return }
+        onOpenURL(url)
+    }
+
     func respond(action: String, identifier: String, key: String?) {
         guard let key = key.flatMap(SessionKey.init(string:)) else { return }
         switch Self.intent(forAction: action) {

@@ -44,6 +44,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// placeholder's, which sends Claude's link to the last active window.
     private var pendingOpens: [(key: SessionKey, markingRead: Bool)] = []
     private var activity: NSObjectProtocol?
+    /// Usage limits from the ai-accounts dashboard (nil until launch finishes).
+    private(set) var usage: UsageMonitor?
+    /// Sends a usage alert to Telegram; tests swap in a recorder.
+    var sendTelegram: (TelegramSettings, String) -> Void = AppDelegate.postToTelegram
 
     override convenience init() {
         self.init { config in
@@ -82,6 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func install(_ notifier: Notifier) {
         notifier.onOpen = { [weak self] key, markingRead in self?.open(key, markingRead: markingRead) }
         notifier.onMarkRead = { [weak self] key in self?.markRead(key) }
+        notifier.onOpenURL = { url in NSWorkspace.shared.open(url) }
         notifier.onPermissionChange = { [weak self] permission in
             self?.statusMenu?.setNotificationPermission(permission)
         }
@@ -98,11 +103,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             markRead: { [weak self] key in self?.markRead(key) },
             markAllRead: { [weak self] in self?.markAllRead() },
             togglePause: { [weak self] in self?.togglePause() },
-            sendTestNotification: { [weak self] in self?.sendTestNotification(query: "") }
+            sendTestNotification: { [weak self] in self?.sendTestNotification(query: "") },
+            openDashboard: { [weak self] in self?.openDashboard() },
+            setUpTelegram: { [weak self] in self?.setUpTelegram() },
+            testTelegram: { [weak self] in self?.testTelegram() },
+            disconnectTelegram: { [weak self] in self?.disconnectTelegram() }
         ))
         statusMenu?.update(sessions: [], paused: paused)
         statusMenu?.setConfigProblem(configProblem)
         notifier?.requestAuthorization()
+        startUsageMonitor()
         Log.shared.info("\(AppInfo.name) \(AppInfo.version) started (pid \(getpid())); home \(AppPaths.home.path)"
             + (paused ? "; notifications paused" : ""))
         scheduleTimer()
@@ -231,6 +241,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.shared.info("config.json changed; reloaded")
         engine.apply(new)
         if new.pollIntervalSeconds != old.pollIntervalSeconds { scheduleTimer() }
+        usage?.apply(new)
+        refreshUsageMenu()
+    }
+
+    // MARK: Usage limits
+
+    func startUsageMonitor(_ monitor: UsageMonitor? = nil) {
+        let monitor = monitor ?? UsageMonitor(config: config, engine: .standard(threshold: config.usageAlertThreshold))
+        monitor.onStatus = { [weak self] _ in self?.refreshUsageMenu() }
+        monitor.onAlerts = { [weak self] alerts, snapshot in self?.announce(alerts, snapshot) }
+        usage = monitor
+        refreshUsageMenu()
+        monitor.start()
+    }
+
+    private func refreshUsageMenu() {
+        let telegram = TelegramSettings.load()
+        statusMenu?.setUsage(UsageMenu.State(
+            enabled: config.usageAlertsEnabled, threshold: config.usageAlertThreshold,
+            status: usage?.status ?? UsageMonitor.Status(), telegram: telegram?.summary,
+            telegramEnabled: config.telegramAlerts))
+    }
+
+    /// One poll's crossings: a macOS banner (unless notifications are off or
+    /// paused) and a Telegram message (unless telegramAlerts is off). Pause
+    /// silences banners only: it is for meetings, and a limit about to stop
+    /// the work is exactly what should still reach the phone.
+    func announce(_ alerts: [UsageAlert], _ snapshot: UsageSnapshot) {
+        let threshold = config.usageAlertThreshold
+        for alert in alerts { Log.shared.info("usage alert: \(UsageText.headline(alert))") }
+        if config.notificationsEnabled, !paused, let notifier, let url = usage?.dashboardURL {
+            let text = UsageText.notification(for: alerts, snapshot: snapshot, threshold: threshold)
+            let id = alerts.count == 1 ? alerts[0].key : "several"
+            notifier.postUsage(id: id, title: text.title, subtitle: text.subtitle, body: text.body,
+                               url: url, sound: config.sound)
+        }
+        if config.telegramAlerts, let settings = TelegramSettings.load() {
+            sendTelegram(settings, UsageText.telegram(for: alerts, snapshot: snapshot, threshold: threshold))
+        }
+    }
+
+    nonisolated static func postToTelegram(_ settings: TelegramSettings, _ html: String) {
+        Task {
+            do {
+                try await TelegramClient(token: settings.botToken).send(html: html, to: settings.chatId)
+                Log.shared.info("usage alert sent to Telegram (\(settings.summary))")
+            } catch {
+                Log.shared.warn("usage alert NOT sent to Telegram: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func openDashboard() {
+        guard let url = usage?.dashboardURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func setUpTelegram() {
+        let summary = usage?.status.snapshot.map { UsageText.summary($0, threshold: config.usageAlertThreshold) }
+        TelegramSetup.run(summary: summary) { [weak self] _ in self?.refreshUsageMenu() }
+    }
+
+    private func testTelegram() {
+        guard let settings = TelegramSettings.load() else { return setUpTelegram() }
+        var text = "🧪 <b>Test from AI Sessions</b>\nUsage alerts reach this chat."
+        if let snapshot = usage?.status.snapshot {
+            text += "\n\n" + UsageText.summary(snapshot, threshold: config.usageAlertThreshold)
+        }
+        Task { @MainActor in
+            do {
+                try await TelegramClient(token: settings.botToken).send(html: text, to: settings.chatId)
+                Log.shared.info("Telegram test message sent (\(settings.summary))")
+                TelegramSetup.show("Sent", "Check Telegram: a test message went to \(settings.summary).")
+            } catch {
+                Log.shared.warn("Telegram test message failed: \(error.localizedDescription)")
+                TelegramSetup.show("The test message failed", error.localizedDescription)
+            }
+        }
+    }
+
+    private func disconnectTelegram() {
+        guard let settings = TelegramSettings.load(), TelegramSetup.confirmDisconnect(settings) else { return }
+        TelegramSettings.delete()
+        Log.shared.info("Telegram disconnected")
+        refreshUsageMenu()
     }
 
     private func setConfigProblem(_ problem: ConfigProblem?) {

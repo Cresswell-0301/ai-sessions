@@ -137,6 +137,72 @@ enum MenuRowText {
     }
 }
 
+/// The words and marks of the "Usage limits" submenu, from the latest
+/// dashboard reading. Pure, so each wording is pinned by a test.
+enum UsageMenu {
+    struct State: Equatable {
+        var enabled = true
+        var threshold: Double = 90
+        var status = UsageMonitor.Status()
+        /// "@bot → Name" once Telegram is connected, else nil.
+        var telegram: String?
+        var telegramEnabled = true
+    }
+
+    /// "Usage limits — 2 at 90%+", "— all under 90%", "— dashboard not reachable".
+    static func title(_ state: State, now: Date) -> String {
+        guard state.enabled else { return "Usage limits — alerts off" }
+        guard let snapshot = state.status.snapshot else {
+            return state.status.problem == nil ? "Usage limits — checking…" : "Usage limits — dashboard not reachable"
+        }
+        let stale = state.status.problem == nil ? "" : " (last known)"
+        let over = snapshot.accounts.filter { account in
+            account.readable && account.windows.contains { $0.pct.rounded() >= state.threshold }
+        }
+        let threshold = Int(state.threshold.rounded())
+        return over.isEmpty ? "Usage limits — all under \(threshold)%\(stale)"
+                            : "Usage limits — \(over.count) at \(threshold)%+\(stale)"
+    }
+
+    static func topSymbol(_ state: State) -> (name: String, tint: SymbolTint) {
+        guard state.enabled, let snapshot = state.status.snapshot else { return ("gauge.with.dots.needle.33percent", .neutral) }
+        let anyOver = snapshot.accounts.contains { account in
+            account.readable && account.windows.contains { $0.pct.rounded() >= state.threshold }
+        }
+        return anyOver ? ("exclamationmark.triangle.fill", .attention) : ("gauge.with.dots.needle.33percent", .neutral)
+    }
+
+    /// Claude first, then Codex; fullest first within each.
+    static func sorted(_ accounts: [UsageAccount]) -> [UsageAccount] {
+        accounts.sorted { lhs, rhs in
+            if lhs.tool != rhs.tool { return lhs.tool == "claude" }
+            return (lhs.binding?.pct ?? -1) > (rhs.binding?.pct ?? -1)
+        }
+    }
+
+    static func symbol(for account: UsageAccount, threshold: Double) -> (name: String, tint: SymbolTint) {
+        guard account.readable else { return ("questionmark.circle", .neutral) }
+        let over = account.windows.contains { $0.pct.rounded() >= threshold }
+        return over ? ("exclamationmark.triangle.fill", .attention) : ("gauge.with.dots.needle.33percent", .neutral)
+    }
+
+    /// "weekly resets in 2d 4h · session resets in 3h 10m".
+    static func resetsTooltip(_ account: UsageAccount, now: Date) -> String? {
+        // Only windows in use: an untouched window's reset says nothing.
+        let parts = account.windows.filter { $0.pct > 0 }.compactMap { window -> String? in
+            UsageText.until(window.resetsAt, now: now).map { "\(window.shortName) resets in \($0)" }
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// "Updated just now" / "Updated 4m ago — dashboard not reachable".
+    static func freshness(_ state: State, now: Date) -> String {
+        let when = state.status.snapshot.map { Formatting.ago($0.fetchedAt, now: now) } ?? ""
+        let age = when == "just now" ? "Updated just now" : "Updated \(when)"
+        return state.status.problem == nil ? age : age + " — dashboard not reachable"
+    }
+}
+
 /// The menu-bar item and its menu. The menu is rebuilt each time it opens,
 /// from the latest snapshot the app handed over.
 @MainActor
@@ -148,6 +214,10 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         var togglePause: () -> Void
         /// Posts a sample notification for the first listed session.
         var sendTestNotification: () -> Void = {}
+        var openDashboard: () -> Void = {}
+        var setUpTelegram: () -> Void = {}
+        var testTelegram: () -> Void = {}
+        var disconnectTelegram: () -> Void = {}
     }
 
     private let actions: Actions
@@ -158,6 +228,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     private var shown: StatusSummary?
     private var permission: Notifier.Permission = .unknown
     private var configProblem: ConfigProblem?
+    private var usage = UsageMenu.State()
 
     static let autosaveName = "ai-sessions"
     /// Where a first launch places the item: macOS orders status items by
@@ -188,6 +259,11 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     /// Shown as a fix-it row at the top of the menu when banners cannot appear.
     func setNotificationPermission(_ permission: Notifier.Permission) {
         self.permission = permission
+    }
+
+    /// What the "Usage limits" submenu shows; read when the menu opens.
+    func setUsage(_ state: UsageMenu.State) {
+        usage = state
     }
 
     /// Shown as a row that opens config.json while the file cannot be used.
@@ -248,6 +324,9 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        menu.addItem(usageItem(now: now))
+
+        menu.addItem(.separator())
         let markAll = item("Mark All as Read", #selector(markAllRead))
         markAll.isEnabled = sessions.contains(where: \.unread)
         menu.addItem(markAll)
@@ -259,6 +338,42 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         menu.addItem(item("Send Test Notification", #selector(sendTestNotification)))
         menu.addItem(.separator())
         menu.addItem(item("Quit", #selector(quit), key: "q"))
+    }
+
+    // MARK: Usage limits
+
+    private func usageItem(now: Date) -> NSMenuItem {
+        let top = NSMenuItem(title: UsageMenu.title(usage, now: now), action: nil, keyEquivalent: "")
+        let symbol = UsageMenu.topSymbol(usage)
+        top.image = Self.image(symbol.name, tint: symbol.tint, pointSize: 13, description: "Usage limits")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        if usage.enabled, let snapshot = usage.status.snapshot {
+            for account in UsageMenu.sorted(snapshot.accounts) {
+                let row = item(UsageText.menuRow(account), #selector(openDashboard))
+                let mark = UsageMenu.symbol(for: account, threshold: usage.threshold)
+                row.image = Self.image(mark.name, tint: mark.tint, pointSize: 12, description: account.label)
+                row.toolTip = UsageMenu.resetsTooltip(account, now: now)
+                sub.addItem(row)
+            }
+            sub.addItem(.separator())
+            sub.addItem(disabledItem(UsageMenu.freshness(usage, now: now)))
+        } else if let problem = usage.status.problem {
+            sub.addItem(disabledItem(problem))
+        } else if !usage.enabled {
+            sub.addItem(disabledItem("Usage alerts are off (usageAlertsEnabled in config.json)"))
+        }
+        sub.addItem(item("Open Dashboard", #selector(openDashboard)))
+        sub.addItem(.separator())
+        if let telegram = usage.telegram {
+            sub.addItem(disabledItem(usage.telegramEnabled ? "Telegram: \(telegram)" : "Telegram: off (telegramAlerts in config.json)"))
+            sub.addItem(item("Send Test Message to Telegram", #selector(testTelegram)))
+            sub.addItem(item("Disconnect Telegram…", #selector(disconnectTelegram)))
+        } else {
+            sub.addItem(item("Set Up Telegram Alerts…", #selector(setUpTelegram)))
+        }
+        top.submenu = sub
+        return top
     }
 
     // MARK: Rows
@@ -337,6 +452,14 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     @objc private func togglePause() { actions.togglePause() }
 
     @objc private func sendTestNotification() { actions.sendTestNotification() }
+
+    @objc private func openDashboard() { actions.openDashboard() }
+
+    @objc private func setUpTelegram() { actions.setUpTelegram() }
+
+    @objc private func testTelegram() { actions.testTelegram() }
+
+    @objc private func disconnectTelegram() { actions.disconnectTelegram() }
 
     @objc private func openLog() {
         NSWorkspace.shared.open(Log.shared.fileURL)

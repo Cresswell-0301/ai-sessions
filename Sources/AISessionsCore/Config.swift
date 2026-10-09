@@ -21,12 +21,22 @@ public struct Config: Codable, Equatable, Sendable {
     /// List `claude -p` / SDK / `codex exec` / sub-agent sessions too.
     public var showAutomationSessions: Bool = false
     public var pollIntervalSeconds: Double = 1.0
+    /// Alert when a Claude/Codex usage window (session, weekly) reaches
+    /// `usageAlertThreshold` percent, from the ai-accounts dashboard's numbers.
+    public var usageAlertsEnabled: Bool = true
+    public var usageAlertThreshold: Double = 90
+    /// The ai-accounts dashboard; only its `GET /data.json` is read.
+    public var usageDashboardURL: String = "http://127.0.0.1:8787"
+    public var usagePollSeconds: Double = 60
+    /// Also send usage alerts to Telegram (once a bot is connected from the menu).
+    public var telegramAlerts: Bool = true
 
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
         case notificationsEnabled, sound, minTurnSecondsToNotify, claudeConfigDirs,
-             codexHomes, codexRecentHours, showAutomationSessions, pollIntervalSeconds
+             codexHomes, codexRecentHours, showAutomationSessions, pollIntervalSeconds,
+             usageAlertsEnabled, usageAlertThreshold, usageDashboardURL, usagePollSeconds, telegramAlerts
     }
 
     public init(from decoder: Decoder) throws {
@@ -40,6 +50,11 @@ public struct Config: Codable, Equatable, Sendable {
         codexRecentHours = (try? c.decodeIfPresent(Double.self, forKey: .codexRecentHours)) ?? d.codexRecentHours
         showAutomationSessions = (try? c.decodeIfPresent(Bool.self, forKey: .showAutomationSessions)) ?? d.showAutomationSessions
         pollIntervalSeconds = (try? c.decodeIfPresent(Double.self, forKey: .pollIntervalSeconds)) ?? d.pollIntervalSeconds
+        usageAlertsEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .usageAlertsEnabled)) ?? d.usageAlertsEnabled
+        usageAlertThreshold = (try? c.decodeIfPresent(Double.self, forKey: .usageAlertThreshold)) ?? d.usageAlertThreshold
+        usageDashboardURL = (try? c.decodeIfPresent(String.self, forKey: .usageDashboardURL)) ?? d.usageDashboardURL
+        usagePollSeconds = (try? c.decodeIfPresent(Double.self, forKey: .usagePollSeconds)) ?? d.usagePollSeconds
+        telegramAlerts = (try? c.decodeIfPresent(Bool.self, forKey: .telegramAlerts)) ?? d.telegramAlerts
     }
 
     /// The settings a process starts with (see `launch`).
@@ -166,6 +181,10 @@ public struct Config: Codable, Equatable, Sendable {
             config.codexHomes = homes.split(separator: ":").map(String.init).filter { !$0.isEmpty }
         }
         config.pollIntervalSeconds = min(max(config.pollIntervalSeconds, 0.25), 10)
+        // The dashboard rescans every few seconds; faster polling reads the same scan.
+        config.usagePollSeconds = min(max(config.usagePollSeconds, 15), 3600)
+        config.usageAlertThreshold = min(max(config.usageAlertThreshold, 1), 100)
+        if let url = environment["AI_SESSIONS_USAGE_URL"], !url.isEmpty { config.usageDashboardURL = url }
         return config
     }
 
