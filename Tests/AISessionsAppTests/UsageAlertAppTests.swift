@@ -100,9 +100,11 @@ final class UsageAlertAppTests: XCTestCase {
     /// reading who is signed in from the scratch home's `~/.claude.json`.
     /// `delay` holds each answer back, as a dashboard busy rescanning does.
     private func monitor(for app: AppDelegate, _ dashboard: Dashboard, delay: UInt64 = 0,
-                         alertAccounts: [String]? = nil) -> UsageMonitor {
+                         alertAccounts: [String]? = nil, excludeFile: URL? = nil) -> UsageMonitor {
         var config = app.config
         if let alertAccounts { config.usageAlertAccounts = alertAccounts }
+        // Never the real ~/.ai-accounts file in a test.
+        config.usageExcludeFile = (excludeFile ?? home.appendingPathComponent("no-exclusions.json")).path
         let home = self.home!
         return UsageMonitor(config: config,
                             engine: UsageAlertEngine(url: home.appendingPathComponent("state/usage-alerts.json"), threshold: 90),
@@ -352,6 +354,21 @@ final class UsageAlertAppTests: XCTestCase {
         await monitor.poll()
         await monitor.poll()
         XCTAssertEqual(center.posted.count, 1, "back on an account with room: nothing to say")
+    }
+
+    func testTheDashboardsOptOutsAreHonoured() async throws {
+        let file = home.appendingPathComponent("suggest-exclude.json")
+        try Data(#"["claude:cresswell-nexxatech@example.com"]"#.utf8).write(to: file)
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard, excludeFile: file)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 94)
+        await monitor.poll()
+        XCTAssertEqual(center.posted.first?.content.body, "All near a limit; CoreOS frees up first.",
+                       "cresswell-nexxatech is opted out on the dashboard: not where to go")
     }
 
     func testARowThatLosesItsEmailForAMomentIsNotAlertedTwice() async throws {

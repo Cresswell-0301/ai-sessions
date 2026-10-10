@@ -458,15 +458,14 @@ public struct UsageView: Sendable {
         UsageAdvice.freesUpFirst(snapshot.accounts, tool: tool, excluded: ownExcluded ?? excluded, now: now)
     }
 
-    /// The same view for an alert about `alerts`: advice that sends the user
-    /// somewhere else. The accounts that just crossed are left out, and so is
-    /// any account already at the threshold (the dashboard still counts 90%
-    /// as usable; switching to it would alert at once).
-    public func leaving(_ alerts: [UsageAlert]) -> UsageView {
+    /// The same view for an alert: advice that sends the user somewhere
+    /// else. Every account at or over the threshold is left out: the ones
+    /// that just crossed, and any already there (the dashboard still counts
+    /// 90% as usable; switching to it would alert at once).
+    public func leaving() -> UsageView {
         var view = self
         view.ownExcluded = ownExcluded ?? excluded
-        let crossed = Set(alerts.map(\.account.key))
-        for account in snapshot.accounts where crossed.contains(account.key) || account.isOver(threshold, at: now) {
+        for account in snapshot.accounts where account.isOver(threshold, at: now) {
             view.excluded.insert(UsageAdvice.exclusionKey(account))
         }
         return view
@@ -497,7 +496,7 @@ public enum UsageText {
     /// renews, and the account to use first (the dashboard's own pick).
     public static func notification(for alerts: [UsageAlert], view: UsageView)
         -> (title: String, subtitle: String, body: String) {
-        let elsewhere = view.leaving(alerts)
+        let elsewhere = view.leaving()
         let advice = adviceTool(view, alerts: alerts).map { tool -> String in
             guard let pick = elsewhere.useFirst(tool: tool) ?? elsewhere.freesUpFirst(tool: tool) else {
                 return "No \(toolName(tool)) account has a fresh reading."
@@ -541,7 +540,7 @@ public enum UsageText {
             blocks.append(windowLines(alert.account, view: view))
         }
         blocks.append("")
-        blocks += adviceLines(view.leaving(alerts), tools: adviceTool(view, alerts: alerts).map { [$0] } ?? [])
+        blocks += adviceLines(view.leaving(), tools: adviceTool(view, alerts: alerts).map { [$0] } ?? [])
         return fit(blocks + [""] + tableBlocks(view))
     }
 
