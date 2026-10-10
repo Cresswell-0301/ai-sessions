@@ -195,7 +195,7 @@ func runUsage() -> Int32 {
         let now = Date()
         print("usage limits (alert at \(Int(threshold))%; \(config.usageAlertsEnabled ? "alerts on" : "alerts OFF"))")
         for account in UsageMenu.sorted(snapshot.accounts) {
-            let over = account.readable && account.windows.contains { $0.pct.rounded() >= threshold }
+            let over = account.isOver(threshold, at: snapshot.fetchedAt)
             let resets = UsageMenu.resetsTooltip(account, now: now).map { "  (\($0))" } ?? ""
             print("  \(over ? "⚠" : " ") \(account.toolName.padding(toLength: 7, withPad: " ", startingAt: 0))"
                 + "\(Formatting.oneLine(UsageText.menuRow(account), max: 120) ?? "")\(resets)")

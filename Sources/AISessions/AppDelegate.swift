@@ -290,7 +290,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for alert in alerts { Log.shared.info("usage alert: \(UsageText.headline(alert))") }
         if config.notificationsEnabled, !paused, let notifier, let url = usage?.dashboardURL {
             let text = UsageText.notification(for: alerts, snapshot: snapshot, threshold: threshold)
-            let id = alerts.count == 1 ? alerts[0].key : "several"
+            // One id per set of windows: a later crossing must not replace
+            // the banner of an earlier one.
+            let id = alerts.count == 1 ? alerts[0].key : "several:" + alerts.map(\.key).sorted().joined(separator: ",")
             notifier.postUsage(id: id, title: text.title, subtitle: text.subtitle, body: text.body,
                                url: url, sound: config.sound)
         }

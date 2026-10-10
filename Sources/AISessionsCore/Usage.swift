@@ -14,12 +14,38 @@ public struct UsageWindow: Equatable, Codable, Sendable {
     public var label: String
     public var pct: Double
     public var resetsAt: Date?
+    /// The dashboard's note when this number is not a fresh reading: "window
+    /// reset, no activity since" (an inferred 0) or "stale — account ran
+    /// after this reading" (an old number kept).
+    public var inferred: String?
 
-    public init(kind: String, label: String, pct: Double, resetsAt: Date? = nil) {
+    public init(kind: String, label: String, pct: Double, resetsAt: Date? = nil, inferred: String? = nil) {
         self.kind = kind
         self.label = label
         self.pct = pct
         self.resetsAt = resetsAt
+        self.inferred = inferred
+    }
+
+    /// An old number the dashboard kept although the account ran since:
+    /// as far as alerts go, no reading at all.
+    public var isStale: Bool { inferred?.lowercased().hasPrefix("stale") == true }
+
+    /// A reading of a period still running at `date`: not stale and not past
+    /// its reset. Only these alert, re-arm, or count as over the threshold;
+    /// a finished period is history, not news.
+    public func isCurrent(at date: Date) -> Bool {
+        !isStale && (resetsAt.map { $0 > date } ?? true)
+    }
+
+    /// At or over `threshold` (rounded as the dashboard rounds) in a running period.
+    public func isOver(_ threshold: Double, at date: Date) -> Bool {
+        isCurrent(at: date) && pct.rounded() >= threshold
+    }
+
+    /// How much is used now: a period whose reset has passed starts again from 0.
+    func used(at date: Date) -> Double {
+        resetsAt.map { $0 <= date } == true ? 0 : pct
     }
 
     /// "session", "weekly", "weekly Fable": what a person calls this window.
@@ -55,6 +81,11 @@ public struct UsageAccount: Equatable, Codable, Sendable {
     public var binding: UsageWindow? { windows.max { $0.pct < $1.pct } }
 
     func window(_ kind: String) -> UsageWindow? { windows.first { $0.kind == kind } }
+
+    /// Readable, with a window at or over `threshold` in a running period.
+    public func isOver(_ threshold: Double, at date: Date) -> Bool {
+        readable && windows.contains { $0.isOver(threshold, at: date) }
+    }
 }
 
 /// What the dashboard said at one moment.
@@ -86,7 +117,8 @@ public struct UsageSnapshot: Equatable, Sendable {
                 let resets = (window["resets"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
                 // Bounded: a wild number must not trap `Int(pct.rounded())`.
                 windows.append(UsageWindow(kind: kind, label: window["label"] as? String ?? kind,
-                                           pct: min(max(pct, 0), 1000), resetsAt: resets))
+                                           pct: min(max(pct, 0), 1000), resetsAt: resets,
+                                           inferred: window["inferred"] as? String))
             }
             let error = limits["error"] as? String
             let readable = (error?.isEmpty ?? true) && !windows.isEmpty
@@ -104,16 +136,23 @@ public struct UsageSnapshot: Equatable, Sendable {
         return skipped as? Bool == true
     }
 
-    /// The Claude account with the most room left now: every window under the
+    /// The account of `tool` with the most room left now: no window over the
     /// threshold, then the lowest weekly, then the lowest session use.
     public func mostRoom(tool: String = "claude", threshold: Double) -> UsageAccount? {
         accounts
-            .filter { $0.tool == tool && $0.readable && $0.windows.allSatisfy { $0.pct.rounded() < threshold } }
-            .min { lhs, rhs in
-                let l = (lhs.window("weekly_all")?.pct ?? lhs.binding?.pct ?? 0, lhs.window("session")?.pct ?? 0)
-                let r = (rhs.window("weekly_all")?.pct ?? rhs.binding?.pct ?? 0, rhs.window("session")?.pct ?? 0)
-                return l < r
-            }
+            .filter { $0.tool == tool && $0.readable && !$0.isOver(threshold, at: fetchedAt) }
+            .min { lhs, rhs in rank(lhs) < rank(rhs) }
+    }
+
+    /// Weekly use, then session use, as they stand now.
+    func rank(_ account: UsageAccount) -> (Double, Double) {
+        let weekly = account.window("weekly_all") ?? account.window("weekly") ?? account.binding
+        return (weekly?.used(at: fetchedAt) ?? 0, account.window("session")?.used(at: fetchedAt) ?? 0)
+    }
+
+    /// Accounts with a window at or over `threshold` now.
+    public func over(_ threshold: Double) -> [UsageAccount] {
+        accounts.filter { $0.isOver(threshold, at: fetchedAt) }
     }
 }
 
@@ -129,7 +168,12 @@ public struct UsageAlert: Equatable, Sendable {
 
     /// Stable per account and window (not per reset): the notification
     /// identifier, so a newer alert for the same window replaces the older.
-    public var key: String { "\(account.tool)|\(account.label)|\(window.kind)" }
+    /// A scoped weekly limit is one per model or surface ("Weekly Opus",
+    /// "Weekly Fable"), all of kind "weekly_scoped": its label tells them apart.
+    public var key: String {
+        let scope = window.kind == "weekly_scoped" ? ":" + window.label.replacingOccurrences(of: "|", with: "/") : ""
+        return "\(account.tool)|\(account.label)|\(window.kind)\(scope)"
+    }
 }
 
 /// Decides which windows are news: edge-triggered, like the dashboard's own
@@ -178,20 +222,49 @@ public final class UsageAlertEngine {
     /// The windows that crossed the threshold since the last call, in the
     /// snapshot's order. Unreadable accounts neither alert nor re-arm: a
     /// signed-out profile reporting nothing has not dropped below anything.
+    /// The very first call records every listed account, readable or not: an
+    /// account the dashboard could not refresh shows its last real numbers,
+    /// and one held back by a 429 is often one at its cap.
     public func evaluate(_ snapshot: UsageSnapshot) -> [UsageAlert] {
         let announce = state.initialized
+        let at = snapshot.fetchedAt
         var alerts: [UsageAlert] = []
         var next = state
-        for account in snapshot.accounts where account.readable {
-            for window in account.windows {
-                let alert = UsageAlert(account: account, window: window)
+        for account in snapshot.accounts where account.readable || !announce {
+            var seen = Set<String>()
+            for alert in Self.distinctWindows(of: account, at: at) {
+                let window = alert.window
+                seen.insert(alert.key)
+                // An old number kept, or a period already over: history. Codex
+                // reports both right after a reset (an inferred 0, then the old
+                // number again once a run starts without a reading).
+                guard window.isCurrent(at: at) else { continue }
+                let record = next.alerted[alert.key]
                 guard window.pct.rounded() >= threshold else {
-                    next.alerted[alert.key] = nil // dropped below: armed again
+                    // Armed again by a reading of the recorded period, or once
+                    // that period is over. A lower number with another reset
+                    // before then is a different limit (Codex shows the one its
+                    // last run hit, sometimes another limit at 0%).
+                    if let record, Self.samePeriod(record.resetsAt, window.resetsAt) || Self.ended(record, at: at) {
+                        next.alerted[alert.key] = nil
+                    }
                     continue
                 }
-                if let record = next.alerted[alert.key], Self.samePeriod(record.resetsAt, window.resetsAt) { continue }
+                if let record, Self.samePeriod(record.resetsAt, window.resetsAt) { continue }
+                // Codex drops the date from "try again at …" on the reset's own
+                // day: no reset, inside a dated period not yet over, is that period.
+                if let record, window.resetsAt == nil, record.resetsAt != nil, !Self.ended(record, at: at) { continue }
                 next.alerted[alert.key] = Record(resetsAt: window.resetsAt, pct: window.pct, alertedAt: now())
                 if announce { alerts.append(alert) }
+            }
+            // A window without a reset that a readable account no longer
+            // reports (a Codex refusal, gone once a run succeeds) is armed again.
+            if account.readable {
+                let part = "\(account.tool)|\(account.label)"
+                for (key, record) in next.alerted
+                where record.resetsAt == nil && !seen.contains(key) && Self.accountPart(of: key) == part {
+                    next.alerted[key] = nil
+                }
             }
         }
         // Accounts the dashboard no longer lists (removed, renamed) are
@@ -205,6 +278,32 @@ public final class UsageAlertEngine {
             save()
         }
         return alerts
+    }
+
+    /// One alert per key. Should two windows share one (a meter the server
+    /// adds before it has a label of its own), the current, fuller one speaks
+    /// for both, so they cannot record and clear each other on every poll.
+    static func distinctWindows(of account: UsageAccount, at date: Date) -> [UsageAlert] {
+        var order: [String] = []
+        var best: [String: UsageAlert] = [:]
+        for window in account.windows {
+            let alert = UsageAlert(account: account, window: window)
+            guard let held = best[alert.key] else {
+                order.append(alert.key)
+                best[alert.key] = alert
+                continue
+            }
+            let candidate = (window.isCurrent(at: date), window.pct)
+            let current = (held.window.isCurrent(at: date), held.window.pct)
+            if (candidate.0 ? 1 : 0, candidate.1) > (current.0 ? 1 : 0, current.1) { best[alert.key] = alert }
+        }
+        return order.compactMap { best[$0] }
+    }
+
+    /// The recorded period is over: its reset passed (give or take the tolerance).
+    static func ended(_ record: Record, at date: Date) -> Bool {
+        guard let reset = record.resetsAt else { return false }
+        return date >= reset.addingTimeInterval(-samePeriodTolerance)
     }
 
     /// "claude|trimo|weekly_all" → "claude|trimo".
@@ -247,9 +346,9 @@ public final class UsageAlertEngine {
 /// The words of a usage alert: the macOS banner, the Telegram message and the
 /// menu lines. Pure, so every wording is pinned by a test.
 public enum UsageText {
-    /// "2d 4h", "3h 10m", "45m".
+    /// "2d 4h", "3h 10m", "45m"; nil without a date or once it has passed.
     public static func until(_ date: Date?, now: Date) -> String? {
-        guard let date else { return nil }
+        guard let date, date > now else { return nil }
         let s = max(0, Int(date.timeIntervalSince(now)))
         let d = s / 86_400, h = (s % 86_400) / 3_600, m = (s % 3_600) / 60
         if d > 0 { return h > 0 ? "\(d)d \(h)h" : "\(d)d" }
@@ -268,16 +367,24 @@ public enum UsageText {
     public static func notification(for alerts: [UsageAlert], snapshot: UsageSnapshot, threshold: Double)
         -> (title: String, subtitle: String, body: String) {
         let now = snapshot.fetchedAt
-        let room = snapshot.mostRoom(threshold: threshold)
-        let advice = room.map { account -> String in
-            let left = 100 - Int((account.window("weekly_all")?.pct ?? account.binding?.pct ?? 0).rounded())
-            return "Most room now: \(account.label) (\(left)% of the week left)."
-        } ?? "No Claude account is under \(percent(threshold)) right now."
+        // Where to move the work: an account of the same tool (Claude first).
+        let tool = alerts.contains { $0.account.tool == "claude" } ? "claude" : alerts.first?.account.tool ?? "claude"
+        let toolName = tool == "codex" ? "Codex" : "Claude"
+        let advice: String
+        if let room = snapshot.mostRoom(tool: tool, threshold: threshold) {
+            let left = 100 - Int(snapshot.rank(room).0.rounded())
+            advice = "Most room now: \(room.label) (\(left)% of the week left)."
+        } else if snapshot.accounts.contains(where: { $0.tool == tool && $0.readable }) {
+            advice = "No \(toolName) account is under \(percent(threshold)) right now."
+        } else {
+            advice = "No \(toolName) account could be read just now."
+        }
         guard alerts.count == 1, let alert = alerts.first else {
             let names = alerts.map(headline).joined(separator: ", ")
             return ("\(alerts.count) limits passed \(percent(threshold))", names, advice)
         }
-        let resets = until(alert.window.resetsAt, now: now).map { "resets in \($0)" } ?? "usage limit"
+        let resets = until(alert.window.resetsAt, now: now).map { "resets in \($0)" }
+            ?? (alert.window.pct.rounded() >= 100 ? "limit reached" : "")
         return ("\(alert.account.label): \(alert.account.toolName) \(alert.window.shortName) limit at \(percent(alert.window.pct))",
                 resets, advice)
     }
@@ -291,7 +398,8 @@ public enum UsageText {
     /// The Telegram message (parse_mode HTML) for one tick's crossings.
     public static func telegram(for alerts: [UsageAlert], snapshot: UsageSnapshot, threshold: Double) -> String {
         let now = snapshot.fetchedAt
-        var blocks = ["⚠️ <b>AI usage — limit almost hit</b>"]
+        let reached = alerts.contains { $0.window.pct.rounded() >= 100 }
+        var blocks = [reached ? "⛔️ <b>AI usage — limit reached</b>" : "⚠️ <b>AI usage — limit almost hit</b>"]
         for alert in alerts {
             let resets = until(alert.window.resetsAt, now: now).map { " (resets in \($0))" } ?? ""
             blocks.append("• <b>\(html(alert.account.label))</b> — \(alert.account.toolName) \(html(alert.window.shortName)) at <b>\(percent(alert.window.pct))</b>\(resets)")
@@ -324,7 +432,7 @@ public enum UsageText {
                 let cells = ["session", "weekly_all", "weekly_scoped"].map { kind in
                     account.window(kind).map { percent($0.pct) } ?? "-"
                 }
-                let mark = account.readable ? (account.windows.contains { $0.pct.rounded() >= threshold } ? " ⚠" : "") : " ?"
+                let mark = account.readable ? (account.isOver(threshold, at: snapshot.fetchedAt) ? " ⚠" : "") : " ?"
                 return pad(String(account.label.prefix(15)), 16) + pad(cells[0], 6) + pad(cells[1], 6) + cells[2] + mark
             }
             out.append(table([pad("account", 16) + pad("sess", 6) + pad("week", 6) + "fable"] + capped(rows)))
@@ -336,8 +444,10 @@ public enum UsageText {
         }
         if let room = snapshot.mostRoom(threshold: threshold) {
             out.append("➡️ Most room now: <b>\(html(room.label))</b>")
-        } else if !claude.isEmpty {
+        } else if claude.contains(where: \.readable) {
             out.append("⏳ Every Claude account is at \(percent(threshold)) or more.")
+        } else if !claude.isEmpty {
+            out.append("⏳ No Claude account could be read just now.")
         }
         return out
     }

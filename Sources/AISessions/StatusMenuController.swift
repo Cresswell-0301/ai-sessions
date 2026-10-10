@@ -163,9 +163,7 @@ enum UsageMenu {
             return state.status.problem == nil ? "Usage limits — checking…" : "Usage limits — dashboard not reachable"
         }
         let stale = state.status.problem == nil ? "" : " (last known)"
-        let over = snapshot.accounts.filter { account in
-            account.readable && account.windows.contains { $0.pct.rounded() >= state.threshold }
-        }
+        let over = snapshot.over(state.threshold)
         let threshold = Int(state.threshold.rounded())
         return over.isEmpty ? "Usage limits — all under \(threshold)%\(stale)"
                             : "Usage limits — \(over.count) at \(threshold)%+\(stale)"
@@ -173,9 +171,7 @@ enum UsageMenu {
 
     static func topSymbol(_ state: State) -> (name: String, tint: SymbolTint) {
         guard state.enabled, let snapshot = state.status.snapshot else { return ("gauge.with.dots.needle.33percent", .neutral) }
-        let anyOver = snapshot.accounts.contains { account in
-            account.readable && account.windows.contains { $0.pct.rounded() >= state.threshold }
-        }
+        let anyOver = !snapshot.over(state.threshold).isEmpty
         return anyOver ? ("exclamationmark.triangle.fill", .attention) : ("gauge.with.dots.needle.33percent", .neutral)
     }
 
@@ -187,9 +183,9 @@ enum UsageMenu {
         }
     }
 
-    static func symbol(for account: UsageAccount, threshold: Double) -> (name: String, tint: SymbolTint) {
+    static func symbol(for account: UsageAccount, threshold: Double, at date: Date) -> (name: String, tint: SymbolTint) {
         guard account.readable else { return ("questionmark.circle", .neutral) }
-        let over = account.windows.contains { $0.pct.rounded() >= threshold }
+        let over = account.isOver(threshold, at: date)
         return over ? ("exclamationmark.triangle.fill", .attention) : ("gauge.with.dots.needle.33percent", .neutral)
     }
 
@@ -378,7 +374,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         if usage.enabled, let snapshot = usage.status.snapshot {
             for account in UsageMenu.sorted(snapshot.accounts) {
                 let row = item(UsageText.menuRow(account), #selector(openDashboard))
-                let mark = UsageMenu.symbol(for: account, threshold: usage.threshold)
+                let mark = UsageMenu.symbol(for: account, threshold: usage.threshold, at: snapshot.fetchedAt)
                 row.image = Self.image(mark.name, tint: mark.tint, pointSize: 12, description: account.label)
                 row.toolTip = UsageMenu.resetsTooltip(account, now: now)
                 sub.addItem(row)

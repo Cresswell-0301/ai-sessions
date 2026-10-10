@@ -27,6 +27,9 @@ final class UsageMonitor {
     private var timer: Timer?
     private var inFlight = false
     private var loggedProblem: String?
+    /// Moves when alerts are switched or the dashboard moves: a poll that
+    /// was waiting meanwhile answers for settings that no longer hold.
+    private var generation = 0
 
     init(config: Config, engine: UsageAlertEngine, fetch: @escaping Fetch = UsageMonitor.urlFetch,
          now: @escaping () -> Date = Date.init) {
@@ -58,6 +61,9 @@ final class UsageMonitor {
         let old = config
         config = new
         engine.threshold = new.usageAlertThreshold
+        if new.usageAlertsEnabled != old.usageAlertsEnabled || new.usageDashboardURL != old.usageDashboardURL {
+            generation += 1
+        }
         if new.usageAlertsEnabled != old.usageAlertsEnabled || new.usagePollSeconds != old.usagePollSeconds {
             reschedule()
         }
@@ -93,22 +99,25 @@ final class UsageMonitor {
         }
         inFlight = true
         defer { inFlight = false }
+        let asked = generation
         let url = base.appendingPathComponent("data.json")
         let snapshot: UsageSnapshot
         do {
             let data = try await fetch(url)
+            guard asked == generation else { return askAgain() }
             guard let parsed = UsageSnapshot.parse(data, fetchedAt: now()) else {
                 return report("the dashboard's data.json was not in the expected shape")
             }
             snapshot = parsed
         } catch {
+            guard asked == generation else { return askAgain() }
             return report("the usage dashboard is not reachable at \(base.absoluteString)")
         }
         let firstRun = engine.isFirstRun
         let alerts = engine.evaluate(snapshot)
         if firstRun {
             let over = snapshot.accounts.flatMap { account in
-                account.windows.filter { $0.pct.rounded() >= config.usageAlertThreshold }.map { _ in account.label }
+                account.windows.filter { $0.isOver(config.usageAlertThreshold, at: snapshot.fetchedAt) }
             }
             Log.shared.info("usage alerts: first reading of \(snapshot.accounts.count) accounts; "
                 + "\(over.count) window(s) already at \(Int(config.usageAlertThreshold))%+ recorded without alerting")
@@ -120,6 +129,13 @@ final class UsageMonitor {
         status = Status(snapshot: snapshot, problem: nil)
         onStatus(status)
         if !alerts.isEmpty { onAlerts(alerts, snapshot) }
+    }
+
+    /// This poll's answer is for settings changed while it waited (alerts
+    /// switched off, another dashboard): drop it, and ask the new one.
+    private func askAgain() {
+        guard config.usageAlertsEnabled else { return }
+        Task { await poll() }
     }
 
     /// Keeps the last good snapshot; logs each distinct problem once.

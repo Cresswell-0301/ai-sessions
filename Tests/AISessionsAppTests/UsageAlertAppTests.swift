@@ -35,13 +35,29 @@ final class UsageAlertAppTests: XCTestCase {
 
     // MARK: Fixtures
 
-    /// Mutable answer for the fake dashboard.
+    /// Mutable answer for the fake dashboard; the monitor asks it off the
+    /// main actor, hence the lock.
     private final class Dashboard: @unchecked Sendable {
-        var body: Data?
-        var calls = 0
+        private let lock = NSLock()
+        private var _body: Data?
+        private var _asked: [URL] = []
+        var body: Data? {
+            get { lock.withLock { _body } }
+            set { lock.withLock { _body = newValue } }
+        }
+        var asked: [URL] { lock.withLock { _asked } }
+        var calls: Int { asked.count }
+
+        func answer(_ url: URL) -> Data? {
+            lock.withLock {
+                _asked.append(url)
+                return _body
+            }
+        }
     }
 
-    private func dashboardJSON(trimoWeekly: Double, trimoSession: Double = 28) -> Data {
+    private func dashboardJSON(trimoWeekly: Double, trimoSession: Double = 28,
+                               cresswellSession: Double = 65, cresswellWeekly: Double = 44) -> Data {
         func row(_ label: String, session: Double, weekly: Double) -> [String: Any] {
             ["tool": "claude", "label": label, "skipped": "signed in — no usage recorded yet", "limits": ["error": NSNull(), "windows": [
                 ["kind": "session", "label": "Session (5hr)", "pct": session, "resets": 1_791_610_000],
@@ -52,7 +68,7 @@ final class UsageAlertAppTests: XCTestCase {
         // dashboard: the first reading must record it, not announce it.
         return try! JSONSerialization.data(withJSONObject: ["rows": [
             row("trimo", session: trimoSession, weekly: trimoWeekly),
-            row("cresswell-nexxatech", session: 65, weekly: 44),
+            row("cresswell-nexxatech", session: cresswellSession, weekly: cresswellWeekly),
             row("CoreOS", session: 0, weekly: 100),
         ]])
     }
@@ -75,14 +91,18 @@ final class UsageAlertAppTests: XCTestCase {
         await app.telegramTask?.value
     }
 
-    private func monitor(for app: AppDelegate, _ dashboard: Dashboard) -> UsageMonitor {
+    /// The monitor on the test's clock: the fixture's resets lie ahead of it.
+    /// `delay` holds each answer back, as a dashboard busy rescanning does.
+    private func monitor(for app: AppDelegate, _ dashboard: Dashboard, delay: UInt64 = 0) -> UsageMonitor {
         UsageMonitor(config: app.config,
                      engine: UsageAlertEngine(url: home.appendingPathComponent("state/usage-alerts.json"), threshold: 90),
-                     fetch: { _ in
-                         dashboard.calls += 1
-                         guard let body = dashboard.body else { throw URLError(.cannotConnectToHost) }
+                     fetch: { url in
+                         let body = dashboard.answer(url)
+                         if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+                         guard let body else { throw URLError(.cannotConnectToHost) }
                          return body
-                     })
+                     },
+                     now: { [unowned self] in clockNow })
     }
 
     private func connectTelegram() throws {
@@ -164,7 +184,7 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertNotNil(monitor.status.snapshot, "the last good reading stays")
         XCTAssertEqual(monitor.status.problem, "the usage dashboard is not reachable at http://127.0.0.1:8787")
         let state = UsageMenu.State(status: monitor.status)
-        XCTAssertEqual(UsageMenu.title(state, now: Date()), "Usage limits — 1 at 90%+ (last known)")
+        XCTAssertEqual(UsageMenu.title(state, now: clockNow), "Usage limits — 1 at 90%+ (last known)")
     }
 
     // MARK: When Telegram fails
@@ -261,6 +281,71 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertTrue(sent.isEmpty)
     }
 
+    // MARK: Settings that change while a poll waits
+
+    func testTurningAlertsOffWhileAPollWaitsAnnouncesNothing() async throws {
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard, delay: 300_000_000)
+        var announced: [[UsageAlert]] = []
+        monitor.onAlerts = { alerts, _ in announced.append(alerts) }
+        await monitor.poll() // first reading
+        dashboard.body = dashboardJSON(trimoWeekly: 95)
+        let poll = Task { await monitor.poll() }
+        while dashboard.calls < 2 { await Task.yield() } // waiting on the dashboard now
+        var off = monitor.config
+        off.usageAlertsEnabled = false
+        monitor.apply(off)
+        await poll.value
+        XCTAssertTrue(announced.isEmpty, "alerts were off by the time this reading came")
+        XCTAssertNil(monitor.status.snapshot, "and the menu stays cleared")
+    }
+
+    func testADashboardMovedWhileAPollWaitsIsAskedAgain() async throws {
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard, delay: 300_000_000)
+        let poll = Task { await monitor.poll() }
+        while dashboard.calls < 1 { await Task.yield() }
+        var moved = monitor.config
+        moved.usageDashboardURL = "http://127.0.0.1:9797"
+        monitor.apply(moved)
+        await poll.value
+        XCTAssertNil(monitor.status.snapshot, "the old dashboard's answer is dropped")
+        let deadline = Date().addingTimeInterval(5)
+        while monitor.status.snapshot == nil, Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertEqual(dashboard.asked.map(\.absoluteString),
+                       ["http://127.0.0.1:8787/data.json", "http://127.0.0.1:9797/data.json"], "then the new one is asked")
+        XCTAssertNotNil(monitor.status.snapshot)
+    }
+
+    // MARK: Banners
+
+    func testEachMultiCrossingBannerStaysAndMarkAllReadLeavesThem() async throws {
+        try connectTelegram()
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 93, trimoSession: 95)
+        await monitor.poll() // trimo's session and week together
+        dashboard.body = dashboardJSON(trimoWeekly: 93, trimoSession: 95, cresswellSession: 97, cresswellWeekly: 91)
+        await monitor.poll() // then cresswell's, together too
+        await settle(app)
+        let usage = center.delivered.keys.filter { $0.hasPrefix("usage:") }.sorted()
+        XCTAssertEqual(usage, ["usage:several:claude|cresswell-nexxatech|session,claude|cresswell-nexxatech|weekly_all",
+                               "usage:several:claude|trimo|session,claude|trimo|weekly_all"],
+                       "the second pair's banner does not replace the first's")
+        center.post(UNNotificationRequest(identifier: "claude:9eb4895f-b5d9-41d0-8161-864ac0eecf46",
+                                          content: UNMutableNotificationContent(), trigger: nil)) { _ in }
+        app.notifier?.withdrawAll() // Mark All as Read
+        XCTAssertEqual(center.delivered.keys.sorted(), usage, "session banners go, usage alerts stay")
+    }
+
     // MARK: Setting up
 
     func testOnlyOneSetupRunsAtATime() async {
@@ -344,7 +429,7 @@ final class UsageAlertAppTests: XCTestCase {
     }
 
     func testUsageMenuTitles() {
-        let now = Date()
+        let now = clockNow
         var state = UsageMenu.State()
         XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — checking…")
         state.status.problem = "the usage dashboard is not reachable at http://127.0.0.1:8787"

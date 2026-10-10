@@ -124,8 +124,17 @@ Telegram message if you connected a bot. The app never talks to Anthropic or
 OpenAI itself: the dashboard holds the accounts' sign-ins.
 
 - **Once per crossing.** A limit alerts again only after it drops below the
-  threshold (it reset) or a new period starts. A restart does not repeat an
-  alert, and the very first reading only records what is already over.
+  threshold in the same period, or when a new period starts. A restart does
+  not repeat an alert, and the very first reading only records what is
+  already over, on every account, including one the dashboard could not
+  refresh at that moment.
+- **Only fresh readings count.** A number the dashboard did not read just
+  now never alerts and never re-arms an alert: an inferred 0% after a reset,
+  an old reading kept while a run is under way ("stale"), or any reading of
+  a period whose reset has passed. A lower number with a different reset,
+  before the alerted period is over, is another limit, not a drop (Codex
+  shows the limit its last run hit). A Codex refusal that loses its date on
+  the reset's own day ("try again at 6:33 PM") is the same week.
 - **Pause Notifications** silences the banner, not Telegram: a limit about to
   stop your work should still reach your phone.
 - **Usage limits** in the menu lists every account, fullest first. Hover a row

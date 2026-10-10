@@ -255,8 +255,13 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         center.removePending(ids)
     }
 
+    /// Every session's banner (Mark All as Read). Usage alerts belong to no
+    /// session and stay until dismissed.
     func withdrawAll() {
-        center.removeAllDelivered()
+        center.deliveredIdentifiers { [center] delivered in
+            let sessions = delivered.filter { !$0.hasPrefix(Notifier.usageIdentifierPrefix) }
+            if !sessions.isEmpty { center.removeDelivered(sessions) }
+        }
         center.removeAllPending()
     }
 
