@@ -207,7 +207,8 @@ final class UsageAlertAppTests: XCTestCase {
         app.housekeepIfDue(now: clockNow)
         await settle(app)
         XCTAssertEqual(sent.count, 1, "delivered once Telegram answers")
-        XCTAssertTrue(sent.first?.html.contains("<b>trimo</b> — Claude weekly at <b>93%</b>") ?? false, sent.first?.html ?? "")
+        XCTAssertTrue(sent.first?.html.hasPrefix("⚠️ <b>AI usage — limit almost hit</b>\n• <b>trimo</b> — Claude weekly at <b>93%</b>") ?? false,
+                      "31 s late is not worth a note: " + (sent.first?.html ?? ""))
         XCTAssertTrue(app.telegramOutbox.pending.isEmpty)
         XCTAssertEqual(UsageMenu.telegramLines(app.usageMenuState(), now: clockNow), ["Telegram: @my_usage_bot → Cress"])
     }
@@ -235,10 +236,14 @@ final class UsageAlertAppTests: XCTestCase {
     func testAnAlertLeftByARestartIsSentAfterIt() async throws {
         try connectTelegram()
         TelegramOutbox.standard().enqueue("⚠️ left from before", now: clockNow)
+        clockNow += 3600 // the Mac slept through it
         let app = makeApp()
         app.housekeepIfDue(now: clockNow)
         await settle(app)
-        XCTAssertEqual(sent.map(\.html), ["⚠️ left from before"])
+        XCTAssertEqual(sent.count, 1)
+        let html = sent.first?.html ?? ""
+        XCTAssertTrue(html.hasPrefix("⏱ <i>Delayed: this alert is from ") && html.hasSuffix(".</i>\n⚠️ left from before"),
+                      "an hour-old table says how old it is: \(html)")
     }
 
     func testTurningTelegramOffOrDisconnectingDropsWhatWaits() async throws {

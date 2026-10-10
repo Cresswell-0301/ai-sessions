@@ -332,7 +332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func drainTelegram(_ settings: TelegramSettings) async {
         while let message = telegramOutbox.next(now: clock()).message {
             do {
-                try await sendTelegram(settings, message.html)
+                try await sendTelegram(settings, Self.withDelayNote(message, now: clock()))
                 let recovered = telegramOutbox.problem != nil
                 telegramOutbox.succeeded(message.id)
                 telegramProblemAnnounced = nil
@@ -352,6 +352,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
         }
+    }
+
+    /// A message that waited (offline, asleep, restarted) says when it is
+    /// from: its usage table is that old.
+    nonisolated static func withDelayNote(_ message: TelegramOutbox.Message, now: Date) -> String {
+        guard now.timeIntervalSince(message.queuedAt) >= 120 else { return message.html }
+        let time = DateFormatter.localizedString(from: message.queuedAt, dateStyle: .none, timeStyle: .short)
+        return "⏱ <i>Delayed: this alert is from \(time).</i>\n" + message.html
     }
 
     /// A refusal that will not pass by itself (token revoked, bot blocked)
