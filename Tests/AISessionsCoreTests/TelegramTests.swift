@@ -241,48 +241,71 @@ final class TelegramTests: XCTestCase {
         }
         let cress = TelegramPeer(id: 222, name: "Cress")
         XCTAssertEqual(parse(tap("usage")), .reportFromButton(callbackId: "cb-9", from: cress))
-        XCTAssertEqual(parse(tap("viewer:allow:555")), .decision(callbackId: "cb-9", from: cress, viewer: 555, allow: true))
-        XCTAssertEqual(parse(tap("viewer:ignore:555")), .decision(callbackId: "cb-9", from: cress, viewer: 555, allow: false))
+        XCTAssertEqual(parse(tap("usage", from: 555, chat: 555))?.peer.id, 555, "anyone's own chat")
         XCTAssertNil(parse(tap("usage", from: 999)), "a button in someone else's chat")
-        XCTAssertNil(parse(tap("viewer:allow:abc")))
-        XCTAssertNil(parse(tap("viewer:make-admin:555")))
+        XCTAssertNil(parse(tap("viewer:allow:555")), "an Allow button from the version that asked first does nothing")
         XCTAssertNil(parse(tap("other")))
     }
 
-    func testTheSharingButtons() async throws {
+    func testStopSharingTakesTheButtonAway() async throws {
         let fake = FakeTelegram()
         fake.answers["sendMessage"] = (200, #"{"ok":true,"result":{"message_id":9}}"#)
         let client = TelegramClient(token: token, transport: fake.transport())
-        try await client.send(html: "asks", to: 222, markup: .viewerRequest(chatId: 555))
         try await client.send(html: "stopped", to: 555, markup: .removeKeyboard)
-        let buttons = (fake.body(0)["reply_markup"] as? [String: Any])?["inline_keyboard"] as? [[[String: Any]]]
-        XCTAssertEqual(buttons?.first?.map { $0["callback_data"] as? String }, ["viewer:allow:555", "viewer:ignore:555"])
-        XCTAssertEqual((fake.body(1)["reply_markup"] as? [String: Any])?["remove_keyboard"] as? Bool, true)
+        XCTAssertEqual(fake.body(0)["reply_markup"] as? [String: Bool], ["remove_keyboard": true])
     }
 
     // MARK: Viewers
 
-    func testViewersAskAreAllowedOrIgnoredAndAreKept() throws {
+    func testAnyoneIsLetInAndAStopHolds() throws {
         let url = dir.appendingPathComponent("state/telegram-viewers.json")
         let viewers = TelegramViewers(url: url)
         let lim = TelegramPeer(id: 555, name: "Lim Wei", username: "limwei")
-        XCTAssertTrue(viewers.request(from: lim, now: t0), "new: the owner is asked")
-        XCTAssertEqual(viewers.status(of: 555), .pending)
-        XCTAssertFalse(viewers.request(from: lim, now: t0 + 3600), "again within a day: not asked again")
-        XCTAssertTrue(viewers.request(from: lim, now: t0 + TelegramViewers.askAgainAfter), "a day later: asked again")
-        XCTAssertEqual(viewers.decide(555, allow: true, now: t0 + 90_000)?.status, .allowed)
-        XCTAssertNil(viewers.decide(555, allow: false, now: t0 + 90_001), "decided already: a second tap changes nothing")
-        XCTAssertEqual(viewers.status(of: 555), .allowed)
+        XCTAssertEqual(viewers.admit(lim, now: t0), .first, "no asking: in at once")
+        XCTAssertEqual(viewers.admit(lim, now: t0 + 60), .again)
+        XCTAssertEqual(viewers.admit(TelegramPeer(id: 555, name: "Lim W."), now: t0 + 90), .again)
+        XCTAssertEqual(viewers.allowed.map(\.label), ["Lim W."], "their name kept current")
         XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber)?.intValue, 0o600)
-        XCTAssertEqual(TelegramViewers(url: url).allowed.map(\.label), ["Lim Wei (@limwei)"], "kept across a restart")
+        XCTAssertEqual(TelegramViewers(url: url).allowed.map(\.chatId), [555], "kept across a restart")
 
-        XCTAssertTrue(viewers.request(from: TelegramPeer(id: 666, name: "Spam"), now: t0))
-        XCTAssertEqual(viewers.decide(666, allow: false, now: t0)?.status, .ignored)
-        XCTAssertFalse(viewers.request(from: TelegramPeer(id: 666, name: "Spam"), now: t0 + 999_999), "ignored stays ignored")
-        viewers.remove(555)
-        XCTAssertNil(viewers.status(of: 555))
+        XCTAssertEqual(viewers.block(555, now: t0 + 120)?.status, .blocked)
+        XCTAssertNil(viewers.block(555, now: t0 + 121), "stopped already")
+        XCTAssertNil(viewers.block(777, now: t0 + 121), "never asked")
+        XCTAssertEqual(viewers.admit(lim, now: t0 + 999_999), .blocked, "a stop holds")
+        XCTAssertEqual(TelegramViewers(url: url).status(of: 555), .blocked, "and outlives a restart")
+        XCTAssertEqual(viewers.unblock(555, now: t0 + 1_000_000)?.status, .allowed)
+        XCTAssertNil(viewers.unblock(555, now: t0 + 1_000_001), "shared already")
+        XCTAssertEqual(viewers.admit(lim, now: t0 + 1_000_002), .again, "shared again: no first-time word")
+
         viewers.clear()
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testAStopIsNeverPushedOutByNewChats() {
+        let viewers = TelegramViewers(url: dir.appendingPathComponent("state/telegram-viewers.json"))
+        viewers.admit(TelegramPeer(id: 1, name: "early"), now: t0)
+        viewers.admit(TelegramPeer(id: 2, name: "stopped"), now: t0)
+        viewers.block(2, now: t0)
+        for id in 3...130 { viewers.admit(TelegramPeer(id: Int64(id), name: "n\(id)"), now: t0) }
+        XCTAssertEqual(viewers.all.count, TelegramViewers.maxViewers)
+        XCTAssertEqual(viewers.status(of: 2), .blocked, "still cut off")
+        XCTAssertNil(viewers.status(of: 1), "the longest-known allowed one went first")
+        XCTAssertEqual(viewers.status(of: 130), .allowed)
+    }
+
+    func testTheEarlierVersionsFileReadsSafely() throws {
+        let url = dir.appendingPathComponent("state/telegram-viewers.json")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(#"""
+        [{"chatId": 1, "name": "Asked", "status": "pending", "since": "2026-10-10T07:00:00Z", "askedAt": "2026-10-10T07:00:00Z"},
+         {"chatId": 2, "name": "Ignored", "status": "ignored", "since": "2026-10-10T07:00:00Z"},
+         {"chatId": 3, "name": "Allowed", "status": "allowed", "since": "2026-10-10T07:00:00Z"},
+         {"chatId": 4, "name": "Unknown", "status": "admin", "since": "2026-10-10T07:00:00Z"}]
+        """#.utf8).write(to: url)
+        let viewers = TelegramViewers(url: url)
+        XCTAssertEqual(viewers.all.map(\.chatId), [1, 2, 3, 4])
+        XCTAssertEqual(viewers.allowed.map(\.chatId), [1, 3], "asked before: in now")
+        XCTAssertEqual(viewers.blocked.map(\.chatId), [2, 4], "ignored stays cut off, and so does anything unknown")
     }
 
     func testAnOverlongMessageIsRefusedNotCut() async throws {

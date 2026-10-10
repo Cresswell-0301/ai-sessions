@@ -200,7 +200,7 @@ enum TelegramSetup {
     static func confirmStopSharing(_ viewer: TelegramViewers.Viewer) -> Bool {
         let alert = NSAlert()
         alert.messageText = "Stop sharing AI usage with \(viewer.name)?"
-        alert.informativeText = "\(viewer.label) will no longer get usage reports from the bot, and their 📊 Usage button goes away. They can ask again later."
+        alert.informativeText = "The bot will no longer answer \(viewer.label), and their 📊 Usage button goes away. Share Again, in the same menu, undoes it."
         alert.addButton(withTitle: "Stop Sharing")
         alert.addButton(withTitle: "Cancel")
         return present(alert) == .alertFirstButtonReturn

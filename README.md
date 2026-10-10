@@ -162,7 +162,8 @@ accounts' sign-ins.
    with a token such as `123456789:AAH…`. Paste it into the setup's field (⌘V).
 2. Click **Open @yourbot** and press **START** in Telegram. The link carries a
    code that is new for each setup, so only the chat that pressed Start on
-   this Mac's link is connected; anyone else who finds the bot is ignored. No
+   this Mac's link is connected and gets the alerts; anyone else who opens the
+   bot can only ask it for a usage report (see *Sharing the reports*). No
    START button? Send the bot the `/start <code>` line that the dialog shows.
 3. Confirm the name it found. A first message, with every account's usage,
    arrives right away. The token is also cleared from the clipboard.
@@ -188,32 +189,24 @@ advice from them.
 
 **The Usage button.** *📊 Usage* stays under the chat: tap it (or send
 `/usage`) any time for the same report about now. An alert carries a *📊 Usage
-now* button too. Your own chat is answered at once; anyone else has to be
-allowed first (below). The app listens with Telegram's long polling while
-Telegram is connected, steps aside while the setup runs, and does not answer
-taps made while the Mac was asleep or the app was not running (they would be
-old).
+now* button too. The app listens with Telegram's long polling while Telegram
+is connected, steps aside while the setup runs, and does not answer taps made
+while the Mac was asleep or the app was not running (they would be old).
 
-**Sharing the reports.** Someone else can see the same reports once you allow
-it. When they open the bot and press START (or send `/usage`), the bot tells
-them it asked you, and your chat gets a message naming them with **✅ Allow**
-and **🚫 Ignore**:
+**Sharing the reports.** Give the bot's name to anyone who should be able to
+check usage: they open it in Telegram and press **START** (or send `/usage`),
+and the report arrives at once with their own *📊 Usage* button. You do
+nothing. Their reports are marked *◀ <your name>'s Mac*, so they know whose
+account the ◀ marks. They never get the alerts, and nothing they send changes
+anything. An account the dashboard lists without a name (its *project* row)
+appears in your reports by its address, in theirs by the part before the @.
+Anyone who finds the bot can do the same, so give its name only to people who
+may see your accounts' usage. Only private chats count, never groups.
 
-- **Allow:** a report reaches them right away, with their own *📊 Usage*
-  button, and they get one whenever they ask. Their reports are marked
-  *◀ <your name>'s Mac*, so they know whose account the ◀ marks. They never get
-  the alerts, and nothing they send changes anything.
-- **Ignore:** the bot never answers them again.
-- **No answer yet:** you are asked again a day later at most, and they are
-  told *still waiting* at most once a minute, however often they ask.
-
-Only you can press Allow: the same button pressed in anyone else's chat does
-nothing. Only private chats count, never groups. *Usage limits* in the menu
-lists who sees the reports (*Shared with …*) and who is waiting. *Stop Sharing ›
-with …* takes one person off and tells them, and their button goes away; they
-may ask again. *Ignored › Let … Ask Again* undoes an Ignore pressed by mistake:
-their next `/usage` asks you again. *Disconnect Telegram…* stops sharing with
-everyone.
+*Usage limits* in the menu lists who gets the reports (*Shared with …*).
+*Stop Sharing › with …* cuts one person off: they are told, their button goes
+away, and the bot no longer answers them. *Share Again › with …* undoes it.
+*Disconnect Telegram…* forgets everyone.
 
 The token is kept in `state/telegram.json`, readable by you alone, and never in
 `config.json` or the log. Use a bot made only for these alerts: the setup reads
@@ -245,7 +238,7 @@ everyone it was shared with.
 | `~/.ai-sessions/state/usage-alerts.json` | which usage limits were already announced, per period |
 | `~/.ai-sessions/state/telegram.json` | the Telegram bot token and chat, once you connect one |
 | `~/.ai-sessions/state/telegram-outbox.json` | Telegram alerts waiting to be tried again |
-| `~/.ai-sessions/state/telegram-viewers.json` | the people you share usage reports with, and the ones who asked |
+| `~/.ai-sessions/state/telegram-viewers.json` | the people who get usage reports from the bot, and the ones you stopped sharing with |
 
 `state/` is readable by you alone (the folder is `0700`, its files `0600`): it
 holds session titles, which are often your own prompts, and the agents' last
@@ -332,15 +325,12 @@ Set `AI_SESSIONS_HOME=/some/dir` to keep a test run's log and state out of
   delivering* with the reason, and the log has a `usage alert not sent`
   line for each try. *Send Test Message to Telegram* or
   `AISessions --telegram-test` tries at once.
-- **Someone you shared the bot with gets no report.** They have to be allowed
-  first: when they send `/usage`, your chat gets a message with **✅ Allow**;
-  the menu lists them under *Asking to see usage* until you answer. The bot
-  only answers while this Mac is awake and the app is running, and a message
-  older than 10 minutes is not answered (it would be old news); they send
-  `/usage` again. Someone you ignored is never answered: *Ignored › Let … Ask
-  Again* lets them ask again. The log says `… asked to see usage reports` when
-  you are asked, `… may now see usage reports` once you allow, and
-  `usage report sent on request to …` for each answer.
+- **Someone you shared the bot with gets no report.** The bot answers only
+  while this Mac is awake and the app is running, and leaves a message more
+  than 10 minutes old unanswered (it was sent while nothing listened): they
+  send `/usage` again. Someone you stopped sharing with gets nothing: *Share
+  Again › with …*. The log says `… started getting usage reports` the first
+  time someone asks and `usage report sent on request to …` for each answer.
 - **Anything else.** *Open Log* in the menu. Every route, event, reload and
   error is there, and `--headless` prints the same lines live.
 

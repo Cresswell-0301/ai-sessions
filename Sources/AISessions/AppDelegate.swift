@@ -55,7 +55,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var telegramBot = TelegramBot()
     /// Why the bot is not listening, for the menu; nil while it listens.
     private var telegramBotProblem: String?
-    /// The people the owner shares usage reports with, and who asked.
+    /// Everyone else who gets usage reports from the bot, and anyone the
+    /// owner stopped sharing with.
     var telegramViewers = TelegramViewers.standard()
     /// The outbox's clock; tests move it past a retry pause.
     var clock: () -> Date = Date.init
@@ -124,7 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             testTelegram: { [weak self] in self?.testTelegram() },
             disconnectTelegram: { [weak self] in self?.disconnectTelegram() },
             stopSharing: { [weak self] in self?.stopSharing(with: $0) },
-            letAskAgain: { [weak self] in self?.letAskAgain($0) }
+            shareAgain: { [weak self] in self?.shareAgain(with: $0) }
         ))
         statusMenu?.update(sessions: [], paused: paused)
         statusMenu?.setConfigProblem(configProblem)
@@ -512,28 +513,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshUsageMenu()
     }
 
-    /// "Stop Sharing with …": asks first, then forgets that person and tells
-    /// them (their 📊 Usage button goes away too).
-    private func stopSharing(with chatId: Int64) {
-        guard let viewer = telegramViewers.all.first(where: { $0.chatId == chatId }),
-              TelegramSetup.confirmStopSharing(viewer) else { return }
-        telegramViewers.remove(chatId)
-        Log.shared.info("Telegram: stopped sharing usage reports with \(viewer.label)")
+    /// "Stop Sharing › with …": asks first; then the bot no longer answers
+    /// them, and tells them so (their 📊 Usage button goes away too).
+    func stopSharing(with chatId: Int64, confirm: (TelegramViewers.Viewer) -> Bool = TelegramSetup.confirmStopSharing) {
+        guard let viewer = telegramViewers.allowed.first(where: { $0.chatId == chatId }), confirm(viewer),
+              let stopped = telegramViewers.block(chatId, now: clock()) else { return }
+        Log.shared.info("Telegram: stopped sharing usage reports with \(stopped.label)")
         refreshUsageMenu()
         guard let settings = TelegramSettings.load() else { return }
         Task { @MainActor [weak self] in
-            await self?.telegramBot.sayStopped(to: viewer, owner: settings.chatName ?? "The owner", settings: settings)
+            await self?.telegramBot.sayStopped(to: stopped, owner: settings.chatName ?? "The owner", settings: settings)
         }
     }
 
-    /// "Ignored › Let … Ask Again": forgets someone ignored by mistake, so
-    /// their next /usage asks the owner again. Nobody is told: they never
-    /// heard back. Only an ignored person; anyone allowed stays allowed.
-    func letAskAgain(_ chatId: Int64) {
-        guard let viewer = telegramViewers.all.first(where: { $0.chatId == chatId && $0.status == .ignored }) else { return }
-        telegramViewers.remove(chatId)
-        Log.shared.info("Telegram: \(viewer.label) may ask to see usage reports again")
+    /// "Share Again › with …": undoes Stop Sharing, and tells them.
+    func shareAgain(with chatId: Int64) {
+        guard let viewer = telegramViewers.unblock(chatId, now: clock()) else { return }
+        Log.shared.info("Telegram: sharing usage reports with \(viewer.label) again")
         refreshUsageMenu()
+        guard let settings = TelegramSettings.load() else { return }
+        Task { @MainActor [weak self] in
+            await self?.telegramBot.sayShared(to: viewer, owner: settings.chatName ?? "The owner", settings: settings)
+        }
     }
 
     private func setConfigProblem(_ problem: ConfigProblem?) {

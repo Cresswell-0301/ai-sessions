@@ -154,7 +154,7 @@ enum UsageMenu {
         var telegramNextTry: Date?
         /// A setup dialog is open: its menu item waits.
         var settingUpTelegram = false
-        /// The people the owner shares usage reports with, and who asked.
+        /// Everyone else who gets usage reports, and anyone sharing was stopped with.
         var viewers: [TelegramViewers.Viewer] = []
     }
 
@@ -258,15 +258,11 @@ enum UsageMenu {
         return lines
     }
 
-    /// Who else sees usage reports through the bot, and who is waiting.
+    /// Who else gets usage reports through the bot.
     static func sharingLines(_ state: State) -> [String] {
-        guard state.telegram != nil else { return [] }
         let allowed = state.viewers.filter { $0.status == .allowed }.map(\.name)
-        let waiting = state.viewers.filter { $0.status == .pending }.map(\.name)
-        var lines: [String] = []
-        if !allowed.isEmpty { lines.append("Shared with " + allowed.joined(separator: ", ")) }
-        if !waiting.isEmpty { lines.append("Asking to see usage: " + waiting.joined(separator: ", ") + " (allow in Telegram)") }
-        return lines
+        guard state.telegram != nil, !allowed.isEmpty else { return [] }
+        return ["Shared with " + allowed.joined(separator: ", ")]
     }
 
     /// "Updated just now" / "Updated 4m ago — dashboard not reachable".
@@ -293,7 +289,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         var testTelegram: () -> Void = {}
         var disconnectTelegram: () -> Void = {}
         var stopSharing: (Int64) -> Void = { _ in }
-        var letAskAgain: (Int64) -> Void = { _ in }
+        var shareAgain: (Int64) -> Void = { _ in }
     }
 
     private let actions: Actions
@@ -472,13 +468,13 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
             stop.submenu = people
             sub.addItem(stop)
         }
-        let ignored = usage.viewers.filter { $0.status == .ignored }
-        if usage.telegram != nil, !ignored.isEmpty {
-            let undo = NSMenuItem(title: "Ignored", action: nil, keyEquivalent: "")
+        let stopped = usage.viewers.filter { $0.status == .blocked }
+        if usage.telegram != nil, !stopped.isEmpty {
+            let undo = NSMenuItem(title: "Share Again", action: nil, keyEquivalent: "")
             let people = NSMenu()
             people.autoenablesItems = false
-            for viewer in ignored {
-                let row = item("Let \(viewer.label) Ask Again", #selector(letAskAgain(_:)))
+            for viewer in stopped {
+                let row = item("with \(viewer.label)", #selector(shareAgain(_:)))
                 row.representedObject = NSNumber(value: viewer.chatId)
                 people.addItem(row)
             }
@@ -587,8 +583,8 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         if let chatId = (sender.representedObject as? NSNumber)?.int64Value { actions.stopSharing(chatId) }
     }
 
-    @objc private func letAskAgain(_ sender: NSMenuItem) {
-        if let chatId = (sender.representedObject as? NSNumber)?.int64Value { actions.letAskAgain(chatId) }
+    @objc private func shareAgain(_ sender: NSMenuItem) {
+        if let chatId = (sender.representedObject as? NSNumber)?.int64Value { actions.shareAgain(chatId) }
     }
 
     @objc private func openLog() {

@@ -475,6 +475,9 @@ public struct UsageView: Sendable {
     public var dashboardDown: Bool
     /// Whether the setting follows the account this Mac is signed into.
     public var followsSignIn: Bool
+    /// For someone the owner shares reports with: a name that is an address
+    /// (the dashboard's unnamed "project" row) shows only its part before the @.
+    public var hidesAddresses = false
 
     public init(snapshot: UsageSnapshot, threshold: Double, followed: [UsageAccount] = [], inUse: Set<String> = [],
                 signedInKnown: Bool = true, excluded: Set<String> = [], timeZone: TimeZone = .current,
@@ -517,6 +520,13 @@ public struct UsageView: Sendable {
     /// else. Every account at or over the threshold is left out: the ones
     /// that just crossed, and any already there (the dashboard still counts
     /// 90% as usable; switching to it would alert at once).
+    /// An account's name in these words.
+    public func name(_ account: UsageAccount) -> String {
+        let name = account.name
+        guard hidesAddresses, let at = name.firstIndex(of: "@"), at != name.startIndex else { return name }
+        return String(name[..<at])
+    }
+
     public func leaving() -> UsageView {
         var view = self
         view.ownExcluded = ownExcluded ?? excluded
@@ -620,8 +630,10 @@ public enum UsageText {
     /// they renew, then use first and most usage left. `lead` replaces the
     /// "📊 AI usage" title.
     public static func reportMessage(_ view: UsageView, lead: String? = nil, owner: String? = nil) -> String {
-        // For someone the owner shares with, whose Mac "◀" is.
+        // For someone the owner shares with: whose Mac "◀" is, and no addresses.
         let mac = owner.map { " · ◀ \(html($0))'s Mac" } ?? ""
+        var view = view
+        view.hidesAddresses = owner != nil
         var blocks = [lead ?? "📊 <b>AI usage</b> · \(clock(view.now, now: view.now, timeZone: view.timeZone))\(mac)"]
         if view.readingIsOld {
             let age = until(view.now, now: view.snapshot.fetchedAt).map { " (\($0) ago)" } ?? ""
@@ -655,8 +667,8 @@ public enum UsageText {
         for tool in tools {
             let name = tools.count > 1 ? " (\(toolName(tool)))" : ""
             let pick = view.useFirst(tool: tool) ?? (view.ownExcluded == nil ? nil : view.freesUpFirst(tool: tool))
-            lines.append("Use first\(name): " + (pick.map { "<b>\(html($0.account.name))</b>" } ?? "—"))
-            lines.append("Most usage left\(name): " + (view.mostLeft(tool: tool).map { "<b>\(html($0.account.name))</b>" } ?? "—"))
+            lines.append("Use first\(name): " + (pick.map { "<b>\(html(view.name($0.account)))</b>" } ?? "—"))
+            lines.append("Most usage left\(name): " + (view.mostLeft(tool: tool).map { "<b>\(html(view.name($0.account)))</b>" } ?? "—"))
         }
         return lines
     }
@@ -681,7 +693,7 @@ public enum UsageText {
             let l = view.inUse.contains(lhs.element.key), r = view.inUse.contains(rhs.element.key)
             return l != r ? l : lhs.offset < rhs.offset
         }.map(\.element)
-        let names = shortNames(ordered.map(\.name))
+        let names = shortNames(ordered.map(view.name))
         // "77% 3h10m": used, then when it renews. A number that is not a
         // reading of the running period (old, or its period over) gets a "?".
         func cell(_ window: UsageWindow?, renewal: Bool = true) -> String {

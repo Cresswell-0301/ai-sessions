@@ -328,8 +328,6 @@ public enum TelegramMarkup: Equatable, Sendable {
     case usageKeyboard
     /// "📊 Usage now" under the message itself (an inline button).
     case usageNowButton
-    /// Allow / Ignore under the owner's copy of someone asking to see usage.
-    case viewerRequest(chatId: Int64)
     /// Takes the "📊 Usage" keyboard away (sharing stopped).
     case removeKeyboard
 
@@ -341,9 +339,6 @@ public enum TelegramMarkup: Equatable, Sendable {
             return ["inline_keyboard": [[["text": "📊 Usage now", "callback_data": TelegramClient.usageCallbackData]]]]
         case .removeKeyboard:
             return ["remove_keyboard": true]
-        case .viewerRequest(let chatId):
-            return ["inline_keyboard": [[["text": "✅ Allow", "callback_data": "viewer:allow:\(chatId)"],
-                                         ["text": "🚫 Ignore", "callback_data": "viewer:ignore:\(chatId)"]]]]
         }
     }
 }
@@ -365,20 +360,17 @@ public struct TelegramPeer: Equatable, Sendable {
 }
 
 /// What a message to the bot asks for, and who asks. Only private chats
-/// count, and only a person writing in their own chat with the bot; whether
-/// they may have an answer is the bot's call (the owner, someone the owner
-/// allowed, or a stranger who has to ask first).
+/// count, and only a person writing in their own chat with the bot: the
+/// owner, or anyone the bot was shared with (see TelegramViewers).
 public enum TelegramRequest: Equatable, Sendable {
     /// "📊 Usage", /usage, /start or "usage" typed in the chat.
     case report(from: TelegramPeer)
     /// The "📊 Usage now" button under an alert; its callback is answered.
     case reportFromButton(callbackId: String, from: TelegramPeer)
-    /// The owner's Allow / Ignore on someone asking to see usage.
-    case decision(callbackId: String, from: TelegramPeer, viewer: Int64, allow: Bool)
 
     public var peer: TelegramPeer {
         switch self {
-        case .report(let peer), .reportFromButton(_, let peer), .decision(_, let peer, _, _): return peer
+        case .report(let peer), .reportFromButton(_, let peer): return peer
         }
     }
 
@@ -399,12 +391,8 @@ public enum TelegramRequest: Equatable, Sendable {
             // The button sits in the presser's own chat with the bot.
             guard let callbackId = query["id"] as? String, let from = query["from"] as? [String: Any],
                   let person = id(from), id((query["message"] as? [String: Any])?["chat"]) == person,
-                  let data = query["data"] as? String else { return nil }
-            if data == TelegramClient.usageCallbackData { return .reportFromButton(callbackId: callbackId, from: peer(person, from)) }
-            let parts = data.split(separator: ":").map(String.init)
-            guard parts.count == 3, parts[0] == "viewer", parts[1] == "allow" || parts[1] == "ignore",
-                  let viewer = Int64(parts[2]) else { return nil }
-            return .decision(callbackId: callbackId, from: peer(person, from), viewer: viewer, allow: parts[1] == "allow")
+                  query["data"] as? String == TelegramClient.usageCallbackData else { return nil }
+            return .reportFromButton(callbackId: callbackId, from: peer(person, from))
         }
         return nil
     }
@@ -426,28 +414,52 @@ public enum TelegramRequest: Equatable, Sendable {
     }
 }
 
-/// The people the owner lets see usage reports through the bot, and the
-/// ones who asked: `state/telegram-viewers.json` (0600). Someone new who
-/// sends /usage is "pending" and the owner gets Allow / Ignore buttons; an
-/// allowed person gets reports on request (never the alerts); an ignored one
-/// gets no answer at all. Not thread-safe: the app uses it on the main actor.
+/// The people other than the owner who get usage reports through the bot:
+/// `state/telegram-viewers.json` (0600). Anyone who sends /usage in a
+/// private chat with the bot gets a report at once and is listed here (never
+/// the alerts). The owner can stop sharing with one of them, who then gets no
+/// answer at all, and share again. Not thread-safe: the app uses it on the
+/// main actor.
 public final class TelegramViewers {
     public struct Viewer: Codable, Equatable, Sendable {
-        public enum Status: String, Codable, Sendable { case pending, allowed, ignored }
+        public enum Status: String, Codable, Sendable {
+            case allowed
+            /// The owner stopped sharing with them.
+            case blocked
+
+            /// An earlier version's states read as their nearest ("pending"
+            /// asked, and is let in now; "ignored" stays cut off). Anything
+            /// unknown is cut off rather than let in.
+            public init(from decoder: Decoder) throws {
+                switch try decoder.singleValueContainer().decode(String.self) {
+                case "allowed", "pending": self = .allowed
+                default: self = .blocked
+                }
+            }
+        }
+
         public var chatId: Int64
         public var name: String
         public var username: String?
         public var status: Status
+        /// When they first asked, or when the owner last stopped or resumed sharing.
         public var since: Date
-        /// When the owner was last asked about a pending one.
-        public var askedAt: Date?
 
         public var label: String { TelegramPeer(id: chatId, name: name, username: username).label }
     }
 
-    /// The owner is asked again about someone still waiting after this long.
-    public static let askAgainAfter: TimeInterval = 86_400
-    /// The most kept; the oldest ignored ones go first.
+    /// What a request from someone other than the owner gets.
+    public enum Admission: Equatable, Sendable {
+        /// Their first: a report, and a word on the 📊 Usage button.
+        case first
+        /// A report.
+        case again
+        /// Nothing: the owner stopped sharing with them.
+        case blocked
+    }
+
+    /// The most kept. The longest-known allowed ones go first; a blocked one
+    /// is never dropped, or new chats could push it out and let it back in.
     static let maxViewers = 100
 
     let url: URL
@@ -467,55 +479,51 @@ public final class TelegramViewers {
     public func status(of chatId: Int64) -> Viewer.Status? { all.first { $0.chatId == chatId }?.status }
 
     public var allowed: [Viewer] { all.filter { $0.status == .allowed } }
-    public var pending: [Viewer] { all.filter { $0.status == .pending } }
+    public var blocked: [Viewer] { all.filter { $0.status == .blocked } }
 
-    /// Someone not allowed asks to see usage. True when the owner should be
-    /// asked now: a new request, or one still waiting after a day. Their
-    /// name is kept current.
+    /// Someone other than the owner asks for a report: let in at once and
+    /// kept, their name current, unless the owner stopped sharing with them.
     @discardableResult
-    public func request(from peer: TelegramPeer, now: Date) -> Bool {
-        var ask = false
-        if let index = all.firstIndex(where: { $0.chatId == peer.id }) {
+    public func admit(_ peer: TelegramPeer, now: Date) -> Admission {
+        guard let index = all.firstIndex(where: { $0.chatId == peer.id }) else {
+            all.append(Viewer(chatId: peer.id, name: peer.name, username: peer.username, status: .allowed, since: now))
+            trim()
+            save()
+            return .first
+        }
+        guard all[index].status == .allowed else { return .blocked }
+        if all[index].name != peer.name || all[index].username != peer.username {
             all[index].name = peer.name
             all[index].username = peer.username
-            if all[index].status == .pending, all[index].askedAt.map({ now.timeIntervalSince($0) >= Self.askAgainAfter }) ?? true {
-                all[index].askedAt = now
-                ask = true
-            }
-        } else {
-            all.append(Viewer(chatId: peer.id, name: peer.name, username: peer.username, status: .pending, since: now, askedAt: now))
-            ask = true
-            trim()
+            save()
         }
-        save()
-        return ask
+        return .again
     }
 
-    /// The owner's answer; nil when that person is not waiting (any more).
+    /// "Stop Sharing": no answer for them any more. Nil unless they were
+    /// getting reports.
     @discardableResult
-    public func decide(_ chatId: Int64, allow: Bool, now: Date) -> Viewer? {
-        guard let index = all.firstIndex(where: { $0.chatId == chatId && $0.status == .pending }) else { return nil }
-        all[index].status = allow ? .allowed : .ignored
-        all[index].since = now
-        all[index].askedAt = nil
-        save()
-        return all[index]
-    }
+    public func block(_ chatId: Int64, now: Date) -> Viewer? { set(.blocked, for: chatId, now: now) }
 
-    /// Stops sharing with `chatId` (they may ask again).
-    public func remove(_ chatId: Int64) {
-        all.removeAll { $0.chatId == chatId }
-        save()
-    }
+    /// "Share Again": reports again. Nil unless sharing with them was stopped.
+    @discardableResult
+    public func unblock(_ chatId: Int64, now: Date) -> Viewer? { set(.allowed, for: chatId, now: now) }
 
     public func clear() {
         all = []
         save()
     }
 
+    private func set(_ status: Viewer.Status, for chatId: Int64, now: Date) -> Viewer? {
+        guard let index = all.firstIndex(where: { $0.chatId == chatId }), all[index].status != status else { return nil }
+        all[index].status = status
+        all[index].since = now
+        save()
+        return all[index]
+    }
+
     private func trim() {
-        while all.count > Self.maxViewers {
-            guard let index = all.firstIndex(where: { $0.status == .ignored }) ?? all.firstIndex(where: { $0.status == .pending }) else { return }
+        while all.count > Self.maxViewers, let index = all.firstIndex(where: { $0.status == .allowed }) {
             all.remove(at: index)
         }
     }

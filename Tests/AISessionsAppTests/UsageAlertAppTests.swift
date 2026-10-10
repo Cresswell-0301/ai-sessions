@@ -656,21 +656,11 @@ final class UsageAlertAppTests: XCTestCase {
                                       "chat": ["id": chat, "type": "private"], "from": ["id": chat, "first_name": name]]]
     }
 
-    /// A press of the owner's Allow / Ignore button (or a forged one, from `from`'s own chat).
-    private func decide(_ id: Int64, viewer: Int64, allow: Bool, from: Int64 = 222) -> [String: Any] {
-        ["update_id": id, "callback_query": ["id": "cb-\(id)", "data": "viewer:\(allow ? "allow" : "ignore"):\(viewer)",
-                                              "from": ["id": from, "first_name": "Cress"],
-                                              "message": ["message_id": 8, "chat": ["id": from, "type": "private"]]]]
-    }
-
     /// What the bot sent to `chat`, in order.
     private func texts(_ api: FakeBotAPI, to chat: Int64) -> [String] {
         api.sent().filter { ($0["chat_id"] as? NSNumber)?.int64Value == chat }.compactMap { $0["text"] as? String }
     }
 
-    private func asks(_ api: FakeBotAPI) -> Int {
-        texts(api, to: 222).filter { $0.contains("wants to see AI usage") }.count
-    }
 
     private func tap(_ id: Int64, chat: Int64 = 222) -> [String: Any] {
         ["update_id": id, "callback_query": ["id": "cb-\(id)", "data": "usage", "from": ["id": chat],
@@ -702,7 +692,7 @@ final class UsageAlertAppTests: XCTestCase {
         return (app, bot)
     }
 
-    func testTheUsageButtonGetsAReportBackAndAStrangerOnlyAsks() async throws {
+    func testTheUsageButtonGetsAReportBack() async throws {
         let api = FakeBotAPI()
         api.backlogNewest = 40 // a tap from before the app started
         let (app, bot) = try await listeningApp(api)
@@ -713,11 +703,10 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual(sent.first?.markup, .usageKeyboard, "a chat connected before the button gets it once")
         XCTAssertEqual(TelegramSettings.load()?.keyboardShown, true)
 
-        api.push(message(41, "/usage", chat: 999, name: "Stranger"), message(42, "📊 Usage"))
-        try await until("a report") { bot.answered == 1 }
-        XCTAssertEqual(texts(api, to: 999), ["👋 I've asked Cress to let you see AI usage. You'll get it here once they allow it."],
-                       "the stranger got no report")
-        let reports = api.sent().filter { ($0["text"] as? String)?.hasPrefix("📊 <b>AI usage</b>") ?? false }
+        api.push(message(41, "/usage", chat: 999, name: "Someone"), message(42, "📊 Usage"))
+        try await until("two reports") { bot.answered == 2 }
+        XCTAssertEqual(texts(api, to: 999).count, 1, "anyone who opens the bot gets one too")
+        let reports = api.sent().filter { ($0["chat_id"] as? NSNumber)?.int64Value == 222 }
         XCTAssertEqual(reports.count, 1)
         XCTAssertEqual((reports.first?["chat_id"] as? NSNumber)?.int64Value, 222)
         let text = reports.first?["text"] as? String ?? ""
@@ -731,122 +720,68 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertTrue(polls.contains(41), "listening starts after the skipped backlog: \(polls)")
     }
 
-    func testSomeoneNewAsksAndTheOwnerAllowsThem() async throws {
+    func testAnyoneWhoOpensTheBotGetsAReportAtOnce() async throws {
         let api = FakeBotAPI()
         let (app, bot) = try await listeningApp(api)
         defer { bot.stop(); withExtendedLifetime(app) {} }
-        api.push(message(50, "/usage", chat: 555, name: "Lim Wei"))
-        try await until("the owner asked") { asks(api) == 1 }
-        let ask = api.sent().last { ($0["chat_id"] as? NSNumber)?.int64Value == 222 }
-        XCTAssertEqual(ask?["text"] as? String, "👋 <b>Lim Wei</b> wants to see AI usage from this bot.")
-        let buttons = (ask?["reply_markup"] as? [String: Any])?["inline_keyboard"] as? [[[String: Any]]]
-        XCTAssertEqual(buttons?.first?.map { $0["callback_data"] as? String }, ["viewer:allow:555", "viewer:ignore:555"])
-        try await until("their reply") { texts(api, to: 555).count == 1 }
-        XCTAssertEqual(texts(api, to: 555), ["👋 I've asked Cress to let you see AI usage. You'll get it here once they allow it."])
-        XCTAssertEqual(UsageMenu.sharingLines(app.usageMenuState()), ["Asking to see usage: Lim Wei (allow in Telegram)"])
-
-        api.push(decide(51, viewer: 555, allow: true))
-        try await until("the welcome") { texts(api, to: 555).count == 2 }
-        let welcome = try XCTUnwrap(texts(api, to: 555).dropFirst().first)
-        XCTAssertTrue(welcome.hasPrefix("✅ Cress let you see AI usage. Tap <b>📊 Usage</b> below any time.\n\n📊 <b>AI usage</b> · "), welcome)
-        XCTAssertTrue(welcome.contains(" · ◀ Cress's Mac\n"), "whose Mac the ◀ marks: \(welcome)")
-        let keyboard = api.sent().last { ($0["chat_id"] as? NSNumber)?.int64Value == 555 }?["reply_markup"] as? [String: Any]
-        XCTAssertEqual(keyboard?["is_persistent"] as? Bool, true, "they get the Usage button too")
-        XCTAssertTrue(api.calls.contains { $0.method == "answerCallbackQuery" && $0.body["text"] as? String == "Allowed Lim Wei" })
+        api.push(message(50, "/start", chat: 555, name: "Lim Wei"))
+        try await until("their report") { bot.answered == 1 }
+        let first = try XCTUnwrap(texts(api, to: 555).first)
+        XCTAssertTrue(first.hasPrefix("👋 Tap <b>📊 Usage</b> below any time for the latest.\n\n📊 <b>AI usage</b> · "), first)
+        XCTAssertTrue(first.contains(" · ◀ Cress's Mac\n"), "whose Mac the ◀ marks: \(first)")
+        let keyboard = api.sent().first?["reply_markup"] as? [String: Any]
+        XCTAssertEqual(keyboard?["is_persistent"] as? Bool, true, "their own Usage button")
+        XCTAssertEqual(texts(api, to: 222), [], "nothing for the owner to answer")
         XCTAssertEqual(UsageMenu.sharingLines(app.usageMenuState()), ["Shared with Lim Wei"])
         XCTAssertEqual(TelegramViewers.standard().status(of: 555), .allowed, "kept for the next start")
 
         clockNow += 10
-        api.push(message(52, "/usage", chat: 555, name: "Lim Wei"))
-        try await until("a report on request") { texts(api, to: 555).count == 3 }
-        let report = try XCTUnwrap(texts(api, to: 555).dropFirst(2).first)
-        XCTAssertTrue(report.hasPrefix("📊 <b>AI usage</b> · "), report)
-        XCTAssertEqual(asks(api), 1, "the owner was asked once")
+        api.push(message(51, "📊 Usage", chat: 555, name: "Lim Wei"))
+        try await until("a second report") { bot.answered == 2 }
+        let second = try XCTUnwrap(texts(api, to: 555).dropFirst().first)
+        XCTAssertTrue(second.hasPrefix("📊 <b>AI usage</b> · "), "the word on the button comes once: \(second)")
     }
 
-    func testOnlyTheOwnerCanAllowSomeone() async throws {
+    func testStopSharingCutsSomeoneOffAndShareAgainUndoesIt() async throws {
         let api = FakeBotAPI()
         let (app, bot) = try await listeningApp(api)
         defer { bot.stop(); withExtendedLifetime(app) {} }
         api.push(message(60, "/usage", chat: 555, name: "Lim Wei"))
-        try await until("the owner asked") { asks(api) == 1 }
-        api.push(decide(61, viewer: 555, allow: true, from: 555), // the same button, forged in their own chat
-                 message(62, "📊 Usage"))
-        try await until("the next message handled") { bot.answered == 1 }
-        XCTAssertEqual(app.telegramViewers.status(of: 555), .pending, "nobody lets themselves in")
-        XCTAssertEqual(texts(api, to: 555).count, 1, "and they got no report")
-        XCTAssertFalse(api.calls.contains { $0.method == "answerCallbackQuery" })
-    }
+        try await until("their report") { bot.answered == 1 }
 
-    func testAWaitingPersonIsNotFloodedAndAnIgnoredOneHearsNothing() async throws {
-        let api = FakeBotAPI()
-        let (app, bot) = try await listeningApp(api)
-        defer { bot.stop(); withExtendedLifetime(app) {} }
-        let asked = "👋 I've asked Cress to let you see AI usage. You'll get it here once they allow it."
-        let waiting = "⏳ Still waiting for Cress to allow you."
-        api.push(message(70, "/usage", chat: 555, name: "Lim Wei"), message(71, "/usage", chat: 555, name: "Lim Wei"),
-                 message(72, "📊 Usage"))
-        try await until("the owner's report") { bot.answered == 1 }
-        XCTAssertEqual(texts(api, to: 555), [asked], "a second ask at once: nothing more")
-        clockNow += 61
-        api.push(message(73, "/start", chat: 555, name: "Lim Wei"), message(74, "/usage", chat: 555, name: "Lim Wei"),
-                 message(75, "📊 Usage"))
-        try await until("the owner's second report") { bot.answered == 2 }
-        XCTAssertEqual(texts(api, to: 555), [asked, waiting], "a minute later: one reminder, not one per message")
-        XCTAssertEqual(asks(api), 1, "the owner is asked once a day at most")
-
-        api.push(decide(76, viewer: 555, allow: false))
-        try await until("the answer") { api.calls.contains { $0.body["text"] as? String == "Ignored Lim Wei" } }
+        app.stopSharing(with: 555, confirm: { _ in false })
+        XCTAssertEqual(app.telegramViewers.status(of: 555), .allowed, "Cancel changes nothing")
+        app.stopSharing(with: 555, confirm: { _ in true })
+        XCTAssertEqual(app.telegramViewers.status(of: 555), .blocked)
+        try await until("they are told") { texts(api, to: 555).count == 2 }
+        XCTAssertEqual(texts(api, to: 555).last, "🔒 Cress stopped sharing AI usage with you.")
+        XCTAssertEqual(api.sent().last?["reply_markup"] as? [String: Bool], ["remove_keyboard": true], "their button goes")
         XCTAssertEqual(UsageMenu.sharingLines(app.usageMenuState()), [])
-        clockNow += TelegramViewers.askAgainAfter
-        api.push(message(77, "/usage", chat: 555, name: "Lim Wei"), message(78, "📊 Usage"))
-        try await until("the owner's third report") { bot.answered == 3 }
-        XCTAssertEqual(texts(api, to: 555), [asked, waiting], "ignored: no answer, ever")
-        XCTAssertEqual(asks(api), 1, "and the owner is not asked again")
-    }
 
-    func testAnIgnoreByMistakeCanBeUndone() async throws {
-        let api = FakeBotAPI()
-        let (app, bot) = try await listeningApp(api)
-        defer { bot.stop(); withExtendedLifetime(app) {} }
-        app.telegramViewers.request(from: TelegramPeer(id: 777, name: "Allowed"), now: clockNow)
-        app.telegramViewers.decide(777, allow: true, now: clockNow)
-        api.push(message(90, "/usage", chat: 555, name: "Lim Wei"))
-        try await until("the owner asked") { asks(api) == 1 }
-        api.push(decide(91, viewer: 555, allow: false))
-        try await until("ignored") { app.telegramViewers.status(of: 555) == .ignored }
-        app.letAskAgain(777)
-        XCTAssertEqual(app.telegramViewers.status(of: 777), .allowed, "only an ignored person is forgotten")
-        app.letAskAgain(555)
-        XCTAssertNil(app.telegramViewers.status(of: 555))
-        api.push(message(92, "/usage", chat: 555, name: "Lim Wei"))
-        try await until("the owner asked again") { asks(api) == 2 }
-        XCTAssertEqual(UsageMenu.sharingLines(app.usageMenuState()),
-                       ["Shared with Allowed", "Asking to see usage: Lim Wei (allow in Telegram)"])
+        clockNow += 60
+        api.push(message(61, "/usage", chat: 555, name: "Lim Wei"), message(62, "📊 Usage"))
+        try await until("the owner's report") { bot.answered == 2 }
+        XCTAssertEqual(texts(api, to: 555).count, 2, "no answer once sharing stopped")
+
+        app.shareAgain(with: 555)
+        try await until("they are told") { texts(api, to: 555).count == 3 }
+        XCTAssertEqual(texts(api, to: 555).last, "🔓 Cress is sharing AI usage with you again. Tap <b>📊 Usage</b> below any time.")
+        XCTAssertEqual((api.sent().last?["reply_markup"] as? [String: Any])?["is_persistent"] as? Bool, true, "their button is back")
+        XCTAssertEqual(UsageMenu.sharingLines(app.usageMenuState()), ["Shared with Lim Wei"])
+        clockNow += 60
+        api.push(message(63, "/usage", chat: 555, name: "Lim Wei"))
+        try await until("a report again") { bot.answered == 3 }
+        XCTAssertTrue(texts(api, to: 555).last?.hasPrefix("📊 <b>AI usage</b> · ") ?? false, texts(api, to: 555).last ?? "none")
     }
 
     func testTwoPeopleTappingTogetherBothGetAReport() async throws {
         let api = FakeBotAPI()
         let (app, bot) = try await listeningApp(api)
         defer { bot.stop(); withExtendedLifetime(app) {} }
-        app.telegramViewers.request(from: TelegramPeer(id: 555, name: "Lim Wei"), now: clockNow)
-        app.telegramViewers.decide(555, allow: true, now: clockNow)
         api.push(message(80, "📊 Usage"), message(81, "📊 Usage", chat: 555, name: "Lim Wei"))
         try await until("two reports") { bot.answered == 2 }
         XCTAssertTrue(texts(api, to: 555).last?.contains(" · ◀ Cress's Mac\n") ?? false, texts(api, to: 555).last ?? "none")
         XCTAssertFalse(texts(api, to: 222).last?.contains("'s Mac") ?? true, "the owner's own report needs no note")
-    }
-
-    func testStopSharingTellsThemAndTakesTheButtonAway() async throws {
-        let api = FakeBotAPI()
-        try connectTelegram()
-        let bot = TelegramBot(transport: api.transport(), clock: { [unowned self] in clockNow })
-        let viewers = TelegramViewers.standard()
-        viewers.request(from: TelegramPeer(id: 555, name: "Lim Wei"), now: clockNow)
-        let viewer = try XCTUnwrap(viewers.decide(555, allow: true, now: clockNow))
-        await bot.sayStopped(to: viewer, owner: "Cress", settings: try XCTUnwrap(TelegramSettings.load()))
-        XCTAssertEqual(texts(api, to: 555), ["🔒 Cress stopped sharing AI usage with you."])
-        XCTAssertEqual((api.sent().first?["reply_markup"] as? [String: Any])?["remove_keyboard"] as? Bool, true)
     }
 
     func testTheButtonUnderAnAlertIsAnsweredAndADoubleTapSendsOneReport() async throws {

@@ -380,6 +380,21 @@ final class UsageTests: XCTestCase {
 
     private func lines(_ html: String) -> [String] { html.components(separatedBy: "\n") }
 
+    func testSomeoneElsesReportSaysWhoseMacAndShowsNoAddress() {
+        // The dashboard's unnamed row for an account goes by its address.
+        var project = claude("project", session: 10, weekly: 20)
+        project["email"] = "cress.nexxa@example.com"
+        let snap = snapshot([claude("cress", session: 69, weekly: 72), project])
+        let mine = UsageText.reportMessage(view(snap, inUse: ["cress"]))
+        XCTAssertTrue(mine.hasSuffix("Use first: <b>cress.nexxa@example.com</b>\nMost usage left: <b>cress.nexxa@example.com</b>"), mine)
+        XCTAssertFalse(mine.contains("'s Mac"), "the owner's own report needs no note")
+        let theirs = UsageText.reportMessage(view(snap, inUse: ["cress"]), owner: "Cress")
+        XCTAssertTrue(lines(theirs).first?.hasSuffix(" · ◀ Cress's Mac") ?? false, theirs)
+        XCTAssertTrue(theirs.contains("\ncress.nexxa "), "the table too: \(theirs)")
+        XCTAssertTrue(theirs.hasSuffix("Use first: <b>cress.nexxa</b>\nMost usage left: <b>cress.nexxa</b>"), theirs)
+        XCTAssertFalse(theirs.contains("@"), "no address anywhere: \(theirs)")
+    }
+
     func testTheReportIsTablesThenUseFirstAndMostUsageLeft() {
         // The user's layout. now = Sat 10 Oct 02:40 UTC; sessions renew in
         // 2h 46m, weeks in 2d 7h: each limit's cell says when it renews.
