@@ -619,8 +619,10 @@ public enum UsageText {
     /// The usage report, in the same layout: every account's limits with when
     /// they renew, then use first and most usage left. `lead` replaces the
     /// "📊 AI usage" title.
-    public static func reportMessage(_ view: UsageView, lead: String? = nil) -> String {
-        var blocks = [lead ?? "📊 <b>AI usage</b> · \(clock(view.now, now: view.now, timeZone: view.timeZone))"]
+    public static func reportMessage(_ view: UsageView, lead: String? = nil, owner: String? = nil) -> String {
+        // For someone the owner shares with, whose Mac "◀" is.
+        let mac = owner.map { " · ◀ \(html($0))'s Mac" } ?? ""
+        var blocks = [lead ?? "📊 <b>AI usage</b> · \(clock(view.now, now: view.now, timeZone: view.timeZone))\(mac)"]
         if view.readingIsOld {
             let age = until(view.now, now: view.snapshot.fetchedAt).map { " (\($0) ago)" } ?? ""
             blocks.append("⚠️ " + (view.dashboardDown ? "The dashboard is not answering: " : "")

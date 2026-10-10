@@ -196,11 +196,21 @@ enum TelegramSetup {
         return alert.runModal()
     }
 
+    /// "Stop Sharing with …": asks first.
+    static func confirmStopSharing(_ viewer: TelegramViewers.Viewer) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Stop sharing AI usage with \(viewer.name)?"
+        alert.informativeText = "\(viewer.label) will no longer get usage reports from the bot, and their 📊 Usage button goes away. They can ask again later."
+        alert.addButton(withTitle: "Stop Sharing")
+        alert.addButton(withTitle: "Cancel")
+        return present(alert) == .alertFirstButtonReturn
+    }
+
     /// "Disconnect Telegram…": asks first, then forgets the bot and chat.
     static func confirmDisconnect(_ settings: TelegramSettings) -> Bool {
         let alert = NSAlert()
         alert.messageText = "Stop sending usage alerts to Telegram?"
-        alert.informativeText = "AI Sessions forgets \(settings.summary), and any alert still waiting to be sent. The bot itself stays in your Telegram; delete it in @BotFather if you no longer want it."
+        alert.informativeText = "AI Sessions forgets \(settings.summary), the people you share usage with, and any alert still waiting to be sent. The bot itself stays in your Telegram; delete it in @BotFather if you no longer want it."
         alert.addButton(withTitle: "Disconnect")
         alert.addButton(withTitle: "Cancel")
         return present(alert) == .alertFirstButtonReturn

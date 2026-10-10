@@ -55,6 +55,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var telegramBot = TelegramBot()
     /// Why the bot is not listening, for the menu; nil while it listens.
     private var telegramBotProblem: String?
+    /// The people the owner shares usage reports with, and who asked.
+    var telegramViewers = TelegramViewers.standard()
     /// The outbox's clock; tests move it past a retry pause.
     var clock: () -> Date = Date.init
     /// The send in progress: one message at a time, oldest first.
@@ -120,7 +122,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openDashboard: { [weak self] in self?.openDashboard() },
             setUpTelegram: { [weak self] in self?.setUpTelegram() },
             testTelegram: { [weak self] in self?.testTelegram() },
-            disconnectTelegram: { [weak self] in self?.disconnectTelegram() }
+            disconnectTelegram: { [weak self] in self?.disconnectTelegram() },
+            stopSharing: { [weak self] in self?.stopSharing(with: $0) },
+            letAskAgain: { [weak self] in self?.letAskAgain($0) }
         ))
         statusMenu?.update(sessions: [], paused: paused)
         statusMenu?.setConfigProblem(configProblem)
@@ -285,7 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             status: usage?.status ?? UsageMonitor.Status(), telegram: TelegramSettings.load()?.summary,
             telegramEnabled: config.telegramAlerts, telegramProblem: telegramOutbox.problem ?? telegramBotProblem,
             telegramWaiting: telegramOutbox.pending.count, telegramNextTry: telegramOutbox.nextAttempt,
-            settingUpTelegram: TelegramSetup.isRunning)
+            settingUpTelegram: TelegramSetup.isRunning, viewers: telegramViewers.all)
     }
 
     /// One poll's crossings: a macOS banner (unless notifications are off or
@@ -325,10 +329,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// A report for the "📊 Usage" button: a fresh reading first, when the
     /// dashboard answers, about now; nil when there has never been one.
-    func usageReport(lead: String? = nil) async -> String? {
+    /// `owner`: for someone the owner shares with, whose Mac "◀" marks.
+    func usageReport(lead: String? = nil, owner: String? = nil) async -> String? {
         await usage?.poll()
         guard usage?.status.snapshot != nil else { return nil }
-        return UsageText.reportMessage(usageView(now: clock()), lead: lead)
+        return UsageText.reportMessage(usageView(now: clock()), lead: lead, owner: owner)
     }
 
     /// Why there is no report to send.
@@ -347,10 +352,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// and not while the setup reads the same updates. A chat connected
     /// before the button existed is sent it once.
     func syncTelegramBot() {
-        telegramBot.report = { [weak self] in
+        telegramBot.report = { [weak self] owner in
             guard let self else { return "📊 No usage reading yet." }
-            return await usageReport() ?? noReportReason()
+            return await usageReport(owner: owner) ?? noReportReason()
         }
+        telegramBot.viewers = telegramViewers
+        telegramBot.onViewers = { [weak self] in self?.refreshUsageMenu() }
         telegramBot.onProblem = { [weak self] problem in
             self?.telegramBotProblem = problem
             self?.refreshUsageMenu()
@@ -498,9 +505,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let settings = TelegramSettings.load(), TelegramSetup.confirmDisconnect(settings) else { return }
         TelegramSettings.delete()
         telegramOutbox.clear()
+        telegramViewers.clear()
         telegramProblemAnnounced = nil
         syncTelegramBot()
         Log.shared.info("Telegram disconnected")
+        refreshUsageMenu()
+    }
+
+    /// "Stop Sharing with …": asks first, then forgets that person and tells
+    /// them (their 📊 Usage button goes away too).
+    private func stopSharing(with chatId: Int64) {
+        guard let viewer = telegramViewers.all.first(where: { $0.chatId == chatId }),
+              TelegramSetup.confirmStopSharing(viewer) else { return }
+        telegramViewers.remove(chatId)
+        Log.shared.info("Telegram: stopped sharing usage reports with \(viewer.label)")
+        refreshUsageMenu()
+        guard let settings = TelegramSettings.load() else { return }
+        Task { @MainActor [weak self] in
+            await self?.telegramBot.sayStopped(to: viewer, owner: settings.chatName ?? "The owner", settings: settings)
+        }
+    }
+
+    /// "Ignored › Let … Ask Again": forgets someone ignored by mistake, so
+    /// their next /usage asks the owner again. Nobody is told: they never
+    /// heard back. Only an ignored person; anyone allowed stays allowed.
+    func letAskAgain(_ chatId: Int64) {
+        guard let viewer = telegramViewers.all.first(where: { $0.chatId == chatId && $0.status == .ignored }) else { return }
+        telegramViewers.remove(chatId)
+        Log.shared.info("Telegram: \(viewer.label) may ask to see usage reports again")
         refreshUsageMenu()
     }
 

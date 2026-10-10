@@ -328,6 +328,10 @@ public enum TelegramMarkup: Equatable, Sendable {
     case usageKeyboard
     /// "📊 Usage now" under the message itself (an inline button).
     case usageNowButton
+    /// Allow / Ignore under the owner's copy of someone asking to see usage.
+    case viewerRequest(chatId: Int64)
+    /// Takes the "📊 Usage" keyboard away (sharing stopped).
+    case removeKeyboard
 
     var json: [String: Any] {
         switch self {
@@ -335,36 +339,80 @@ public enum TelegramMarkup: Equatable, Sendable {
             return ["keyboard": [[["text": TelegramClient.usageButtonTitle]]], "resize_keyboard": true, "is_persistent": true]
         case .usageNowButton:
             return ["inline_keyboard": [[["text": "📊 Usage now", "callback_data": TelegramClient.usageCallbackData]]]]
+        case .removeKeyboard:
+            return ["remove_keyboard": true]
+        case .viewerRequest(let chatId):
+            return ["inline_keyboard": [[["text": "✅ Allow", "callback_data": "viewer:allow:\(chatId)"],
+                                         ["text": "🚫 Ignore", "callback_data": "viewer:ignore:\(chatId)"]]]]
         }
     }
 }
 
-/// What a message to the bot asks for. Only the connected private chat is
-/// heard; anyone else who finds the bot gets no answer at all.
+/// Someone in a private chat with the bot.
+public struct TelegramPeer: Equatable, Sendable {
+    public var id: Int64
+    public var name: String
+    public var username: String?
+
+    public init(id: Int64, name: String, username: String? = nil) {
+        self.id = id
+        self.name = name
+        self.username = username
+    }
+
+    /// "Lim Wei (@limwei)".
+    public var label: String { username.map { "\(name) (@\($0))" } ?? name }
+}
+
+/// What a message to the bot asks for, and who asks. Only private chats
+/// count, and only a person writing in their own chat with the bot; whether
+/// they may have an answer is the bot's call (the owner, someone the owner
+/// allowed, or a stranger who has to ask first).
 public enum TelegramRequest: Equatable, Sendable {
     /// "📊 Usage", /usage, /start or "usage" typed in the chat.
-    case report
+    case report(from: TelegramPeer)
     /// The "📊 Usage now" button under an alert; its callback is answered.
-    case reportFromButton(callbackId: String)
+    case reportFromButton(callbackId: String, from: TelegramPeer)
+    /// The owner's Allow / Ignore on someone asking to see usage.
+    case decision(callbackId: String, from: TelegramPeer, viewer: Int64, allow: Bool)
 
-    /// The request in `update`, if it is one from `chatId`. A message older
-    /// than `maxAge` (typed while the Mac slept) is left unanswered.
-    public static func parse(_ update: [String: Any], chatId: Int64, bot: String?, now: Date,
+    public var peer: TelegramPeer {
+        switch self {
+        case .report(let peer), .reportFromButton(_, let peer), .decision(_, let peer, _, _): return peer
+        }
+    }
+
+    /// The request in `update`, if any. A message older than `maxAge` (typed
+    /// while the Mac slept) is left unanswered.
+    public static func parse(_ update: [String: Any], bot: String?, now: Date,
                              maxAge: TimeInterval = 600) -> TelegramRequest? {
         func id(_ object: Any?) -> Int64? { ((object as? [String: Any])?["id"] as? NSNumber)?.int64Value }
         if let message = update["message"] as? [String: Any] {
-            guard id(message["chat"]) == chatId, (message["chat"] as? [String: Any])?["type"] as? String == "private",
-                  id(message["from"]).map({ $0 == chatId }) ?? true,
+            guard let chat = message["chat"] as? [String: Any], chat["type"] as? String == "private",
+                  let from = message["from"] as? [String: Any], from["is_bot"] as? Bool != true,
+                  let person = id(from), id(chat) == person,
                   let text = message["text"] as? String, asksForUsage(text, bot: bot) else { return nil }
             if let sent = (message["date"] as? NSNumber)?.doubleValue, now.timeIntervalSince1970 - sent > maxAge { return nil }
-            return .report
+            return .report(from: peer(person, from))
         }
         if let query = update["callback_query"] as? [String: Any] {
-            guard let callbackId = query["id"] as? String, query["data"] as? String == TelegramClient.usageCallbackData,
-                  id(query["from"]) == chatId, id((query["message"] as? [String: Any])?["chat"]) == chatId else { return nil }
-            return .reportFromButton(callbackId: callbackId)
+            // The button sits in the presser's own chat with the bot.
+            guard let callbackId = query["id"] as? String, let from = query["from"] as? [String: Any],
+                  let person = id(from), id((query["message"] as? [String: Any])?["chat"]) == person,
+                  let data = query["data"] as? String else { return nil }
+            if data == TelegramClient.usageCallbackData { return .reportFromButton(callbackId: callbackId, from: peer(person, from)) }
+            let parts = data.split(separator: ":").map(String.init)
+            guard parts.count == 3, parts[0] == "viewer", parts[1] == "allow" || parts[1] == "ignore",
+                  let viewer = Int64(parts[2]) else { return nil }
+            return .decision(callbackId: callbackId, from: peer(person, from), viewer: viewer, allow: parts[1] == "allow")
         }
         return nil
+    }
+
+    private static func peer(_ id: Int64, _ user: [String: Any]) -> TelegramPeer {
+        let name = [user["first_name"] as? String, user["last_name"] as? String].compactMap { $0 }.joined(separator: " ")
+        let username = user["username"] as? String
+        return TelegramPeer(id: id, name: name.isEmpty ? (username ?? "someone") : name, username: username)
     }
 
     /// The keyboard button's text, /usage (/usage@bot), /start, or "usage".
@@ -375,6 +423,116 @@ public enum TelegramRequest: Equatable, Sendable {
         let parts = first.split(separator: "@", maxSplits: 1).map(String.init)
         if parts.count == 2, parts[1] != bot?.lowercased() { return false }
         return parts.first == "/usage" || parts.first == "/start"
+    }
+}
+
+/// The people the owner lets see usage reports through the bot, and the
+/// ones who asked: `state/telegram-viewers.json` (0600). Someone new who
+/// sends /usage is "pending" and the owner gets Allow / Ignore buttons; an
+/// allowed person gets reports on request (never the alerts); an ignored one
+/// gets no answer at all. Not thread-safe: the app uses it on the main actor.
+public final class TelegramViewers {
+    public struct Viewer: Codable, Equatable, Sendable {
+        public enum Status: String, Codable, Sendable { case pending, allowed, ignored }
+        public var chatId: Int64
+        public var name: String
+        public var username: String?
+        public var status: Status
+        public var since: Date
+        /// When the owner was last asked about a pending one.
+        public var askedAt: Date?
+
+        public var label: String { TelegramPeer(id: chatId, name: name, username: username).label }
+    }
+
+    /// The owner is asked again about someone still waiting after this long.
+    public static let askAgainAfter: TimeInterval = 86_400
+    /// The most kept; the oldest ignored ones go first.
+    static let maxViewers = 100
+
+    let url: URL
+    public private(set) var all: [Viewer]
+
+    public init(url: URL) {
+        self.url = url
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        all = (try? Data(contentsOf: url)).flatMap { try? decoder.decode([Viewer].self, from: $0) } ?? []
+    }
+
+    public static func standard() -> TelegramViewers {
+        TelegramViewers(url: AppPaths.stateDir.appendingPathComponent("telegram-viewers.json"))
+    }
+
+    public func status(of chatId: Int64) -> Viewer.Status? { all.first { $0.chatId == chatId }?.status }
+
+    public var allowed: [Viewer] { all.filter { $0.status == .allowed } }
+    public var pending: [Viewer] { all.filter { $0.status == .pending } }
+
+    /// Someone not allowed asks to see usage. True when the owner should be
+    /// asked now: a new request, or one still waiting after a day. Their
+    /// name is kept current.
+    @discardableResult
+    public func request(from peer: TelegramPeer, now: Date) -> Bool {
+        var ask = false
+        if let index = all.firstIndex(where: { $0.chatId == peer.id }) {
+            all[index].name = peer.name
+            all[index].username = peer.username
+            if all[index].status == .pending, all[index].askedAt.map({ now.timeIntervalSince($0) >= Self.askAgainAfter }) ?? true {
+                all[index].askedAt = now
+                ask = true
+            }
+        } else {
+            all.append(Viewer(chatId: peer.id, name: peer.name, username: peer.username, status: .pending, since: now, askedAt: now))
+            ask = true
+            trim()
+        }
+        save()
+        return ask
+    }
+
+    /// The owner's answer; nil when that person is not waiting (any more).
+    @discardableResult
+    public func decide(_ chatId: Int64, allow: Bool, now: Date) -> Viewer? {
+        guard let index = all.firstIndex(where: { $0.chatId == chatId && $0.status == .pending }) else { return nil }
+        all[index].status = allow ? .allowed : .ignored
+        all[index].since = now
+        all[index].askedAt = nil
+        save()
+        return all[index]
+    }
+
+    /// Stops sharing with `chatId` (they may ask again).
+    public func remove(_ chatId: Int64) {
+        all.removeAll { $0.chatId == chatId }
+        save()
+    }
+
+    public func clear() {
+        all = []
+        save()
+    }
+
+    private func trim() {
+        while all.count > Self.maxViewers {
+            guard let index = all.firstIndex(where: { $0.status == .ignored }) ?? all.firstIndex(where: { $0.status == .pending }) else { return }
+            all.remove(at: index)
+        }
+    }
+
+    private func save() {
+        do {
+            if all.isEmpty {
+                try? FileManager.default.removeItem(at: url)
+                return
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            try OwnerOnlyFile.write(try encoder.encode(all), to: url)
+        } catch {
+            Log.shared.error("could not save \(url.path): \(error.localizedDescription)")
+        }
     }
 }
 

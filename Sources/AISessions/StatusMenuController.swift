@@ -154,6 +154,8 @@ enum UsageMenu {
         var telegramNextTry: Date?
         /// A setup dialog is open: its menu item waits.
         var settingUpTelegram = false
+        /// The people the owner shares usage reports with, and who asked.
+        var viewers: [TelegramViewers.Viewer] = []
     }
 
     /// The account this Mac is signed into, with its limits: "Usage limits —
@@ -256,6 +258,17 @@ enum UsageMenu {
         return lines
     }
 
+    /// Who else sees usage reports through the bot, and who is waiting.
+    static func sharingLines(_ state: State) -> [String] {
+        guard state.telegram != nil else { return [] }
+        let allowed = state.viewers.filter { $0.status == .allowed }.map(\.name)
+        let waiting = state.viewers.filter { $0.status == .pending }.map(\.name)
+        var lines: [String] = []
+        if !allowed.isEmpty { lines.append("Shared with " + allowed.joined(separator: ", ")) }
+        if !waiting.isEmpty { lines.append("Asking to see usage: " + waiting.joined(separator: ", ") + " (allow in Telegram)") }
+        return lines
+    }
+
     /// "Updated just now" / "Updated 4m ago — dashboard not reachable".
     static func freshness(_ state: State, now: Date) -> String {
         let when = state.status.snapshot.map { Formatting.ago($0.fetchedAt, now: now) } ?? ""
@@ -279,6 +292,8 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         var setUpTelegram: () -> Void = {}
         var testTelegram: () -> Void = {}
         var disconnectTelegram: () -> Void = {}
+        var stopSharing: (Int64) -> Void = { _ in }
+        var letAskAgain: (Int64) -> Void = { _ in }
     }
 
     private let actions: Actions
@@ -443,6 +458,33 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         let setUp = item(Self.setUpTitle(usage), #selector(setUpTelegram))
         setUp.isEnabled = !usage.settingUpTelegram
         if usage.telegram == nil || usage.telegramProblem != nil || usage.settingUpTelegram { sub.addItem(setUp) }
+        for line in UsageMenu.sharingLines(usage) { sub.addItem(disabledItem(line)) }
+        let shared = usage.viewers.filter { $0.status == .allowed }
+        if usage.telegram != nil, !shared.isEmpty {
+            let stop = NSMenuItem(title: "Stop Sharing", action: nil, keyEquivalent: "")
+            let people = NSMenu()
+            people.autoenablesItems = false
+            for viewer in shared {
+                let row = item("with \(viewer.label)…", #selector(stopSharing(_:)))
+                row.representedObject = NSNumber(value: viewer.chatId)
+                people.addItem(row)
+            }
+            stop.submenu = people
+            sub.addItem(stop)
+        }
+        let ignored = usage.viewers.filter { $0.status == .ignored }
+        if usage.telegram != nil, !ignored.isEmpty {
+            let undo = NSMenuItem(title: "Ignored", action: nil, keyEquivalent: "")
+            let people = NSMenu()
+            people.autoenablesItems = false
+            for viewer in ignored {
+                let row = item("Let \(viewer.label) Ask Again", #selector(letAskAgain(_:)))
+                row.representedObject = NSNumber(value: viewer.chatId)
+                people.addItem(row)
+            }
+            undo.submenu = people
+            sub.addItem(undo)
+        }
         if usage.telegram != nil {
             sub.addItem(item("Send Test Message to Telegram", #selector(testTelegram)))
             sub.addItem(item("Disconnect Telegram…", #selector(disconnectTelegram)))
@@ -540,6 +582,14 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     @objc private func testTelegram() { actions.testTelegram() }
 
     @objc private func disconnectTelegram() { actions.disconnectTelegram() }
+
+    @objc private func stopSharing(_ sender: NSMenuItem) {
+        if let chatId = (sender.representedObject as? NSNumber)?.int64Value { actions.stopSharing(chatId) }
+    }
+
+    @objc private func letAskAgain(_ sender: NSMenuItem) {
+        if let chatId = (sender.representedObject as? NSNumber)?.int64Value { actions.letAskAgain(chatId) }
+    }
 
     @objc private func openLog() {
         NSWorkspace.shared.open(Log.shared.fileURL)

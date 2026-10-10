@@ -188,10 +188,32 @@ advice from them.
 
 **The Usage button.** *📊 Usage* stays under the chat: tap it (or send
 `/usage`) any time for the same report about now. An alert carries a *📊 Usage
-now* button too. Only your own chat is answered; anyone else who finds the bot
-gets nothing. The app listens with Telegram's long polling while Telegram is
-connected, steps aside while the setup runs, and does not answer taps made while
-the Mac was asleep or the app was not running (they would be old).
+now* button too. Your own chat is answered at once; anyone else has to be
+allowed first (below). The app listens with Telegram's long polling while
+Telegram is connected, steps aside while the setup runs, and does not answer
+taps made while the Mac was asleep or the app was not running (they would be
+old).
+
+**Sharing the reports.** Someone else can see the same reports once you allow
+it. When they open the bot and press START (or send `/usage`), the bot tells
+them it asked you, and your chat gets a message naming them with **✅ Allow**
+and **🚫 Ignore**:
+
+- **Allow:** a report reaches them right away, with their own *📊 Usage*
+  button, and they get one whenever they ask. Their reports are marked
+  *◀ <your name>'s Mac*, so they know whose account the ◀ marks. They never get
+  the alerts, and nothing they send changes anything.
+- **Ignore:** the bot never answers them again.
+- **No answer yet:** you are asked again a day later at most, and they are
+  told *still waiting* at most once a minute, however often they ask.
+
+Only you can press Allow: the same button pressed in anyone else's chat does
+nothing. Only private chats count, never groups. *Usage limits* in the menu
+lists who sees the reports (*Shared with …*) and who is waiting. *Stop Sharing ›
+with …* takes one person off and tells them, and their button goes away; they
+may ask again. *Ignored › Let … Ask Again* undoes an Ignore pressed by mistake:
+their next `/usage` asks you again. *Disconnect Telegram…* stops sharing with
+everyone.
 
 The token is kept in `state/telegram.json`, readable by you alone, and never in
 `config.json` or the log. Use a bot made only for these alerts: the setup reads
@@ -204,7 +226,8 @@ and so on, up to every 15 minutes, for 6 hours. Meanwhile the submenu says why
 and how many wait. When Telegram refuses for good (the token was revoked, the
 bot was blocked), the message is dropped and a banner says so, once; *Set Up
 Telegram Again…* fixes it. *Send Test Message to Telegram* checks the
-connection, and *Disconnect Telegram…* forgets the bot and anything waiting.
+connection, and *Disconnect Telegram…* forgets the bot, anything waiting and
+everyone it was shared with.
 
 ## Files
 
@@ -222,6 +245,7 @@ connection, and *Disconnect Telegram…* forgets the bot and anything waiting.
 | `~/.ai-sessions/state/usage-alerts.json` | which usage limits were already announced, per period |
 | `~/.ai-sessions/state/telegram.json` | the Telegram bot token and chat, once you connect one |
 | `~/.ai-sessions/state/telegram-outbox.json` | Telegram alerts waiting to be tried again |
+| `~/.ai-sessions/state/telegram-viewers.json` | the people you share usage reports with, and the ones who asked |
 
 `state/` is readable by you alone (the folder is `0700`, its files `0600`): it
 holds session titles, which are often your own prompts, and the agents' last
@@ -308,6 +332,15 @@ Set `AI_SESSIONS_HOME=/some/dir` to keep a test run's log and state out of
   delivering* with the reason, and the log has a `usage alert not sent`
   line for each try. *Send Test Message to Telegram* or
   `AISessions --telegram-test` tries at once.
+- **Someone you shared the bot with gets no report.** They have to be allowed
+  first: when they send `/usage`, your chat gets a message with **✅ Allow**;
+  the menu lists them under *Asking to see usage* until you answer. The bot
+  only answers while this Mac is awake and the app is running, and a message
+  older than 10 minutes is not answered (it would be old news); they send
+  `/usage` again. Someone you ignored is never answered: *Ignored › Let … Ask
+  Again* lets them ask again. The log says `… asked to see usage reports` when
+  you are asked, `… may now see usage reports` once you allow, and
+  `usage report sent on request to …` for each answer.
 - **Anything else.** *Open Log* in the menu. Every route, event, reload and
   error is there, and `--headless` prints the same lines live.
 

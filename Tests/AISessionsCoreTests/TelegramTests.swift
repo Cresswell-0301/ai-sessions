@@ -208,41 +208,81 @@ final class TelegramTests: XCTestCase {
         XCTAssertEqual((fake.body(3)["commands"] as? [[String: Any]])?.first?["command"] as? String, "usage")
     }
 
-    func testOnlyTheConnectedChatIsAnswered() {
+    func testARequestSaysWhoAsks() {
         let now = Date(timeIntervalSince1970: 1_791_600_000)
-        func message(_ text: String, chat: Int64 = 222, type: String = "private", from: Int64? = 222, age: Double = 5) -> [String: Any] {
+        func message(_ text: String, chat: Int64 = 222, type: String = "private", from: Int64? = 222, age: Double = 5,
+                     bot: Bool = false) -> [String: Any] {
             var message: [String: Any] = ["message_id": 1, "date": now.timeIntervalSince1970 - age, "text": text,
                                           "chat": ["id": chat, "type": type]]
-            if let from { message["from"] = ["id": from, "is_bot": false] }
+            if let from { message["from"] = ["id": from, "is_bot": bot, "first_name": "Lim", "last_name": "Wei", "username": "limwei"] }
             return ["update_id": 1, "message": message]
         }
         func parse(_ update: [String: Any]) -> TelegramRequest? {
-            TelegramRequest.parse(update, chatId: 222, bot: "My_Usage_Bot", now: now)
+            TelegramRequest.parse(update, bot: "My_Usage_Bot", now: now)
         }
-        XCTAssertEqual(parse(message("📊 Usage")), .report, "the button")
-        XCTAssertEqual(parse(message("/usage")), .report)
-        XCTAssertEqual(parse(message("/usage@my_usage_bot")), .report)
-        XCTAssertEqual(parse(message("/start")), .report)
-        XCTAssertEqual(parse(message(" Usage ")), .report)
+        let lim = TelegramPeer(id: 222, name: "Lim Wei", username: "limwei")
+        XCTAssertEqual(parse(message("📊 Usage")), .report(from: lim), "the button")
+        XCTAssertEqual(parse(message("/usage")), .report(from: lim))
+        XCTAssertEqual(parse(message("/usage@my_usage_bot")), .report(from: lim))
+        XCTAssertEqual(parse(message("/start")), .report(from: lim))
+        XCTAssertEqual(parse(message(" Usage ")), .report(from: lim))
+        XCTAssertEqual(parse(message("/usage", chat: 999, from: 999))?.peer.id, 999, "anyone: whether they get an answer is the bot's call")
         XCTAssertNil(parse(message("/usage@other_bot")), "a command for another bot")
         XCTAssertNil(parse(message("hello")))
-        XCTAssertNil(parse(message("/usage", chat: 999, from: 999)), "a stranger who found the bot")
-        XCTAssertNil(parse(message("/usage", chat: 222, type: "group")), "not the private chat")
-        XCTAssertNil(parse(message("/usage", from: 999)), "someone else in that chat")
-        XCTAssertNil(parse(message("/usage", chat: 999, from: nil)), "another chat, sender unknown")
+        XCTAssertNil(parse(message("/usage", chat: 222, type: "group")), "not a private chat")
+        XCTAssertNil(parse(message("/usage", from: 999)), "someone other than the chat's own person")
+        XCTAssertNil(parse(message("/usage", chat: 999, from: nil)), "no sender")
+        XCTAssertNil(parse(message("/usage", bot: true)), "another bot")
         XCTAssertNil(parse(message("/usage", age: 3600)), "typed an hour ago, while the Mac slept")
 
-        let tap: [String: Any] = ["update_id": 2, "callback_query": ["id": "cb-9", "data": "usage", "from": ["id": 222],
-                                                                    "message": ["message_id": 5, "chat": ["id": 222, "type": "private"]]]]
-        XCTAssertEqual(parse(tap), .reportFromButton(callbackId: "cb-9"))
-        var strangerTap = tap
-        strangerTap["callback_query"] = ["id": "cb-x", "data": "usage", "from": ["id": 999],
-                                         "message": ["message_id": 5, "chat": ["id": 222, "type": "private"]]]
-        XCTAssertNil(parse(strangerTap))
-        var otherData = tap
-        otherData["callback_query"] = ["id": "cb-y", "data": "other", "from": ["id": 222],
-                                       "message": ["message_id": 5, "chat": ["id": 222, "type": "private"]]]
-        XCTAssertNil(parse(otherData))
+        func tap(_ data: String, from: Int64 = 222, chat: Int64 = 222) -> [String: Any] {
+            ["update_id": 2, "callback_query": ["id": "cb-9", "data": data, "from": ["id": from, "first_name": "Cress"],
+                                                "message": ["message_id": 5, "chat": ["id": chat, "type": "private"]]]]
+        }
+        let cress = TelegramPeer(id: 222, name: "Cress")
+        XCTAssertEqual(parse(tap("usage")), .reportFromButton(callbackId: "cb-9", from: cress))
+        XCTAssertEqual(parse(tap("viewer:allow:555")), .decision(callbackId: "cb-9", from: cress, viewer: 555, allow: true))
+        XCTAssertEqual(parse(tap("viewer:ignore:555")), .decision(callbackId: "cb-9", from: cress, viewer: 555, allow: false))
+        XCTAssertNil(parse(tap("usage", from: 999)), "a button in someone else's chat")
+        XCTAssertNil(parse(tap("viewer:allow:abc")))
+        XCTAssertNil(parse(tap("viewer:make-admin:555")))
+        XCTAssertNil(parse(tap("other")))
+    }
+
+    func testTheSharingButtons() async throws {
+        let fake = FakeTelegram()
+        fake.answers["sendMessage"] = (200, #"{"ok":true,"result":{"message_id":9}}"#)
+        let client = TelegramClient(token: token, transport: fake.transport())
+        try await client.send(html: "asks", to: 222, markup: .viewerRequest(chatId: 555))
+        try await client.send(html: "stopped", to: 555, markup: .removeKeyboard)
+        let buttons = (fake.body(0)["reply_markup"] as? [String: Any])?["inline_keyboard"] as? [[[String: Any]]]
+        XCTAssertEqual(buttons?.first?.map { $0["callback_data"] as? String }, ["viewer:allow:555", "viewer:ignore:555"])
+        XCTAssertEqual((fake.body(1)["reply_markup"] as? [String: Any])?["remove_keyboard"] as? Bool, true)
+    }
+
+    // MARK: Viewers
+
+    func testViewersAskAreAllowedOrIgnoredAndAreKept() throws {
+        let url = dir.appendingPathComponent("state/telegram-viewers.json")
+        let viewers = TelegramViewers(url: url)
+        let lim = TelegramPeer(id: 555, name: "Lim Wei", username: "limwei")
+        XCTAssertTrue(viewers.request(from: lim, now: t0), "new: the owner is asked")
+        XCTAssertEqual(viewers.status(of: 555), .pending)
+        XCTAssertFalse(viewers.request(from: lim, now: t0 + 3600), "again within a day: not asked again")
+        XCTAssertTrue(viewers.request(from: lim, now: t0 + TelegramViewers.askAgainAfter), "a day later: asked again")
+        XCTAssertEqual(viewers.decide(555, allow: true, now: t0 + 90_000)?.status, .allowed)
+        XCTAssertNil(viewers.decide(555, allow: false, now: t0 + 90_001), "decided already: a second tap changes nothing")
+        XCTAssertEqual(viewers.status(of: 555), .allowed)
+        XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        XCTAssertEqual(TelegramViewers(url: url).allowed.map(\.label), ["Lim Wei (@limwei)"], "kept across a restart")
+
+        XCTAssertTrue(viewers.request(from: TelegramPeer(id: 666, name: "Spam"), now: t0))
+        XCTAssertEqual(viewers.decide(666, allow: false, now: t0)?.status, .ignored)
+        XCTAssertFalse(viewers.request(from: TelegramPeer(id: 666, name: "Spam"), now: t0 + 999_999), "ignored stays ignored")
+        viewers.remove(555)
+        XCTAssertNil(viewers.status(of: 555))
+        viewers.clear()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
     func testAnOverlongMessageIsRefusedNotCut() async throws {
