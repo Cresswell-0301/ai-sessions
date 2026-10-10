@@ -214,11 +214,10 @@ func runTelegramTest() -> Int32 {
         return 1
     }
     let config = Config.load()
-    var text = "🧪 <b>Test from AI Sessions</b> (command line)\nUsage alerts reach this chat."
-    if case .success(let snapshot) = fetchUsage(config) {
-        text += "\n\n" + UsageText.summary(snapshot, threshold: config.usageAlertThreshold)
-    }
-    let message = text
+    var snapshot: UsageSnapshot?
+    if case .success(let reading) = fetchUsage(config) { snapshot = reading }
+    let message = UsageText.telegram(lead: "🧪 <b>Test from AI Sessions</b> (command line)\nUsage alerts reach this chat.",
+                                     snapshot: snapshot, threshold: config.usageAlertThreshold)
     let outcome: String? = waitFor {
         do {
             try await TelegramClient(token: settings.botToken).send(html: message, to: settings.chatId)

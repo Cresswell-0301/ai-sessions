@@ -69,29 +69,39 @@ public struct UsageSnapshot: Equatable, Sendable {
 
     /// Parses the dashboard's `/data.json`: `{"rows": [{"tool", "label",
     /// "skipped", "limits": {"error", "windows": [{"kind", "label", "pct",
-    /// "resets"}]}}], "meta": {…}}`. Rows it skipped (excluded, broken) and
-    /// windows without a number are left out; nil if the shape is not that.
+    /// "resets"}]}}], "meta": {…}}`. Excluded accounts and windows without a
+    /// number are left out; nil if the shape is not that.
     public static func parse(_ data: Data, fetchedAt: Date) -> UsageSnapshot? {
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let rows = root["rows"] as? [Any] else { return nil }
         var accounts: [UsageAccount] = []
         for case let row as [String: Any] in rows {
             guard let tool = row["tool"] as? String, let label = row["label"] as? String,
-                  row["skipped"] as? Bool != true else { continue }
+                  !isLeftOut(row["skipped"]) else { continue }
             let limits = row["limits"] as? [String: Any] ?? [:]
             var windows: [UsageWindow] = []
             for case let window as [String: Any] in limits["windows"] as? [Any] ?? [] {
                 guard let kind = window["kind"] as? String, let pct = (window["pct"] as? NSNumber)?.doubleValue,
                       pct.isFinite else { continue }
                 let resets = (window["resets"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+                // Bounded: a wild number must not trap `Int(pct.rounded())`.
                 windows.append(UsageWindow(kind: kind, label: window["label"] as? String ?? kind,
-                                           pct: pct, resetsAt: resets))
+                                           pct: min(max(pct, 0), 1000), resetsAt: resets))
             }
             let error = limits["error"] as? String
             let readable = (error?.isEmpty ?? true) && !windows.isEmpty
             accounts.append(UsageAccount(tool: tool, label: label, windows: windows, readable: readable))
         }
         return UsageSnapshot(accounts: accounts, fetchedAt: fetchedAt)
+    }
+
+    /// `skipped` is the dashboard's note on its token-cost scan ("signed in —
+    /// no usage recorded yet"), not on the limits, which it reads anyway. Only
+    /// an excluded account is left out (the dashboard withholds its limits on
+    /// purpose), or a row marked plainly `true`.
+    static func isLeftOut(_ skipped: Any?) -> Bool {
+        if let reason = skipped as? String { return reason.hasPrefix("excluded") }
+        return skipped as? Bool == true
     }
 
     /// The Claude account with the most room left now: every window under the
@@ -272,48 +282,95 @@ public enum UsageText {
                 resets, advice)
     }
 
+    /// What one Telegram message may hold: Telegram takes 4096 UTF-16 units
+    /// (after parsing, so the tags here only make this cautious).
+    public static let telegramBudget = 4000
+    /// Rows per table before "…and N more" (eleven accounts today).
+    static let maxTableRows = 30
+
     /// The Telegram message (parse_mode HTML) for one tick's crossings.
     public static func telegram(for alerts: [UsageAlert], snapshot: UsageSnapshot, threshold: Double) -> String {
         let now = snapshot.fetchedAt
-        var lines = ["⚠️ <b>AI usage — limit almost hit</b>"]
+        var blocks = ["⚠️ <b>AI usage — limit almost hit</b>"]
         for alert in alerts {
             let resets = until(alert.window.resetsAt, now: now).map { " (resets in \($0))" } ?? ""
-            lines.append("• <b>\(html(alert.account.label))</b> — \(alert.account.toolName) \(html(alert.window.shortName)) at <b>\(percent(alert.window.pct))</b>\(resets)")
+            blocks.append("• <b>\(html(alert.account.label))</b> — \(alert.account.toolName) \(html(alert.window.shortName)) at <b>\(percent(alert.window.pct))</b>\(resets)")
         }
-        lines.append("")
-        lines.append(summary(snapshot, threshold: threshold))
-        return lines.joined(separator: "\n")
+        blocks.append("")
+        return fit(blocks + summaryBlocks(snapshot, threshold: threshold))
+    }
+
+    /// `lead` (HTML), then every account's usage when there is a reading:
+    /// the welcome and test messages.
+    public static func telegram(lead: String, snapshot: UsageSnapshot?, threshold: Double) -> String {
+        guard let snapshot else { return fit([lead]) }
+        return fit([lead, ""] + summaryBlocks(snapshot, threshold: threshold))
     }
 
     /// Every account's usage as monospaced tables, plus the account with the
     /// most room: what the user needs in order to choose where to work next.
     public static func summary(_ snapshot: UsageSnapshot, threshold: Double) -> String {
+        fit(summaryBlocks(snapshot, threshold: threshold))
+    }
+
+    /// The summary in blocks that are only ever kept or left out whole: a
+    /// heading, a whole `<pre>` table, the advice line.
+    static func summaryBlocks(_ snapshot: UsageSnapshot, threshold: Double) -> [String] {
         var out: [String] = []
         let claude = snapshot.accounts.filter { $0.tool == "claude" }
         if !claude.isEmpty {
             out.append("<b>Claude Code</b>")
-            var table = [pad("account", 16) + pad("sess", 6) + pad("week", 6) + "fable"]
-            for account in claude {
+            let rows = claude.map { account -> String in
                 let cells = ["session", "weekly_all", "weekly_scoped"].map { kind in
                     account.window(kind).map { percent($0.pct) } ?? "-"
                 }
                 let mark = account.readable ? (account.windows.contains { $0.pct.rounded() >= threshold } ? " ⚠" : "") : " ?"
-                table.append(pad(String(account.label.prefix(15)), 16) + pad(cells[0], 6) + pad(cells[1], 6) + cells[2] + mark)
+                return pad(String(account.label.prefix(15)), 16) + pad(cells[0], 6) + pad(cells[1], 6) + cells[2] + mark
             }
-            out.append("<pre>" + html(table.joined(separator: "\n")) + "</pre>")
+            out.append(table([pad("account", 16) + pad("sess", 6) + pad("week", 6) + "fable"] + capped(rows)))
         }
         let codex = snapshot.accounts.filter { $0.tool == "codex" }
         if !codex.isEmpty {
             out.append("<b>Codex</b>")
-            let table = codex.map { pad(String($0.label.prefix(15)), 16) + ($0.binding.map { percent($0.pct) } ?? "-") }
-            out.append("<pre>" + html(table.joined(separator: "\n")) + "</pre>")
+            out.append(table(capped(codex.map { pad(String($0.label.prefix(15)), 16) + ($0.binding.map { percent($0.pct) } ?? "-") })))
         }
         if let room = snapshot.mostRoom(threshold: threshold) {
             out.append("➡️ Most room now: <b>\(html(room.label))</b>")
         } else if !claude.isEmpty {
             out.append("⏳ Every Claude account is at \(percent(threshold)) or more.")
         }
-        return out.joined(separator: "\n")
+        return out
+    }
+
+    private static func table(_ rows: [String]) -> String {
+        "<pre>" + html(rows.joined(separator: "\n")) + "</pre>"
+    }
+
+    private static func capped(_ rows: [String]) -> [String] {
+        rows.count <= maxTableRows ? rows : Array(rows.prefix(maxTableRows)) + ["…and \(rows.count - maxTableRows) more"]
+    }
+
+    /// Joins whole blocks while they fit in `budget` (UTF-16 units, as
+    /// Telegram counts). Never a cut: one inside a tag or a `<pre>` makes
+    /// Telegram refuse the whole message. What is left out is counted on a
+    /// last line.
+    static func fit(_ blocks: [String], budget: Int = telegramBudget) -> String {
+        let tailRoom = 64
+        var kept: [String] = []
+        var used = 0
+        for (index, block) in blocks.enumerated() {
+            let cost = block.utf16.count + (kept.isEmpty ? 0 : 1)
+            let isLast = index == blocks.count - 1
+            if used + cost <= budget - (isLast ? 0 : tailRoom) {
+                kept.append(block)
+                used += cost
+                continue
+            }
+            let left = blocks[index...].reduce(0) { $0 + $1.split(separator: "\n", omittingEmptySubsequences: false).count }
+            kept.append("…\(left) more line\(left == 1 ? "" : "s") not shown: open the dashboard")
+            break
+        }
+        return kept.joined(separator: "\n")
     }
 
     /// One menu row: "trimo — week 94% · session 27%".

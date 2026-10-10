@@ -27,20 +27,13 @@ public struct TelegramSettings: Codable, Equatable, Sendable {
 
     /// Written 0600 from the start (no window where it is world-readable).
     public func save(to url: URL = standardURL) throws {
-        let fm = FileManager.default
-        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
-                               attributes: [.posixPermissions: 0o700])
-        let temp = url.deletingLastPathComponent().appendingPathComponent(".telegram-\(UUID().uuidString).tmp")
-        guard fm.createFile(atPath: temp.path, contents: try JSONEncoder().encode(self),
-                            attributes: [.posixPermissions: 0o600]) else {
-            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: temp.path])
-        }
-        if fm.fileExists(atPath: url.path) { _ = try fm.replaceItemAt(url, withItemAt: temp) } else { try fm.moveItem(at: temp, to: url) }
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        try OwnerOnlyFile.write(try JSONEncoder().encode(self), to: url)
     }
 
+    /// Forgets the bot, including a temp copy a crash left mid-save.
     public static func delete(at url: URL = standardURL) {
         try? FileManager.default.removeItem(at: url)
+        OwnerOnlyFile.removeLeftovers(of: url)
     }
 
     /// "@ai_sessions_bot → Cresswell".
@@ -50,12 +43,67 @@ public struct TelegramSettings: Codable, Equatable, Sendable {
     }
 }
 
+/// Writes files only their owner can read: created 0600 under a temp name
+/// in the same 0700 directory, then renamed over the old one, so there is no
+/// moment where the file is readable by others or half-written.
+public enum OwnerOnlyFile {
+    public static func write(_ data: Data, to url: URL) throws {
+        let fm = FileManager.default
+        let directory = url.deletingLastPathComponent()
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let temp = directory.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        guard fm.createFile(atPath: temp.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: temp.path])
+        }
+        guard rename(temp.path, url.path) == 0 else {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            try? fm.removeItem(at: temp)
+            throw error
+        }
+    }
+
+    /// Temp copies of `url` that a crash between create and rename left.
+    public static func removeLeftovers(of url: URL) {
+        let fm = FileManager.default
+        let directory = url.deletingLastPathComponent()
+        let prefix = ".\(url.lastPathComponent)."
+        for name in (try? fm.contentsOfDirectory(atPath: directory.path)) ?? []
+        where name.hasPrefix(prefix) && name.hasSuffix(".tmp") {
+            try? fm.removeItem(at: directory.appendingPathComponent(name))
+        }
+    }
+}
+
 /// What can go wrong talking to Telegram, in words fit for an alert.
 /// Never carries the token: request URLs contain it, so they are not kept.
 public struct TelegramError: Error, Equatable, LocalizedError, Sendable {
+    public enum Kind: Equatable, Sendable {
+        /// Telegram was not reached, was busy or asked to slow down: the same
+        /// message may go through later.
+        case transient
+        /// Sending it again cannot help until something changes: a revoked
+        /// token, a blocked bot, a rejected message.
+        case permanent
+    }
+
     public var message: String
-    public init(_ message: String) { self.message = message }
+    public var kind: Kind
+    /// Telegram's own "retry after N s" (HTTP 429).
+    public var retryAfter: TimeInterval?
+
+    public init(_ message: String, kind: Kind = .permanent, retryAfter: TimeInterval? = nil) {
+        self.message = message
+        self.kind = kind
+        self.retryAfter = retryAfter
+    }
+
     public var errorDescription: String? { message }
+
+    /// Any error from a send, as a TelegramError: the client's own pass
+    /// through; anything else (a closure in a test) counts as transient.
+    public static func from(_ error: Error) -> TelegramError {
+        error as? TelegramError ?? TelegramError(error.localizedDescription, kind: .transient)
+    }
 }
 
 /// The Telegram Bot API calls this app needs. `transport` is injectable so
@@ -71,7 +119,18 @@ public struct TelegramClient: Sendable {
     public struct Chat: Equatable, Sendable {
         public var id: Int64
         public var name: String
+        /// The person's own @username, when they have one.
+        public var username: String?
+
+        public init(id: Int64, name: String, username: String? = nil) {
+            self.id = id
+            self.name = name
+            self.username = username
+        }
     }
+
+    /// Telegram's limit for one message, in UTF-16 units after parsing.
+    public static let maxMessageLength = 4096
 
     public let token: String
     let transport: Transport
@@ -90,6 +149,20 @@ public struct TelegramClient: Sendable {
         return parts[1].allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-") }
     }
 
+    /// A fresh code for one setup: the payload of `t.me/<bot>?start=<code>`.
+    /// 10 hex digits (40 bits) — short enough to type, too many to guess
+    /// during the minute a setup waits.
+    public static func makeStartCode() -> String {
+        var generator = SystemRandomNumberGenerator()
+        return (0..<10).map { _ in String(Int.random(in: 0..<16, using: &generator), radix: 16) }.joined()
+    }
+
+    /// The link that opens the bot in Telegram and, on Start, sends it
+    /// "/start <code>".
+    public static func startLink(bot: String, code: String) -> URL? {
+        URL(string: "https://t.me/\(bot)?start=\(code)")
+    }
+
     /// Which bot the token belongs to (and that it works at all).
     public func me() async throws -> Bot {
         let result = try await call("getMe", body: nil)
@@ -99,26 +172,58 @@ public struct TelegramClient: Sendable {
         return Bot(username: username, name: bot["first_name"] as? String ?? username)
     }
 
-    /// The newest private chat that wrote to the bot: the user pressed Start
-    /// (or sent anything) after creating it. nil when nobody has yet.
-    public func newestPrivateChat() async throws -> Chat? {
-        let result = try await call("getUpdates", body: ["timeout": 0, "allowed_updates": ["message"]])
-        guard let updates = result as? [Any] else { return nil }
-        for case let update as [String: Any] in updates.reversed() {
-            guard let message = update["message"] as? [String: Any],
-                  let chat = message["chat"] as? [String: Any], chat["type"] as? String == "private",
-                  let id = (chat["id"] as? NSNumber)?.int64Value else { continue }
-            let name = [chat["first_name"] as? String, chat["last_name"] as? String]
-                .compactMap { $0 }.joined(separator: " ")
-            return Chat(id: id, name: name.isEmpty ? (chat["username"] as? String ?? "you") : name)
+    /// The private chat that answered this setup's code: pressed Start on
+    /// `startLink(bot:code:)` (Telegram then sends "/start <code>"), or sent
+    /// the code itself. Nobody else's message counts, so a stranger who found
+    /// the bot cannot claim the alerts. Reads every waiting update, a page
+    /// of up to 100 at a time; moving to the next page tells Telegram the
+    /// earlier ones were read. nil when the code has not arrived yet.
+    /// `allowed_updates` is left alone on purpose: Telegram keeps that filter
+    /// for later calls, so setting it would change the bot for anyone else.
+    public func chatThatSent(code: String, bot: String, maxPages: Int = 20) async throws -> Chat? {
+        var offset: Int64?
+        for _ in 0..<maxPages {
+            var body: [String: Any] = ["timeout": 0, "limit": 100]
+            if let offset { body["offset"] = offset }
+            guard let updates = try await call("getUpdates", body: body) as? [Any], !updates.isEmpty else { return nil }
+            var newest: Int64?
+            for case let update as [String: Any] in updates {
+                if let id = (update["update_id"] as? NSNumber)?.int64Value { newest = max(newest ?? id, id) }
+                guard let message = update["message"] as? [String: Any],
+                      let chat = message["chat"] as? [String: Any], chat["type"] as? String == "private",
+                      let id = (chat["id"] as? NSNumber)?.int64Value,
+                      let text = message["text"] as? String,
+                      Self.answers(text, code: code, bot: bot) else { continue }
+                let name = [chat["first_name"] as? String, chat["last_name"] as? String]
+                    .compactMap { $0 }.joined(separator: " ")
+                let username = chat["username"] as? String
+                return Chat(id: id, name: name.isEmpty ? (username ?? "you") : name, username: username)
+            }
+            guard updates.count >= 100, let newest else { return nil }
+            offset = newest + 1
         }
         return nil
     }
 
-    /// Sends `html` (Telegram HTML parse mode) to `chatId`.
+    /// "/start <code>", "/start@<bot> <code>" or the bare code.
+    static func answers(_ text: String, code: String, bot: String) -> Bool {
+        let words = text.split(whereSeparator: \.isWhitespace).map(String.init)
+        switch words.count {
+        case 1: return words[0] == code
+        case 2: return (words[0] == "/start" || words[0].lowercased() == "/start@\(bot.lowercased())") && words[1] == code
+        default: return false
+        }
+    }
+
+    /// Sends `html` (Telegram HTML parse mode) to `chatId`. Too long is an
+    /// error rather than a cut: a cut can land inside a tag, and then
+    /// Telegram rejects the whole message (`UsageText` keeps within it).
     public func send(html: String, to chatId: Int64) async throws {
+        guard html.utf16.count <= Self.maxMessageLength else {
+            throw TelegramError("The message is \(html.utf16.count) characters long; Telegram takes \(Self.maxMessageLength)")
+        }
         _ = try await call("sendMessage", body: [
-            "chat_id": chatId, "text": String(html.prefix(4000)), "parse_mode": "HTML",
+            "chat_id": chatId, "text": html, "parse_mode": "HTML",
             "disable_web_page_preview": true,
         ])
     }
@@ -139,12 +244,20 @@ public struct TelegramClient: Sendable {
             (data, status) = try await transport(request)
         } catch {
             // URLSession errors quote the URL, and the URL holds the token.
-            throw TelegramError("Could not reach Telegram (\((error as NSError).code)): check the connection")
+            throw TelegramError("Could not reach Telegram (\((error as NSError).code)): check the connection", kind: .transient)
         }
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         if json?["ok"] as? Bool == true, let result = json?["result"] { return result }
         let description = json?["description"] as? String ?? "HTTP \(status)"
-        throw TelegramError(Self.explain(description, status: status))
+        let retryAfter = ((json?["parameters"] as? [String: Any])?["retry_after"] as? NSNumber)?.doubleValue
+        throw TelegramError(Self.explain(description, status: status), kind: Self.kind(status: status),
+                            retryAfter: retryAfter)
+    }
+
+    /// 429 (slow down) and server trouble pass; any other refusal stays
+    /// until the token, the chat or the message changes.
+    static func kind(status: Int) -> TelegramError.Kind {
+        (400..<500).contains(status) && status != 429 ? .permanent : .transient
     }
 
     /// Telegram's own words, with the usual causes spelled out.
@@ -152,7 +265,11 @@ public struct TelegramClient: Sendable {
         switch status {
         case 401, 404: return "Telegram did not accept the bot token (\(description)). Copy it again from @BotFather."
         case 403: return "Telegram refused (\(description)). Open the chat with your bot and press Start."
-        case 409: return "This bot has a webhook set, so it cannot read messages here (\(description))."
+        case 409 where description.lowercased().contains("webhook"):
+            return "This bot sends its messages to a webhook, so they cannot be read here (\(description)). Make a new bot just for these alerts."
+        case 409:
+            return "Another program is reading this bot's messages right now (\(description)). Make a new bot just for these alerts, or stop that program and try again."
+        case 429: return "Telegram asked to slow down (\(description))."
         default: return "Telegram said: \(description)"
         }
     }
@@ -161,4 +278,149 @@ public struct TelegramClient: Sendable {
         let (data, response) = try await URLSession.shared.data(for: request)
         return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
     }
+}
+
+/// Usage alerts on their way to Telegram. Kept on disk until sent, so a
+/// dropped connection, a sleeping Mac or a restart delays a message instead
+/// of losing it; tried again with growing pauses, Telegram's "retry after"
+/// honoured. A refusal that will not change by itself (revoked token,
+/// blocked bot) drops the message and is reported, as is the last failure
+/// of any kind. Not thread-safe: the app uses it on the main actor.
+public final class TelegramOutbox {
+    public struct Message: Codable, Equatable, Sendable {
+        public var id: UUID
+        public var html: String
+        public var queuedAt: Date
+        public var attempts: Int
+        public var nextAttempt: Date
+    }
+
+    struct State: Codable, Equatable {
+        var messages: [Message] = []
+        /// Why the last attempt failed; nil once one succeeds.
+        var problem: String?
+        var problemSince: Date?
+    }
+
+    public enum Outcome: Equatable, Sendable {
+        case retry(at: Date)
+        case dropped
+    }
+
+    /// A usage alert older than this is old news: windows are five hours
+    /// long, and the menu and the banner already said it.
+    public static let maxAge: TimeInterval = 6 * 3600
+    /// The oldest go first when more wait (a long offline stretch).
+    public static let maxMessages = 20
+    static let firstRetry: TimeInterval = 30
+    static let longestRetry: TimeInterval = 15 * 60
+
+    let url: URL
+    private(set) var state: State
+
+    public init(url: URL) {
+        self.url = url
+        state = (try? Data(contentsOf: url)).flatMap { try? Self.decoder.decode(State.self, from: $0) } ?? State()
+    }
+
+    public static func standard() -> TelegramOutbox {
+        TelegramOutbox(url: AppPaths.stateDir.appendingPathComponent("telegram-outbox.json"))
+    }
+
+    public var pending: [Message] { state.messages }
+    public var problem: String? { state.problem }
+    public var problemSince: Date? { state.problemSince }
+
+    public func enqueue(_ html: String, now: Date) {
+        update { state in
+            state.messages.append(Message(id: UUID(), html: html, queuedAt: now, attempts: 0, nextAttempt: now))
+            if state.messages.count > Self.maxMessages { state.messages.removeFirst(state.messages.count - Self.maxMessages) }
+        }
+    }
+
+    /// The oldest message due by `now`, after dropping the expired ones
+    /// (returned in `expired` so the caller can say so).
+    public func next(now: Date) -> (message: Message?, expired: Int) {
+        var expired = 0
+        update { state in
+            let before = state.messages.count
+            state.messages.removeAll { now.timeIntervalSince($0.queuedAt) > Self.maxAge }
+            expired = before - state.messages.count
+        }
+        return (state.messages.first { $0.nextAttempt <= now }, expired)
+    }
+
+    /// When the earliest waiting message is due, for the menu.
+    public var nextAttempt: Date? { state.messages.map(\.nextAttempt).min() }
+
+    public func succeeded(_ id: UUID) {
+        update { state in
+            state.messages.removeAll { $0.id == id }
+            state.problem = nil
+            state.problemSince = nil
+        }
+    }
+
+    @discardableResult
+    public func failed(_ id: UUID, _ error: TelegramError, now: Date) -> Outcome {
+        var outcome = Outcome.dropped
+        update { state in
+            if state.problem == nil { state.problemSince = now }
+            state.problem = error.message
+            guard let index = state.messages.firstIndex(where: { $0.id == id }) else { return }
+            guard error.kind == .transient else {
+                state.messages.remove(at: index)
+                return
+            }
+            state.messages[index].attempts += 1
+            let backoff = min(Self.firstRetry * pow(2, Double(state.messages[index].attempts - 1)), Self.longestRetry)
+            let at = now.addingTimeInterval(max(backoff, min(error.retryAfter ?? 0, 3600)))
+            state.messages[index].nextAttempt = at
+            outcome = .retry(at: at)
+        }
+        return outcome
+    }
+
+    /// Everything forgotten: Telegram disconnected or turned off.
+    public func clear() {
+        update { $0 = State() }
+    }
+
+    /// A reconnect proved the chat works; what still waits goes there next.
+    public func clearProblem(now: Date) {
+        update { state in
+            state.problem = nil
+            state.problemSince = nil
+            for index in state.messages.indices { state.messages[index].nextAttempt = now }
+        }
+    }
+
+    private func update(_ change: (inout State) -> Void) {
+        var next = state
+        change(&next)
+        guard next != state else { return }
+        state = next
+        do {
+            if next == State() {
+                try? FileManager.default.removeItem(at: url)
+            } else {
+                try OwnerOnlyFile.write(try Self.encoder.encode(next), to: url)
+            }
+        } catch {
+            Log.shared.error("could not save \(url.path): \(error.localizedDescription)")
+        }
+    }
+
+    private static let encoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.prettyPrinted, .sortedKeys]
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }()
+
+    private static let decoder: JSONDecoder = {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }()
 }

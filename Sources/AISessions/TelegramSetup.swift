@@ -7,15 +7,34 @@ import AppKit
 /// config file or a log.
 @MainActor
 enum TelegramSetup {
+    /// One setup at a time: a second click while the first waits on Telegram
+    /// would stack two flows, each with its own token, on top of each other.
+    private(set) static var isRunning = false
+
     /// Runs the whole flow; `completion` gets the saved settings, or nil when
-    /// the user cancelled. `summary` adds the current usage table to the
-    /// welcome message.
-    static func run(summary: String?, completion: @escaping (TelegramSettings?) -> Void) {
+    /// the user cancelled. `snapshot`'s usage goes into the welcome message.
+    /// While a setup is open this only brings it forward and returns false.
+    @discardableResult
+    static func run(snapshot: UsageSnapshot?, threshold: Double,
+                    completion: @escaping (TelegramSettings?) -> Void) -> Bool {
         NSApp.activate(ignoringOtherApps: true)
-        Task { @MainActor in completion(await flow(summary: summary)) }
+        return run({ await flow(snapshot: snapshot, threshold: threshold) }, completion: completion)
     }
 
-    private static func flow(summary: String?) async -> TelegramSettings? {
+    /// The guard around any flow (tests pass one that waits on them).
+    static func run(_ flow: @escaping @MainActor () async -> TelegramSettings?,
+                    completion: @escaping (TelegramSettings?) -> Void) -> Bool {
+        guard !isRunning else { return false }
+        isRunning = true
+        Task { @MainActor in
+            let settings = await flow()
+            isRunning = false
+            completion(settings)
+        }
+        return true
+    }
+
+    private static func flow(snapshot: UsageSnapshot?, threshold: Double) async -> TelegramSettings? {
         // 1. The token.
         var client: TelegramClient
         var bot: TelegramClient.Bot
@@ -33,27 +52,33 @@ enum TelegramSetup {
                 show("Telegram did not accept it", error.localizedDescription)
             }
         }
-        // 2. The chat: Telegram lets a bot write only to people who wrote to it first.
+        // 2. The chat. A bot may write only to people who wrote to it first,
+        // and anyone can write to a bot: only the chat that answers this
+        // setup's code is taken, and only after the user says it is theirs.
+        let code = TelegramClient.makeStartCode()
         var chat: TelegramClient.Chat
         while true {
-            switch askToSayHi(bot) {
+            switch askToPressStart(bot, code: code) {
             case .cancel: return nil
             case .openChat:
-                if let url = URL(string: "https://t.me/\(bot.username)") { NSWorkspace.shared.open(url) }
+                if let url = TelegramClient.startLink(bot: bot.username, code: code) { NSWorkspace.shared.open(url) }
                 continue
             case .proceed:
                 break
             }
+            let found: TelegramClient.Chat?
             do {
-                guard let found = try await client.newestPrivateChat() else {
-                    show("No message yet", "Open @\(bot.username) in Telegram, press Start (or send it any message), then click Continue.")
-                    continue
-                }
-                chat = found
+                found = try await client.chatThatSent(code: code, bot: bot.username)
             } catch {
                 show("Could not read the bot's messages", error.localizedDescription)
                 continue
             }
+            guard let found else {
+                show("Not there yet", "@\(bot.username) has not received this setup's code. Click Open @\(bot.username) and press START in Telegram (or send the bot this message: /start \(code)), then click Continue.")
+                continue
+            }
+            guard confirm(found, bot: bot) else { return nil }
+            chat = found
             break
         }
         // 3. Save, then prove it with a first message.
@@ -64,12 +89,15 @@ enum TelegramSetup {
             show("Could not save the settings", error.localizedDescription)
             return nil
         }
-        var welcome = "✅ <b>AI Sessions is connected.</b>\nYou will get a message here when a Claude or Codex usage limit passes the alert threshold."
-        if let summary { welcome += "\n\n" + summary }
+        let cleared = clearClipboard(ifItHolds: client.token)
+        let welcome = UsageText.telegram(
+            lead: "✅ <b>AI Sessions is connected.</b>\nYou will get a message here when a Claude or Codex usage limit passes the alert threshold.",
+            snapshot: snapshot, threshold: threshold)
         do {
             try await client.send(html: welcome, to: chat.id)
             Log.shared.info("Telegram connected: \(settings.summary)")
-            show("Telegram is connected", "Usage alerts will also go to \(settings.summary). A first message is waiting there.")
+            show("Telegram is connected", "Usage alerts will also go to \(settings.summary). A first message is waiting there."
+                + (cleared ? "\n\nThe token was also cleared from the clipboard." : ""))
         } catch {
             Log.shared.warn("Telegram connected but the welcome message failed: \(error.localizedDescription)")
             show("Connected, but the first message failed", error.localizedDescription)
@@ -83,7 +111,7 @@ enum TelegramSetup {
         alert.informativeText = """
             1. In Telegram, open @BotFather and send /newbot.
             2. Choose a name; BotFather replies with a token like 123456789:AAH…
-            3. Paste that token below.
+            3. Paste that token below (⌘V).
 
             It stays on this Mac, readable only by you (~/.ai-sessions/state/telegram.json).
             """
@@ -95,7 +123,7 @@ enum TelegramSetup {
         alert.addButton(withTitle: "Open @BotFather")
         alert.window.initialFirstResponder = field
         while true {
-            switch alert.runModal() {
+            switch present(alert) {
             case .alertFirstButtonReturn:
                 return field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             case .alertThirdButtonReturn:
@@ -106,39 +134,100 @@ enum TelegramSetup {
         }
     }
 
-    private enum SayHi { case proceed, cancel, openChat }
+    private enum PressStart { case proceed, cancel, openChat }
 
-    private static func askToSayHi(_ bot: TelegramClient.Bot) -> SayHi {
+    private static func askToPressStart(_ bot: TelegramClient.Bot, code: String) -> PressStart {
         let alert = NSAlert()
-        alert.messageText = "Now say hi to @\(bot.username)"
-        alert.informativeText = "Open the chat with your bot in Telegram and press Start (or send it any message), then click Continue. That is how the bot learns where to send the alerts."
+        alert.messageText = "Now press Start in @\(bot.username)"
+        alert.informativeText = """
+            Click Open @\(bot.username): Telegram opens the chat with your bot. Press START there, then come back and click Continue.
+
+            No START button? Send the bot this message instead:
+            /start \(code)
+
+            The code is new for each setup, so only you can connect this bot to this Mac.
+            """
         alert.addButton(withTitle: "Continue")
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Open @\(bot.username)")
-        switch alert.runModal() {
+        switch present(alert) {
         case .alertFirstButtonReturn: return .proceed
         case .alertThirdButtonReturn: return .openChat
         default: return .cancel
         }
     }
 
+    /// Names the chat before anything is saved or sent to it.
+    private static func confirm(_ chat: TelegramClient.Chat, bot: TelegramClient.Bot) -> Bool {
+        let alert = NSAlert()
+        let who = chat.username.map { "\(chat.name) (@\($0))" } ?? chat.name
+        alert.messageText = "Send usage alerts to \(who)?"
+        alert.informativeText = "This Telegram account answered this setup's code in its chat with @\(bot.username). Alerts, with every account's usage, will go there."
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+        return present(alert) == .alertFirstButtonReturn
+    }
+
+    /// The token was copied out of Telegram to be pasted here. Once it is
+    /// saved it should not linger where clipboard history or Universal
+    /// Clipboard can carry it; only that exact text is cleared.
+    private static func clearClipboard(ifItHolds token: String) -> Bool {
+        let pasteboard = NSPasteboard.general
+        guard pasteboard.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) == token else {
+            return false
+        }
+        pasteboard.clearContents()
+        return true
+    }
+
     static func show(_ title: String, _ text: String) {
-        NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = text
         alert.addButton(withTitle: "OK")
-        alert.runModal()
+        present(alert)
+    }
+
+    /// Every dialog comes to the front: the app has no Dock icon or windows,
+    /// and its alert would otherwise open behind whatever app is in use.
+    @discardableResult
+    private static func present(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal()
     }
 
     /// "Disconnect Telegram…": asks first, then forgets the bot and chat.
     static func confirmDisconnect(_ settings: TelegramSettings) -> Bool {
-        NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Stop sending usage alerts to Telegram?"
-        alert.informativeText = "AI Sessions forgets \(settings.summary). The bot itself stays in your Telegram; delete it in @BotFather if you no longer want it."
+        alert.informativeText = "AI Sessions forgets \(settings.summary), and any alert still waiting to be sent. The bot itself stays in your Telegram; delete it in @BotFather if you no longer want it."
         alert.addButton(withTitle: "Disconnect")
         alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn
+        return present(alert) == .alertFirstButtonReturn
+    }
+}
+
+/// The app's main menu. An accessory app shows no menu bar, but without an
+/// Edit menu nothing turns ⌘V into Paste: the bot token could not be pasted
+/// into the setup's field. Never visible; its key equivalents reach the
+/// focused field through the responder chain (nil targets).
+enum AppMenu {
+    static func make() -> NSMenu {
+        let main = NSMenu()
+        // The first item is the application menu by convention.
+        main.addItem(NSMenuItem(title: AppInfo.name, action: nil, keyEquivalent: ""))
+        main.items[0].submenu = NSMenu(title: AppInfo.name)
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        editItem.submenu = edit
+        main.addItem(editItem)
+        return main
     }
 }

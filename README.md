@@ -21,6 +21,11 @@ one click takes you back to that session's tab.
   *Mark as Read*. Turns shorter than 10 seconds are not announced, since you
   were probably watching, and neither is a turn you stopped yourself (Esc in
   Claude, Stop in Codex). A question is always announced.
+- **Usage-limit alerts.** When a Claude session or weekly limit, or a Codex
+  limit, reaches 90% on any account the ai-accounts dashboard tracks, a banner
+  names the account, when the limit resets and which account has the most
+  room. With your own Telegram bot connected, the same alert reaches your
+  phone. See [Usage-limit alerts](#usage-limit-alerts).
 - **Back to the tab.** A Claude or Codex session in VS Code (or Cursor,
   Windsurf, VSCodium, Insiders, or another VS Code fork) opens in the exact
   editor window that owns it. An editor whose link scheme is unknown is just
@@ -93,6 +98,11 @@ warning until the file is fixed.
 | `codexRecentHours` | `12` | A Codex thread stays listed this long after its last activity |
 | `showAutomationSessions` | `false` | Also list (and announce) `claude -p`, SDK runs, `codex exec` and sub-agents |
 | `pollIntervalSeconds` | `1.0` | How often to look (limited to 0.25–10) |
+| `usageAlertsEnabled` | `true` | Read the usage dashboard and alert at the threshold |
+| `usageAlertThreshold` | `90` | Percent of a limit that triggers an alert (1–100) |
+| `usageDashboardURL` | `"http://127.0.0.1:8787"` | Where the ai-accounts dashboard runs |
+| `usagePollSeconds` | `60` | How often to read it (limited to 15–3600) |
+| `telegramAlerts` | `true` | Also send usage alerts to the connected Telegram chat |
 
 ```json
 { "minTurnSecondsToNotify": 30, "sound": false }
@@ -102,6 +112,50 @@ warning until the file is fixed.
 config. It persists across restarts as the file
 `~/.ai-sessions/state/notifications-paused`, so a script can create or delete
 that file to do the same (for example, while sharing your screen).
+
+## Usage-limit alerts
+
+The ai-accounts dashboard (`http://127.0.0.1:8787`) already reads every Claude
+and Codex account's limits. Once a minute the app reads the dashboard's last
+scan (`GET /data.json`) and announces a limit the moment it reaches the
+threshold (90%): a banner such as *trimo: Claude weekly limit at 94% — resets
+in 2d 4h — Most room now: cresswell*, whose click opens the dashboard, and a
+Telegram message if you connected a bot. The app never talks to Anthropic or
+OpenAI itself: the dashboard holds the accounts' sign-ins.
+
+- **Once per crossing.** A limit alerts again only after it drops below the
+  threshold (it reset) or a new period starts. A restart does not repeat an
+  alert, and the very first reading only records what is already over.
+- **Pause Notifications** silences the banner, not Telegram: a limit about to
+  stop your work should still reach your phone.
+- **Usage limits** in the menu lists every account, fullest first. Hover a row
+  for when its limits reset; click it to open the dashboard.
+
+### Telegram
+
+*Usage limits › Set Up Telegram Alerts…* walks you through it:
+
+1. In Telegram, open **@BotFather**, send `/newbot` and pick a name. It replies
+   with a token such as `123456789:AAH…`. Paste it into the setup's field (⌘V).
+2. Click **Open @yourbot** and press **START** in Telegram. The link carries a
+   code that is new for each setup, so only the chat that pressed Start on
+   this Mac's link is connected; anyone else who finds the bot is ignored. No
+   START button? Send the bot the `/start <code>` line that the dialog shows.
+3. Confirm the name it found. A first message, with every account's usage,
+   arrives right away. The token is also cleared from the clipboard.
+
+The token is kept in `state/telegram.json`, readable by you alone, and never in
+`config.json` or the log. Use a bot made only for these alerts: the setup reads
+the bot's incoming messages, so a bot that sends them to a webhook, or that
+another program reads, cannot be used.
+
+A message that cannot be sent (no network, Telegram busy) waits in
+`state/telegram-outbox.json` and is tried again after 30 s, then 1, 2, 4 minutes
+and so on, up to every 15 minutes, for 6 hours. Meanwhile the submenu says why
+and how many wait. When Telegram refuses for good (the token was revoked, the
+bot was blocked), the message is dropped and a banner says so, once; *Set Up
+Telegram Again…* fixes it. *Send Test Message to Telegram* checks the
+connection, and *Disconnect Telegram…* forgets the bot and anything waiting.
 
 ## Files
 
@@ -116,6 +170,9 @@ that file to do the same (for example, while sharing your screen).
 | `~/.ai-sessions/state/snapshot.json` | the current session list as JSON, for scripts and other tools |
 | `~/.ai-sessions/state/notifications-paused` | present while notifications are paused |
 | `~/.ai-sessions/state/headless/` | `--headless`'s own state, snapshot and log |
+| `~/.ai-sessions/state/usage-alerts.json` | which usage limits were already announced, per period |
+| `~/.ai-sessions/state/telegram.json` | the Telegram bot token and chat, once you connect one |
+| `~/.ai-sessions/state/telegram-outbox.json` | Telegram alerts waiting to be tried again |
 
 `state/` is readable by you alone (the folder is `0700`, its files `0600`): it
 holds session titles, which are often your own prompts, and the agents' last
@@ -135,6 +192,8 @@ $AISESSIONS --headless --use-app-state   # …in the menu-bar app's own state fi
 $AISESSIONS --route claude:9eb4   # print how it would get back to a session (key or unique prefix)
 $AISESSIONS --route claude:9eb4 --open   # …and do it
 $AISESSIONS --test-notification   # ask the running app for a sample banner (optionally: a session key)
+$AISESSIONS --usage               # every account's usage limits, as the alerts see them
+$AISESSIONS --telegram-test       # send a test message to the connected Telegram chat
 $AISESSIONS --version
 ```
 
@@ -145,7 +204,8 @@ instead, which only makes sense while the app is not running.
 
 Set `AI_SESSIONS_HOME=/some/dir` to keep a test run's log and state out of
 `~/.ai-sessions`. `AI_SESSIONS_CLAUDE_DIRS` and `AI_SESSIONS_CODEX_HOMES`
-(colon-separated) override the watched directories.
+(colon-separated) override the watched directories, and
+`AI_SESSIONS_USAGE_URL` the dashboard's address.
 
 ## Troubleshooting
 
@@ -186,6 +246,15 @@ Set `AI_SESSIONS_HOME=/some/dir` to keep a test run's log and state out of
   sub-agents) are hidden unless `showAutomationSessions` is on. Codex threads
   drop off `codexRecentHours` after their last activity. The log's
   `watching …` line at startup names the directories being read.
+- **No usage alerts.** *Usage limits* in the menu says *dashboard not
+  reachable* while the ai-accounts dashboard is down: check
+  `http://127.0.0.1:8787`. `AISessions --usage` prints what the alerts see. An
+  account already over the threshold when the app first read the dashboard
+  was recorded, not announced; it alerts after its next reset.
+- **Telegram stays quiet.** The submenu's Telegram row turns into *not
+  delivering* with the reason, and the log has a `usage alert not sent`
+  line for each try. *Send Test Message to Telegram* or
+  `AISessions --telegram-test` tries at once.
 - **Anything else.** *Open Log* in the menu. Every route, event, reload and
   error is there, and `--headless` prints the same lines live.
 

@@ -147,6 +147,13 @@ enum UsageMenu {
         /// "@bot → Name" once Telegram is connected, else nil.
         var telegram: String?
         var telegramEnabled = true
+        /// Why the last message to Telegram failed; nil once one went through.
+        var telegramProblem: String?
+        /// Alerts kept for a retry, and when the next try is.
+        var telegramWaiting = 0
+        var telegramNextTry: Date?
+        /// A setup dialog is open: its menu item waits.
+        var settingUpTelegram = false
     }
 
     /// "Usage limits — 2 at 90%+", "— all under 90%", "— dashboard not reachable".
@@ -193,6 +200,26 @@ enum UsageMenu {
             UsageText.until(window.resetsAt, now: now).map { "\(window.shortName) resets in \($0)" }
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// The Telegram rows of the submenu, when a bot is connected: where the
+    /// alerts go, why the last one failed, what waits for a retry.
+    static func telegramLines(_ state: State, now: Date) -> [String] {
+        guard let telegram = state.telegram else { return [] }
+        guard state.telegramEnabled else { return ["Telegram: off (telegramAlerts in config.json)"] }
+        var lines: [String] = []
+        if let problem = state.telegramProblem {
+            lines.append("Telegram: not delivering — \(telegram)")
+            lines.append(Formatting.oneLine(problem, max: 90) ?? problem)
+        } else {
+            lines.append("Telegram: \(telegram)")
+        }
+        if state.telegramWaiting > 0 {
+            let alerts = state.telegramWaiting == 1 ? "1 alert waits" : "\(state.telegramWaiting) alerts wait"
+            let next = state.telegramNextTry.map { $0 > now ? " — next try in \(UsageText.until($0, now: now) ?? "a moment")" : " — sending" } ?? ""
+            lines.append(alerts + " to be sent" + next)
+        }
+        return lines
     }
 
     /// "Updated just now" / "Updated 4m ago — dashboard not reachable".
@@ -365,15 +392,29 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         }
         sub.addItem(item("Open Dashboard", #selector(openDashboard)))
         sub.addItem(.separator())
-        if let telegram = usage.telegram {
-            sub.addItem(disabledItem(usage.telegramEnabled ? "Telegram: \(telegram)" : "Telegram: off (telegramAlerts in config.json)"))
+        for (index, line) in UsageMenu.telegramLines(usage, now: now).enumerated() {
+            let row = disabledItem(line)
+            if index == 0, usage.telegramProblem != nil, usage.telegramEnabled {
+                row.image = Self.image("exclamationmark.triangle.fill", tint: .attention, pointSize: 12,
+                                       description: "Telegram is not delivering")
+                row.toolTip = usage.telegramProblem
+            }
+            sub.addItem(row)
+        }
+        let setUp = item(Self.setUpTitle(usage), #selector(setUpTelegram))
+        setUp.isEnabled = !usage.settingUpTelegram
+        if usage.telegram == nil || usage.telegramProblem != nil || usage.settingUpTelegram { sub.addItem(setUp) }
+        if usage.telegram != nil {
             sub.addItem(item("Send Test Message to Telegram", #selector(testTelegram)))
             sub.addItem(item("Disconnect Telegram…", #selector(disconnectTelegram)))
-        } else {
-            sub.addItem(item("Set Up Telegram Alerts…", #selector(setUpTelegram)))
         }
         top.submenu = sub
         return top
+    }
+
+    static func setUpTitle(_ state: UsageMenu.State) -> String {
+        if state.settingUpTelegram { return "Setting Up Telegram…" }
+        return state.telegram == nil ? "Set Up Telegram Alerts…" : "Set Up Telegram Again…"
     }
 
     // MARK: Rows

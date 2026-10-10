@@ -46,8 +46,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var activity: NSObjectProtocol?
     /// Usage limits from the ai-accounts dashboard (nil until launch finishes).
     private(set) var usage: UsageMonitor?
-    /// Sends a usage alert to Telegram; tests swap in a recorder.
-    var sendTelegram: (TelegramSettings, String) -> Void = AppDelegate.postToTelegram
+    /// Usage alerts on their way to Telegram, kept until sent.
+    private(set) var telegramOutbox = TelegramOutbox.standard()
+    /// Sends one message to Telegram; tests swap in a recorder.
+    var sendTelegram: @MainActor (TelegramSettings, String) async throws -> Void = AppDelegate.postToTelegram
+    /// The outbox's clock; tests move it past a retry pause.
+    var clock: () -> Date = Date.init
+    /// The send in progress: one message at a time, oldest first.
+    private(set) var telegramTask: Task<Void, Never>?
+    /// The refusal a banner was posted for: one banner per problem.
+    private var telegramProblemAnnounced: String?
 
     override convenience init() {
         self.init { config in
@@ -111,8 +119,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ))
         statusMenu?.update(sessions: [], paused: paused)
         statusMenu?.setConfigProblem(configProblem)
+        NSApp.mainMenu = AppMenu.make()
         notifier?.requestAuthorization()
         startUsageMonitor()
+        flushTelegram() // what a restart interrupted
         Log.shared.info("\(AppInfo.name) \(AppInfo.version) started (pid \(getpid())); home \(AppPaths.home.path)"
             + (paused ? "; notifications paused" : ""))
         scheduleTimer()
@@ -203,6 +213,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
         if configWatcher.checkForChange() { reloadConfig() }
+        // A Telegram message that failed goes again once its pause is over.
+        flushTelegram()
         // The flag is a file so that a script can pause notifications too.
         let filePaused = pauseFlag.isPaused
         if filePaused != paused {
@@ -257,11 +269,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshUsageMenu() {
-        let telegram = TelegramSettings.load()
-        statusMenu?.setUsage(UsageMenu.State(
+        statusMenu?.setUsage(usageMenuState())
+    }
+
+    func usageMenuState() -> UsageMenu.State {
+        UsageMenu.State(
             enabled: config.usageAlertsEnabled, threshold: config.usageAlertThreshold,
-            status: usage?.status ?? UsageMonitor.Status(), telegram: telegram?.summary,
-            telegramEnabled: config.telegramAlerts))
+            status: usage?.status ?? UsageMonitor.Status(), telegram: TelegramSettings.load()?.summary,
+            telegramEnabled: config.telegramAlerts, telegramProblem: telegramOutbox.problem,
+            telegramWaiting: telegramOutbox.pending.count, telegramNextTry: telegramOutbox.nextAttempt,
+            settingUpTelegram: TelegramSetup.isRunning)
     }
 
     /// One poll's crossings: a macOS banner (unless notifications are off or
@@ -277,20 +294,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             notifier.postUsage(id: id, title: text.title, subtitle: text.subtitle, body: text.body,
                                url: url, sound: config.sound)
         }
-        if config.telegramAlerts, let settings = TelegramSettings.load() {
-            sendTelegram(settings, UsageText.telegram(for: alerts, snapshot: snapshot, threshold: threshold))
+        if config.telegramAlerts, TelegramSettings.load() != nil {
+            telegramOutbox.enqueue(UsageText.telegram(for: alerts, snapshot: snapshot, threshold: threshold), now: clock())
+            flushTelegram()
         }
     }
 
-    nonisolated static func postToTelegram(_ settings: TelegramSettings, _ html: String) {
-        Task {
+    nonisolated static func postToTelegram(_ settings: TelegramSettings, _ html: String) async throws {
+        try await TelegramClient(token: settings.botToken).send(html: html, to: settings.chatId)
+    }
+
+    /// Sends what the outbox has due. Runs after each alert and from
+    /// housekeeping, which is how a failed message goes again when its
+    /// pause is over; a send already under way finishes the round.
+    func flushTelegram() {
+        guard telegramTask == nil, !telegramOutbox.pending.isEmpty else { return }
+        guard config.telegramAlerts, let settings = TelegramSettings.load() else {
+            // Turned off or disconnected: nothing will ever take these.
+            telegramOutbox.clear()
+            refreshUsageMenu()
+            return
+        }
+        let (message, expired) = telegramOutbox.next(now: clock())
+        if expired > 0 {
+            Log.shared.warn("Telegram: dropped \(expired) usage alert(s) not sent within \(Formatting.duration(TelegramOutbox.maxAge))")
+            refreshUsageMenu()
+        }
+        guard message != nil else { return }
+        telegramTask = Task { @MainActor [weak self] in
+            await self?.drainTelegram(settings)
+            self?.telegramTask = nil
+        }
+    }
+
+    /// Due messages, in order, until one fails; that one waits for its
+    /// retry (or is dropped, when Telegram refused it for good).
+    private func drainTelegram(_ settings: TelegramSettings) async {
+        while let message = telegramOutbox.next(now: clock()).message {
             do {
-                try await TelegramClient(token: settings.botToken).send(html: html, to: settings.chatId)
-                Log.shared.info("usage alert sent to Telegram (\(settings.summary))")
+                try await sendTelegram(settings, message.html)
+                let recovered = telegramOutbox.problem != nil
+                telegramOutbox.succeeded(message.id)
+                telegramProblemAnnounced = nil
+                Log.shared.info("usage alert sent to Telegram (\(settings.summary))" + (recovered ? "; delivering again" : ""))
+                refreshUsageMenu()
             } catch {
-                Log.shared.warn("usage alert NOT sent to Telegram: \(error.localizedDescription)")
+                let failure = TelegramError.from(error)
+                switch telegramOutbox.failed(message.id, failure, now: clock()) {
+                case .retry(let at):
+                    Log.shared.warn("usage alert not sent to Telegram yet (\(failure.message)); "
+                        + "trying again in \(Formatting.duration(at.timeIntervalSince(clock())))")
+                case .dropped:
+                    Log.shared.warn("usage alert NOT sent to Telegram: \(failure.message)")
+                    announceTelegramProblem(failure, settings)
+                }
+                refreshUsageMenu()
+                return
             }
         }
+    }
+
+    /// A refusal that will not pass by itself (token revoked, bot blocked)
+    /// gets a banner, once per problem: the alerts it stops are the ones
+    /// meant for when the user is away from the Mac, and the menu row alone
+    /// goes unseen. A click opens the bot's chat (or @BotFather).
+    private func announceTelegramProblem(_ failure: TelegramError, _ settings: TelegramSettings) {
+        guard telegramProblemAnnounced != failure.message else { return }
+        telegramProblemAnnounced = failure.message
+        guard config.notificationsEnabled, !paused, let notifier,
+              let link = URL(string: "https://t.me/\(settings.botUsername ?? "BotFather")") else { return }
+        notifier.postUsage(id: "telegram", title: "A usage alert did not reach Telegram", subtitle: settings.summary,
+                           body: failure.message, url: link, sound: config.sound)
     }
 
     private func openDashboard() {
@@ -299,20 +373,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setUpTelegram() {
-        let summary = usage?.status.snapshot.map { UsageText.summary($0, threshold: config.usageAlertThreshold) }
-        TelegramSetup.run(summary: summary) { [weak self] _ in self?.refreshUsageMenu() }
+        let started = TelegramSetup.run(snapshot: usage?.status.snapshot, threshold: config.usageAlertThreshold) { [weak self] settings in
+            guard let self else { return }
+            if settings != nil { telegramWorks() }
+            refreshUsageMenu()
+        }
+        if started { refreshUsageMenu() } // greys the item out meanwhile
+    }
+
+    /// A message just went through: what waits goes now, a new refusal
+    /// gets its banner again.
+    private func telegramWorks() {
+        telegramOutbox.clearProblem(now: clock())
+        telegramProblemAnnounced = nil
+        flushTelegram()
     }
 
     private func testTelegram() {
         guard let settings = TelegramSettings.load() else { return setUpTelegram() }
-        var text = "🧪 <b>Test from AI Sessions</b>\nUsage alerts reach this chat."
-        if let snapshot = usage?.status.snapshot {
-            text += "\n\n" + UsageText.summary(snapshot, threshold: config.usageAlertThreshold)
-        }
+        let text = UsageText.telegram(lead: "🧪 <b>Test from AI Sessions</b>\nUsage alerts reach this chat.",
+                                      snapshot: usage?.status.snapshot, threshold: config.usageAlertThreshold)
         Task { @MainActor in
             do {
-                try await TelegramClient(token: settings.botToken).send(html: text, to: settings.chatId)
+                try await sendTelegram(settings, text)
                 Log.shared.info("Telegram test message sent (\(settings.summary))")
+                telegramWorks()
+                refreshUsageMenu()
                 TelegramSetup.show("Sent", "Check Telegram: a test message went to \(settings.summary).")
             } catch {
                 Log.shared.warn("Telegram test message failed: \(error.localizedDescription)")
@@ -324,6 +410,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func disconnectTelegram() {
         guard let settings = TelegramSettings.load(), TelegramSetup.confirmDisconnect(settings) else { return }
         TelegramSettings.delete()
+        telegramOutbox.clear()
+        telegramProblemAnnounced = nil
         Log.shared.info("Telegram disconnected")
         refreshUsageMenu()
     }

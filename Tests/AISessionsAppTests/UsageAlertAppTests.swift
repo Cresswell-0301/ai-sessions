@@ -12,6 +12,9 @@ final class UsageAlertAppTests: XCTestCase {
     private var savedHome: String?
     private var center: RecordingCenter!
     private var sent: [(settings: TelegramSettings, html: String)] = []
+    /// What the fake Telegram answers; nil = delivered.
+    private var telegramFailure: TelegramError?
+    private var clockNow = Date(timeIntervalSince1970: 1_791_600_000)
     private let token = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawQ"
 
     override func setUpWithError() throws {
@@ -20,6 +23,7 @@ final class UsageAlertAppTests: XCTestCase {
         savedHome = ProcessInfo.processInfo.environment["AI_SESSIONS_HOME"]
         setenv("AI_SESSIONS_HOME", home.path, 1)
         sent = []
+        telegramFailure = nil
     }
 
     override func tearDown() {
@@ -39,7 +43,7 @@ final class UsageAlertAppTests: XCTestCase {
 
     private func dashboardJSON(trimoWeekly: Double, trimoSession: Double = 28) -> Data {
         func row(_ label: String, session: Double, weekly: Double) -> [String: Any] {
-            ["tool": "claude", "label": label, "skipped": false, "limits": ["error": NSNull(), "windows": [
+            ["tool": "claude", "label": label, "skipped": "signed in — no usage recorded yet", "limits": ["error": NSNull(), "windows": [
                 ["kind": "session", "label": "Session (5hr)", "pct": session, "resets": 1_791_610_000],
                 ["kind": "weekly_all", "label": "Weekly (7 day)", "pct": weekly, "resets": 1_791_800_000],
             ]] as [String: Any]]
@@ -58,8 +62,17 @@ final class UsageAlertAppTests: XCTestCase {
         let app = AppDelegate { config in SessionEngine(config: config, store: store, makeSources: { _ in [] }) }
         center = RecordingCenter()
         app.install(Notifier(center: center))
-        app.sendTelegram = { [unowned self] settings, html in self.sent.append((settings, html)) }
+        app.sendTelegram = { [unowned self] settings, html in
+            if let failure = self.telegramFailure { throw failure }
+            self.sent.append((settings, html))
+        }
+        app.clock = { [unowned self] in self.clockNow }
         return app
+    }
+
+    /// Lets the send under way finish.
+    private func settle(_ app: AppDelegate) async {
+        await app.telegramTask?.value
     }
 
     private func monitor(for app: AppDelegate, _ dashboard: Dashboard) -> UsageMonitor {
@@ -91,6 +104,7 @@ final class UsageAlertAppTests: XCTestCase {
 
         dashboard.body = dashboardJSON(trimoWeekly: 94)
         await monitor.poll()
+        await settle(app)
         XCTAssertEqual(center.posted.map(\.identifier), ["usage:claude|trimo|weekly_all"])
         let content = try XCTUnwrap(center.posted.first?.content)
         XCTAssertEqual(content.title, "trimo: Claude weekly limit at 94%")
@@ -102,6 +116,7 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertTrue(sent.first?.html.contains("<b>trimo</b> — Claude weekly at <b>94%</b>") ?? false, sent.first?.html ?? "")
 
         await monitor.poll() // still over: nothing new
+        await settle(app)
         XCTAssertEqual(center.posted.count, 1)
         XCTAssertEqual(sent.count, 1)
     }
@@ -117,6 +132,7 @@ final class UsageAlertAppTests: XCTestCase {
         await monitor.poll()
         dashboard.body = dashboardJSON(trimoWeekly: 92)
         await monitor.poll()
+        await settle(app)
         XCTAssertEqual(center.posted.count, 0, "paused: no banner")
         XCTAssertEqual(sent.count, 1, "the phone still hears about a limit")
     }
@@ -130,8 +146,10 @@ final class UsageAlertAppTests: XCTestCase {
         await monitor.poll()
         dashboard.body = dashboardJSON(trimoWeekly: 92)
         await monitor.poll()
+        await settle(app)
         XCTAssertEqual(center.posted.count, 1)
         XCTAssertTrue(sent.isEmpty, "nothing to send to before a bot is connected")
+        XCTAssertTrue(app.telegramOutbox.pending.isEmpty, "nor anything kept for later")
     }
 
     func testAnUnreachableDashboardKeepsTheLastReadingAndSaysWhy() async {
@@ -147,6 +165,130 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual(monitor.status.problem, "the usage dashboard is not reachable at http://127.0.0.1:8787")
         let state = UsageMenu.State(status: monitor.status)
         XCTAssertEqual(UsageMenu.title(state, now: Date()), "Usage limits — 1 at 90%+ (last known)")
+    }
+
+    // MARK: When Telegram fails
+
+    /// An app past its first reading, one poll away from trimo's crossing.
+    private func appBeforeACrossing() async throws -> (AppDelegate, UsageMonitor, Dashboard) {
+        try connectTelegram()
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 93)
+        return (app, monitor, dashboard)
+    }
+
+    func testAnUnreachableTelegramGetsTheAlertLaterAndTheMenuSaysWhy() async throws {
+        let (app, monitor, _) = try await appBeforeACrossing()
+        telegramFailure = TelegramError("Could not reach Telegram (-1009): check the connection", kind: .transient)
+        await monitor.poll()
+        await settle(app)
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertEqual(app.telegramOutbox.pending.count, 1, "kept for another try")
+        XCTAssertEqual(center.posted.map(\.identifier), ["usage:claude|trimo|weekly_all"], "no banner for a passing failure")
+        let state = app.usageMenuState()
+        XCTAssertEqual(UsageMenu.telegramLines(state, now: clockNow), [
+            "Telegram: not delivering — @my_usage_bot → Cress",
+            "Could not reach Telegram (-1009): check the connection",
+            "1 alert waits to be sent — next try in 1m",
+        ])
+
+        // Housekeeping (every 5 s) is what tries again.
+        telegramFailure = nil
+        clockNow += 10
+        app.housekeepIfDue(now: clockNow)
+        await settle(app)
+        XCTAssertTrue(sent.isEmpty, "not before its pause is over")
+        clockNow += 21
+        app.housekeepIfDue(now: clockNow)
+        await settle(app)
+        XCTAssertEqual(sent.count, 1, "delivered once Telegram answers")
+        XCTAssertTrue(sent.first?.html.contains("<b>trimo</b> — Claude weekly at <b>93%</b>") ?? false, sent.first?.html ?? "")
+        XCTAssertTrue(app.telegramOutbox.pending.isEmpty)
+        XCTAssertEqual(UsageMenu.telegramLines(app.usageMenuState(), now: clockNow), ["Telegram: @my_usage_bot → Cress"])
+    }
+
+    func testARefusedAlertPostsOneBannerThatOpensTheBot() async throws {
+        let (app, monitor, dashboard) = try await appBeforeACrossing()
+        telegramFailure = TelegramError("Telegram refused (Forbidden: bot was blocked by the user). Open the chat with your bot and press Start.")
+        await monitor.poll()
+        await settle(app)
+        XCTAssertTrue(app.telegramOutbox.pending.isEmpty, "a refusal is not retried")
+        let banners = center.posted.filter { $0.identifier == "usage:telegram" }
+        XCTAssertEqual(banners.count, 1)
+        XCTAssertEqual(banners.first?.content.title, "A usage alert did not reach Telegram")
+        XCTAssertEqual(banners.first?.content.body, telegramFailure?.message)
+        XCTAssertEqual(banners.first?.content.userInfo["openURL"] as? String, "https://t.me/my_usage_bot")
+
+        // The next crossing fails the same way: no second banner for it.
+        dashboard.body = dashboardJSON(trimoWeekly: 93, trimoSession: 95)
+        await monitor.poll()
+        await settle(app)
+        XCTAssertEqual(center.posted.filter { $0.identifier == "usage:telegram" }.count, 1, "one banner per problem")
+        XCTAssertEqual(center.posted.filter { $0.identifier.hasPrefix("usage:claude") }.count, 2, "the usage banners still come")
+    }
+
+    func testAnAlertLeftByARestartIsSentAfterIt() async throws {
+        try connectTelegram()
+        TelegramOutbox.standard().enqueue("⚠️ left from before", now: clockNow)
+        let app = makeApp()
+        app.housekeepIfDue(now: clockNow)
+        await settle(app)
+        XCTAssertEqual(sent.map(\.html), ["⚠️ left from before"])
+    }
+
+    func testTurningTelegramOffOrDisconnectingDropsWhatWaits() async throws {
+        let (app, monitor, _) = try await appBeforeACrossing()
+        telegramFailure = TelegramError("Could not reach Telegram", kind: .transient)
+        await monitor.poll()
+        await settle(app)
+        XCTAssertEqual(app.telegramOutbox.pending.count, 1)
+        TelegramSettings.delete()
+        clockNow += 60
+        app.housekeepIfDue(now: clockNow)
+        await settle(app)
+        XCTAssertTrue(app.telegramOutbox.pending.isEmpty, "nobody to send it to any more")
+        XCTAssertNil(app.telegramOutbox.problem)
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    // MARK: Setting up
+
+    func testOnlyOneSetupRunsAtATime() async {
+        var release: CheckedContinuation<Void, Never>?
+        var finished: [TelegramSettings?] = []
+        let flow: @MainActor () async -> TelegramSettings? = {
+            await withCheckedContinuation { release = $0 }
+            return nil
+        }
+        XCTAssertTrue(TelegramSetup.run(flow, completion: { finished.append($0) }))
+        XCTAssertTrue(TelegramSetup.isRunning)
+        XCTAssertFalse(TelegramSetup.run(flow, completion: { finished.append($0) }), "a second click while one is open")
+        XCTAssertEqual(StatusMenuController.setUpTitle(UsageMenu.State(settingUpTelegram: TelegramSetup.isRunning)),
+                       "Setting Up Telegram…")
+        while release == nil { await Task.yield() }
+        release?.resume()
+        while TelegramSetup.isRunning { await Task.yield() }
+        XCTAssertEqual(finished.count, 1)
+        XCTAssertTrue(TelegramSetup.run({ nil }, completion: { _ in }), "free again once it ends")
+        while TelegramSetup.isRunning { await Task.yield() }
+    }
+
+    func testTheHiddenEditMenuGivesTheTokenFieldPaste() throws {
+        let menu = AppMenu.make()
+        let edit = try XCTUnwrap(menu.items.first { $0.title == "Edit" }?.submenu)
+        let items = Dictionary(uniqueKeysWithValues: edit.items.compactMap { item in item.action.map { (NSStringFromSelector($0), item) } })
+        for (action, key) in ["paste:": "v", "copy:": "c", "cut:": "x", "selectAll:": "a", "undo:": "z"] {
+            let item = try XCTUnwrap(items[action], "\(action) is missing")
+            XCTAssertEqual(item.keyEquivalent, key)
+            XCTAssertEqual(item.keyEquivalentModifierMask, .command)
+            XCTAssertNil(item.target, "\(action) goes to the focused field, whatever it is")
+        }
+        XCTAssertNotEqual(menu.items.first?.title, "Edit", "the first item is the application menu")
     }
 
     // MARK: Clicks and housekeeping
@@ -175,6 +317,26 @@ final class UsageAlertAppTests: XCTestCase {
     }
 
     // MARK: Menu words
+
+    func testTelegramMenuLines() {
+        let now = clockNow
+        var state = UsageMenu.State()
+        XCTAssertEqual(UsageMenu.telegramLines(state, now: now), [], "not connected: only the setup item")
+        XCTAssertEqual(StatusMenuController.setUpTitle(state), "Set Up Telegram Alerts…")
+        state.telegram = "@my_usage_bot → Cress"
+        XCTAssertEqual(UsageMenu.telegramLines(state, now: now), ["Telegram: @my_usage_bot → Cress"])
+        state.telegramProblem = "Telegram did not accept the bot token (Unauthorized). Copy it again from @BotFather."
+        state.telegramWaiting = 2
+        state.telegramNextTry = now.addingTimeInterval(-1)
+        XCTAssertEqual(UsageMenu.telegramLines(state, now: now), [
+            "Telegram: not delivering — @my_usage_bot → Cress",
+            "Telegram did not accept the bot token (Unauthorized). Copy it again from @BotFather.",
+            "2 alerts wait to be sent — sending",
+        ])
+        XCTAssertEqual(StatusMenuController.setUpTitle(state), "Set Up Telegram Again…")
+        state.telegramEnabled = false
+        XCTAssertEqual(UsageMenu.telegramLines(state, now: now), ["Telegram: off (telegramAlerts in config.json)"])
+    }
 
     func testUsageMenuTitles() {
         let now = Date()
