@@ -315,11 +315,42 @@ final class UsageTests: XCTestCase {
 
     }
 
-    func testAnAccountTheDashboardDropsIsForgotten() {
+    func testADroppedAccountKeepsItsRecordsUntilItsPeriodEnds() {
         let engine = engine()
+        let key = "claude|trimo@example.com|weekly_all"
         _ = engine.evaluate(snapshot([claude("trimo", session: 20, weekly: 95), claude("other", session: 1, weekly: 1)]))
-        XCTAssertNotNil(engine.state.alerted["claude|trimo|weekly_all"])
+        XCTAssertNotNil(engine.state.alerted[key], "kept under the account's address")
         _ = engine.evaluate(snapshot([claude("other", session: 1, weekly: 1)]))
+        XCTAssertNotNil(engine.state.alerted[key], "missing from one scan: kept")
+        XCTAssertEqual(engine.evaluate(snapshot([claude("trimo", session: 20, weekly: 96), claude("other", session: 1, weekly: 1)])), [],
+                       "back in the next scan: the same crossing, not news")
+        _ = engine.evaluate(snapshot([claude("other", session: 1, weekly: 1)], at: 1_791_800_000 + 3600))
+        XCTAssertNil(engine.state.alerted[key], "gone, and its week over: forgotten")
+    }
+
+    func testRecordsBelongToTheAccountNotTheDashboardLabel() {
+        let engine = engine()
+        _ = engine.evaluate(snapshot([claude("cress", session: 20, weekly: 50)]))
+        XCTAssertEqual(keys(engine.evaluate(snapshot([claude("cress", session: 20, weekly: 95)]))), ["claude|cress|weekly_all"])
+        // This Mac's account shows up once more as the dashboard's "project"
+        // row (its profile's address was not read in that scan): one account.
+        var project = claude("project", session: 20, weekly: 95)
+        project["email"] = "cress@example.com"
+        XCTAssertEqual(engine.evaluate(snapshot([claude("cress", session: 20, weekly: 95), project])), [], "not announced twice")
+        // A folder signed in to another account later: its records are not the new account's.
+        var resigned = claude("cress", session: 20, weekly: 95)
+        resigned["email"] = "someone-else@example.com"
+        XCTAssertEqual(keys(engine.evaluate(snapshot([resigned]))), ["claude|cress|weekly_all"], "another account crossing: news")
+    }
+
+    func testRecordsKeptUnderALabelMoveToTheAddress() throws {
+        // A state file from before records were kept by address.
+        let url = dir.appendingPathComponent("usage-alerts.json")
+        let legacy = #"{"initialized":true,"alerted":{"claude|trimo|weekly_all":{"pct":95,"resetsAt":"2026-10-12T10:13:20Z","alertedAt":"2026-10-10T01:00:00Z"}}}"#
+        try Data(legacy.utf8).write(to: url)
+        let engine = UsageAlertEngine(url: url, threshold: 90, now: { [now] in now })
+        XCTAssertEqual(engine.evaluate(snapshot([claude("trimo", session: 20, weekly: 96)])), [], "the same crossing, recorded before")
+        XCTAssertNotNil(engine.state.alerted["claude|trimo@example.com|weekly_all"])
         XCTAssertNil(engine.state.alerted["claude|trimo|weekly_all"])
     }
 
@@ -359,12 +390,12 @@ final class UsageTests: XCTestCase {
             "📊 <b>AI usage</b> · 02:40",
             "",
             "<b>Claude Code</b>",
-            "<pre>account       session    week",
-            "cress         69% 2h46m  72% 2d7h ◀",
-            "full          0%         100% 2d7h ⚠",
-            "roomy         0%         53% 6d</pre>",
+            "<pre>account session   week",
+            "cress   69% 2h46m 72% 2d7h ◀",
+            "full    0%        100% 2d7h ⚠",
+            "roomy   0%        53% 6d</pre>",
             "<b>Codex</b>",
-            "<pre>cx            37% 3d</pre>",
+            "<pre>cx 37% 3d</pre>",
             "",
             "Use first: <b>cress</b>",
             "Most usage left: <b>roomy</b>",
@@ -379,9 +410,9 @@ final class UsageTests: XCTestCase {
             "⚠️ <b>tr&lt;i&gt;mo</b> — Claude weekly at <b>94%</b>",
             "",
             "<b>Claude Code</b>",
-            "<pre>account       session    week",
-            "tr&lt;i&gt;mo       28% 2h46m  94% 2d7h ⚠ ◀",
-            "roomy         0%         53% 6d</pre>",
+            "<pre>account session   week",
+            "tr&lt;i&gt;mo 28% 2h46m 94% 2d7h ⚠ ◀",
+            "roomy   0%        53% 6d</pre>",
             "",
             "Use first: <b>roomy</b>",
             "Most usage left: <b>roomy</b>",
@@ -417,7 +448,8 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(v.useFirst(tool: "claude")?.account.label, "edge", "the dashboard's own pick, unchanged")
         XCTAssertTrue(UsageText.alertMessage([alert], view: v).contains("Use first: <b>roomy</b>\nMost usage left: <b>roomy</b>"))
         XCTAssertEqual(UsageText.notification(for: [alert], view: v).body, "Use first: roomy (47% left).")
-        XCTAssertTrue(UsageText.reportMessage(v).contains("Use first: <b>edge</b>\n"), "the report mirrors the dashboard")
+        XCTAssertTrue(UsageText.reportMessage(v).contains("Use first: <b>roomy</b>\n"),
+                      "an account at the threshold is no place to go, in a report either")
 
         // Every account full: when work can go on, and where.
         let full = snapshot([claude("cress", session: 20, weekly: 95),
@@ -432,14 +464,14 @@ final class UsageTests: XCTestCase {
         let snap = snapshot([claude("trimo", session: 28, weekly: 94, weeklyResets: now.timeIntervalSince1970 + 2 * 86_400 + 4 * 3_600 + 60),
                              claude("cresswell", session: 65, weekly: 44)])
         let one = UsageText.notification(for: [try crossing(snap, 0, "weekly_all")], view: view(snap))
-        XCTAssertEqual(one.title, "trimo: Claude weekly limit at 94%")
-        XCTAssertEqual(one.subtitle, "renews in 2d 4h")
+        XCTAssertEqual(one.title, "Claude weekly limit at 94%", "the number first: a long title is cut at its end")
+        XCTAssertEqual(one.subtitle, "trimo · renews in 2d 4h")
         XCTAssertEqual(one.body, "Use first: cresswell (35% left).")
 
         let both = snapshot([claude("a", session: 91, weekly: 92), claude("b", session: 100, weekly: 100)])
         let several = UsageText.notification(for: [try crossing(both, 0, "session"), try crossing(both, 0, "weekly_all")], view: view(both))
-        XCTAssertEqual(several.title, "2 limits passed 90%")
-        XCTAssertEqual(several.subtitle, "a · Claude session 91%, a · Claude weekly 92%")
+        XCTAssertEqual(several.title, "2 limits at 90%+")
+        XCTAssertEqual(several.subtitle, "a: session 91%, weekly 92%")
         XCTAssertEqual(several.body, "All near a limit; a frees up first.")
 
         let codexSnap = snapshot([codex("nexxaflo", [cwindow("weekly", 95, resets: now.timeIntervalSince1970 + 3600)]),
@@ -450,7 +482,7 @@ final class UsageTests: XCTestCase {
 
         let refused = snapshot([codex("nexxaflo", [cwindow("usage", 100, resets: nil)])])
         let refusal = try crossing(refused, 0, "usage")
-        XCTAssertEqual(UsageText.notification(for: [refusal], view: view(refused)).subtitle, "limit reached")
+        XCTAssertEqual(UsageText.notification(for: [refusal], view: view(refused)).subtitle, "nexxaflo · limit reached")
         XCTAssertTrue(UsageText.alertMessage([refusal], view: view(refused)).hasPrefix("⛔️ <b>nexxaflo</b> — Codex usage at <b>100%</b>"))
     }
 
@@ -474,6 +506,48 @@ final class UsageTests: XCTestCase {
         XCTAssertTrue(tables.contains("a29 "), "30 rows shown")
         XCTAssertFalse(tables.contains("a30 "))
         XCTAssertTrue(tables.contains("…and 10 more</pre>"), tables)
+    }
+
+    func testAnOldReadingSaysSoAndGivesNoAdvice() {
+        let snap = snapshot([claude("cress", session: 69, weekly: 72), claude("roomy", session: 0, weekly: 53)])
+        var old = view(snap, inUse: ["cress"])
+        old.now = now.addingTimeInterval(5 * 3600)
+        old.dashboardDown = true
+        let report = UsageText.reportMessage(old)
+        XCTAssertTrue(report.hasPrefix("📊 <b>AI usage</b> · 07:40\n⚠️ The dashboard is not answering: these numbers are from 02:40 (5h ago)."),
+                      report)
+        XCTAssertTrue(report.hasSuffix("Use first: —\nMost usage left: —"), "no advice from a 5-hour-old reading: \(report)")
+        XCTAssertTrue(report.contains("cress   69%?"), "a session that has renewed since is not 69% now: \(report)")
+    }
+
+    func testTablesStayAlignedAndTellAccountsApart() {
+        // Fable on, a 10-character week cell, a long label sharing its start
+        // with another, a wide-character label, a number from an old period.
+        var cress = claude("cresswell-nexxatech", session: 84, weekly: 100, weeklyResets: now.timeIntervalSince1970 + 3 * 86_400 + 11 * 3600)
+        var windows = cress["limits"] as! [String: Any]
+        windows["windows"] = [window("session", 84, resets: 1_791_610_000, label: "Session (5hr)"),
+                              window("weekly_all", 100, resets: now.timeIntervalSince1970 + 3 * 86_400 + 11 * 3600, label: "Weekly (7 day)"),
+                              window("weekly_scoped", 0, resets: 1_791_800_000, label: "Weekly Opus"),
+                              window("weekly_scoped", 12, resets: 1_791_800_000, label: "Weekly Fable")]
+        cress["limits"] = windows
+        let flo = claude("cresswell-nexflo", session: 0, weekly: 10)
+        let cjk = claude("財務", session: 0, weekly: 30)
+        let stale = claude("old", session: 0, weekly: 100, weeklyResets: now.timeIntervalSince1970 - 60)
+        let lines = UsageText.tableBlocks(view(snapshot([cress, flo, cjk, stale]))).joined(separator: "\n").components(separatedBy: "\n")
+        XCTAssertEqual(lines, [
+            "<b>Claude Code</b>",
+            "<pre>account       session   week       fable",
+            "cresswell-…ch 84% 2h46m 100% 3d11h 12% ⚠",
+            "cresswell-…lo 0%        10% 2d7h   0%",
+            "財務          0%        30% 2d7h   0%",
+            "old           0%        100%?      0%</pre>",
+        ])
+    }
+
+    func testAStopSignOnlyForTheAccountThatStopped() throws {
+        let snap = snapshot([claude("cress", session: 91, weekly: 50), claude("full", session: 0, weekly: 100)])
+        let html = UsageText.alertMessage([try crossing(snap, 0, "session"), try crossing(snap, 1, "weekly_all")], view: view(snap))
+        XCTAssertTrue(html.hasPrefix("⚠️ <b>cress</b> — Claude session at <b>91%</b>\n⛔️ <b>full</b> — Claude weekly at <b>100%</b>"), html)
     }
 
     func testFitKeepsWholeBlocksAndCountsTheRest() {

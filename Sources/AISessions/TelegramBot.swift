@@ -8,19 +8,27 @@ import Foundation
 /// the setup flow, which reads the same updates (Telegram allows one reader).
 @MainActor
 final class TelegramBot {
-    /// Builds the report to send, after a fresh reading if it can; nil when
-    /// there is no reading at all yet.
-    var report: @MainActor () async -> String? = { nil }
+    /// Builds the reply: a report after a fresh reading if it can, else why
+    /// there is none.
+    var report: @MainActor () async -> String = { "📊 No usage reading yet." }
     /// Called with why the bot stopped listening, or nil once it listens.
     var onProblem: (String?) -> Void = { _ in }
 
     /// Seconds one getUpdates waits for a message.
     static let pollTimeout = 50
+    /// A long poll that drops (connection lost, the Mac asleep) is routine:
+    /// said only after this many failures in a row.
+    static let failuresBeforeSaying = 4
     /// A second tap within this many seconds gets no second report.
     static let minGap: TimeInterval = 3
 
     private let transport: TelegramClient.Transport
     private let clock: () -> Date
+    /// Seconds to wait after `failures` failures in a row (`status`: HTTP
+    /// status, 409 waits longer); tests shorten it.
+    var pauseAfter: (_ failures: Int, _ status: Int?) -> TimeInterval = { failures, status in
+        failures == 1 ? 1 : min(5 * pow(2, Double(failures - 2)), status == 409 ? 600 : 300)
+    }
     private(set) var settings: TelegramSettings?
     private var task: Task<Void, Never>?
     private var lastReport: Date?
@@ -54,7 +62,7 @@ final class TelegramBot {
         let client = TelegramClient(token: settings.botToken, transport: transport)
         var offset: Int64?
         var started = false
-        var pause: TimeInterval = 5
+        var failures = 0
         while !Task.isCancelled {
             do {
                 if !started {
@@ -66,7 +74,7 @@ final class TelegramBot {
                 }
                 let updates = try await client.updates(after: offset, timeout: Self.pollTimeout)
                 guard !Task.isCancelled else { return }
-                pause = 5
+                failures = 0
                 recovered()
                 for update in updates {
                     if let id = (update["update_id"] as? NSNumber)?.int64Value { offset = max(offset ?? 0, id + 1) }
@@ -83,10 +91,11 @@ final class TelegramBot {
                     task = nil
                     return
                 }
-                // Asleep, offline, or another program reading this bot (409).
-                report(problem: failure.message)
-                try? await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000))
-                pause = min(pause * 2, failure.status == 409 ? 600 : 300)
+                // Asleep, offline, a dropped connection, or another program
+                // reading this bot (409): try again, soon at first.
+                failures += 1
+                if failures >= Self.failuresBeforeSaying || failure.status == 409 { report(problem: failure.message) }
+                try? await Task.sleep(nanoseconds: UInt64(pauseAfter(failures, failure.status) * 1_000_000_000))
             }
         }
     }
@@ -107,7 +116,6 @@ final class TelegramBot {
         guard !tooSoon else { return }
         lastReport = now
         let html = await report()
-            ?? "📊 No usage reading yet: is the ai-accounts dashboard running (http://127.0.0.1:8787)?"
         do {
             try await client.send(html: html, to: settings.chatId, markup: .usageKeyboard)
             answered += 1

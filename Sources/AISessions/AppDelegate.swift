@@ -311,21 +311,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The words' inputs for `snapshot` (the latest reading by default): whose
     /// limits alert, which accounts this Mac uses, the dashboard's opt-outs.
-    func usageView(_ snapshot: UsageSnapshot? = nil) -> UsageView {
+    /// `now` is the moment they are for (the reading's own by default).
+    func usageView(_ snapshot: UsageSnapshot? = nil, now: Date? = nil) -> UsageView {
         let status = usage?.status ?? UsageMonitor.Status()
         let reading = snapshot ?? status.snapshot ?? UsageSnapshot(accounts: [], fetchedAt: clock())
         var current = status
         current.snapshot = reading
         return UsageView(snapshot: reading, threshold: config.usageAlertThreshold, followed: current.covered,
-                         inUse: current.inUse, signedInKnown: status.signedIn != nil, excluded: status.excluded)
+                         inUse: current.inUse, signedInKnown: status.signedIn != nil, excluded: status.excluded,
+                         now: now, dashboardDown: snapshot == nil && status.problem != nil,
+                         followsSignIn: status.scope.current)
     }
 
     /// A report for the "📊 Usage" button: a fresh reading first, when the
-    /// dashboard answers; nil when there has never been one.
+    /// dashboard answers, about now; nil when there has never been one.
     func usageReport(lead: String? = nil) async -> String? {
         await usage?.poll()
         guard usage?.status.snapshot != nil else { return nil }
-        return UsageText.reportMessage(usageView(), lead: lead)
+        return UsageText.reportMessage(usageView(now: clock()), lead: lead)
+    }
+
+    /// Why there is no report to send.
+    func noReportReason() -> String {
+        guard config.usageAlertsEnabled else {
+            return "📊 Usage limits are off in AI Sessions (usageAlertsEnabled in config.json)."
+        }
+        return "📊 No usage reading yet: the dashboard at \(config.usageDashboardURL) is not answering."
     }
 
     nonisolated static func postToTelegram(_ settings: TelegramSettings, _ html: String, _ markup: TelegramMarkup?) async throws {
@@ -336,7 +347,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// and not while the setup reads the same updates. A chat connected
     /// before the button existed is sent it once.
     func syncTelegramBot() {
-        telegramBot.report = { [weak self] in await self?.usageReport() }
+        telegramBot.report = { [weak self] in
+            guard let self else { return "📊 No usage reading yet." }
+            return await usageReport() ?? noReportReason()
+        }
         telegramBot.onProblem = { [weak self] problem in
             self?.telegramBotProblem = problem
             self?.refreshUsageMenu()

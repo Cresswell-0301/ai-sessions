@@ -119,9 +119,10 @@ that file to do the same (for example, while sharing your screen).
 The ai-accounts dashboard (`http://127.0.0.1:8787`) already reads every Claude
 and Codex account's limits. Once a minute the app reads the dashboard's last
 scan (`GET /data.json`) and announces a limit of **the account in use** the
-moment it reaches the threshold (90%): a banner such as *cresswell-nexxatech:
-Claude weekly limit at 91% — resets in 2d 4h — Most room now: looiytube2*,
-whose click opens the dashboard, and a Telegram message if you connected a bot.
+moment it reaches the threshold (90%): a banner such as *Claude weekly limit at
+91% — cresswell-nexxatech · renews in 21h 20m — Use first: looiytube2 (47%
+left)*, whose click opens the dashboard, and a Telegram message if you
+connected a bot.
 The app never talks to Anthropic or OpenAI itself: the dashboard holds the
 accounts' sign-ins.
 
@@ -179,8 +180,11 @@ Most usage left: looiytube2
 *Use first* is the dashboard's own pick (the account whose week renews soonest
 among those with room, so its quota is not wasted; accounts opted out on the
 dashboard are skipped). In an alert it leaves out every account already at the
-threshold, so it names somewhere to go; when there is nowhere, the account that
-frees up first. *Most usage left* is the account with the most room now.
+threshold (the dashboard still counts exactly 90% as usable), in an alert and
+in a report alike; when there is nowhere, the account that frees up first.
+*Most usage left* is the account with the most room now. A report asked for
+while the dashboard is not answering says how old its numbers are and gives no
+advice from them.
 
 **The Usage button.** *📊 Usage* stays under the chat: tap it (or send
 `/usage`) any time for the same report about now. An alert carries a *📊 Usage

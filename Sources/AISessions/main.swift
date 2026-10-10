@@ -201,7 +201,8 @@ private func usageStatus(_ config: Config, _ snapshot: UsageSnapshot) -> UsageMo
 
 private func usageView(_ config: Config, _ status: UsageMonitor.Status, _ snapshot: UsageSnapshot) -> UsageView {
     UsageView(snapshot: snapshot, threshold: config.usageAlertThreshold, followed: status.covered,
-              inUse: status.inUse, signedInKnown: status.signedIn != nil, excluded: status.excluded)
+              inUse: status.inUse, signedInKnown: status.signedIn != nil, excluded: status.excluded,
+              followsSignIn: status.scope.current)
 }
 
 func runUsage() -> Int32 {

@@ -87,8 +87,22 @@ public struct UsageAccount: Equatable, Codable, Sendable {
 
     public var toolName: String { tool == "codex" ? "Codex" : "Claude" }
 
-    /// "claude|trimo": one account of one tool.
+    /// "claude|trimo": one account of one tool, as the dashboard lists it.
     public var key: String { "\(tool)|\(label)" }
+
+    /// "claude|trimomalaysia@gmail.com": the account itself, which alert
+    /// records are kept under. A dashboard label is a folder: it can be
+    /// signed in to another account later, and the account this Mac uses can
+    /// appear as a passing "project" row as well as its own; the address is
+    /// the same in both. A row without one falls back to its label.
+    public var recordID: String {
+        let identity = email.map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.flatMap { $0.isEmpty ? nil : $0 }
+        return "\(tool)|\(identity ?? label)"
+    }
+
+    /// What to call the account: its label, or its address for the
+    /// dashboard's "project" row (this Mac's account when it has no profile).
+    public var name: String { label == "project" ? (email ?? label) : label }
 
     /// A Claude account signed in where the user's sessions run.
     public func isSignedIn(_ emails: Set<String>?) -> Bool {
@@ -221,9 +235,14 @@ public struct UsageAlert: Equatable, Sendable {
     /// identifier, so a newer alert for the same window replaces the older.
     /// A scoped weekly limit is one per model or surface ("Weekly Opus",
     /// "Weekly Fable"), all of kind "weekly_scoped": its label tells them apart.
-    public var key: String {
+    public var key: String { "\(account.key)|\(windowKey)" }
+
+    /// The same window of the account itself, which its record is kept under.
+    public var recordKey: String { "\(account.recordID)|\(windowKey)" }
+
+    private var windowKey: String {
         let scope = window.kind == "weekly_scoped" ? ":" + window.label.replacingOccurrences(of: "|", with: "/") : ""
-        return "\(account.tool)|\(account.label)|\(window.kind)\(scope)"
+        return window.kind + scope
     }
 }
 
@@ -276,30 +295,32 @@ public final class UsageAlertEngine {
     /// The very first call records every listed account, readable or not: an
     /// account the dashboard could not refresh shows its last real numbers,
     /// and one held back by a 429 is often one at its cap.
-    /// Only accounts `covering` accepts are evaluated (the ones whose limits
-    /// alert); the others gain no records and keep the ones they have.
-    public func evaluate(_ snapshot: UsageSnapshot, covering: (UsageAccount) -> Bool = { _ in true }) -> [UsageAlert] {
+    /// Every account is evaluated, so each keeps its own edge whether or not
+    /// its limits alert; the caller announces the ones it follows (and
+    /// `forget`s an account it starts following).
+    public func evaluate(_ snapshot: UsageSnapshot) -> [UsageAlert] {
         let announce = state.initialized
         let at = snapshot.fetchedAt
         var alerts: [UsageAlert] = []
         var next = state
-        for account in snapshot.accounts where covering(account) && (account.readable || !announce) {
+        Self.moveLegacyRecords(&next, to: snapshot)
+        for account in snapshot.accounts where account.readable || !announce {
             var seen = Set<String>()
             for alert in Self.distinctWindows(of: account, at: at) {
                 let window = alert.window
-                seen.insert(alert.key)
+                seen.insert(alert.recordKey)
                 // An old number kept, or a period already over: history. Codex
                 // reports both right after a reset (an inferred 0, then the old
                 // number again once a run starts without a reading).
                 guard window.isCurrent(at: at) else { continue }
-                let record = next.alerted[alert.key]
+                let record = next.alerted[alert.recordKey]
                 guard window.pct.rounded() >= threshold else {
                     // Armed again by a reading of the recorded period, or once
                     // that period is over. A lower number with another reset
                     // before then is a different limit (Codex shows the one its
                     // last run hit, sometimes another limit at 0%).
                     if let record, Self.samePeriod(record.resetsAt, window.resetsAt) || Self.ended(record, at: at) {
-                        next.alerted[alert.key] = nil
+                        next.alerted[alert.recordKey] = nil
                     }
                     continue
                 }
@@ -307,24 +328,27 @@ public final class UsageAlertEngine {
                 // Codex drops the date from "try again at …" on the reset's own
                 // day: no reset, inside a dated period not yet over, is that period.
                 if let record, window.resetsAt == nil, record.resetsAt != nil, !Self.ended(record, at: at) { continue }
-                next.alerted[alert.key] = Record(resetsAt: window.resetsAt, pct: window.pct, alertedAt: now())
+                next.alerted[alert.recordKey] = Record(resetsAt: window.resetsAt, pct: window.pct, alertedAt: now())
                 if announce { alerts.append(alert) }
             }
             // A window without a reset that a readable account no longer
             // reports (a Codex refusal, gone once a run succeeds) is armed again.
             if account.readable {
-                let part = "\(account.tool)|\(account.label)"
+                let part = account.recordID
                 for (key, record) in next.alerted
                 where record.resetsAt == nil && !seen.contains(key) && Self.accountPart(of: key) == part {
                     next.alerted[key] = nil
                 }
             }
         }
-        // Accounts the dashboard no longer lists (removed, renamed) are
-        // forgotten; an unreadable one keeps its records, so a brief read
-        // failure cannot re-announce a window that never went below.
-        let listed = Set(snapshot.accounts.map { "\($0.tool)|\($0.label)" })
-        next.alerted = next.alerted.filter { listed.contains(Self.accountPart(of: $0.key)) }
+        // An account the dashboard no longer lists keeps its records until
+        // their period is over: a row can miss one scan (a profile not read,
+        // the "project" row of a login in progress), and coming back must not
+        // make an old crossing news. An unreadable one keeps its records too.
+        let listed = Set(snapshot.accounts.map(\.recordID))
+        next.alerted = next.alerted.filter { key, record in
+            listed.contains(Self.accountPart(of: key)) || !Self.lapsed(record, at: at)
+        }
         next.initialized = true
         if next != state {
             state = next
@@ -333,14 +357,32 @@ public final class UsageAlertEngine {
         return alerts
     }
 
-    /// Makes `accounts` news again: their windows over the threshold alert
-    /// at the next evaluation. For an account just signed in to, which may
-    /// have crossed while the alerts followed another one.
-    public func forget(_ accounts: [UsageAccount]) {
-        let parts = Set(accounts.map(\.key))
-        guard state.alerted.keys.contains(where: { parts.contains(Self.accountPart(of: $0)) }) else { return }
-        state.alerted = state.alerted.filter { !parts.contains(Self.accountPart(of: $0.key)) }
+    /// Makes accounts (by `recordID`) news again: their windows over the
+    /// threshold alert at the next evaluation. For an account just signed in
+    /// to, which may have crossed while the alerts followed another one.
+    public func forget(_ ids: Set<String>) {
+        guard state.alerted.keys.contains(where: { ids.contains(Self.accountPart(of: $0)) }) else { return }
+        state.alerted = state.alerted.filter { !ids.contains(Self.accountPart(of: $0.key)) }
         save()
+    }
+
+    /// Records kept under a dashboard label (before they were kept under the
+    /// account's address) move to the address the row now shows.
+    static func moveLegacyRecords(_ state: inout State, to snapshot: UsageSnapshot) {
+        for account in snapshot.accounts where account.recordID != account.key {
+            for (key, record) in state.alerted where accountPart(of: key) == account.key {
+                let window = key.dropFirst(account.key.count) // "|weekly_all"
+                state.alerted[key] = nil
+                let moved = account.recordID + window
+                if state.alerted[moved] == nil { state.alerted[moved] = record }
+            }
+        }
+    }
+
+    /// A record of an account no longer listed may go: its period is over,
+    /// or (no reset to tell) it is more than a week old.
+    static func lapsed(_ record: Record, at date: Date) -> Bool {
+        record.resetsAt == nil ? date.timeIntervalSince(record.alertedAt) > 8 * 86_400 : ended(record, at: date)
     }
 
     /// One alert per key. Should two windows share one (a meter the server
@@ -351,14 +393,14 @@ public final class UsageAlertEngine {
         var best: [String: UsageAlert] = [:]
         for window in account.windows {
             let alert = UsageAlert(account: account, window: window)
-            guard let held = best[alert.key] else {
-                order.append(alert.key)
-                best[alert.key] = alert
+            guard let held = best[alert.recordKey] else {
+                order.append(alert.recordKey)
+                best[alert.recordKey] = alert
                 continue
             }
             let candidate = (window.isCurrent(at: date), window.pct)
             let current = (held.window.isCurrent(at: date), held.window.pct)
-            if (candidate.0 ? 1 : 0, candidate.1) > (current.0 ? 1 : 0, current.1) { best[alert.key] = alert }
+            if (candidate.0 ? 1 : 0, candidate.1) > (current.0 ? 1 : 0, current.1) { best[alert.recordKey] = alert }
         }
         return order.compactMap { best[$0] }
     }
@@ -369,7 +411,7 @@ public final class UsageAlertEngine {
         return date >= reset.addingTimeInterval(-samePeriodTolerance)
     }
 
-    /// "claude|trimo|weekly_all" → "claude|trimo".
+    /// "claude|a@b.com|weekly_all" → "claude|a@b.com".
     static func accountPart(of key: String) -> String {
         guard let bar = key.lastIndex(of: "|") else { return key }
         return String(key[..<bar])
@@ -425,9 +467,18 @@ public struct UsageView: Sendable {
     /// accounts were left out, to say which account frees up first when no
     /// other one is free.
     var ownExcluded: Set<String>?
+    /// The moment the words are for: "renews in" counts from it, and a
+    /// reading older than 15 minutes is no base for advice. The reading's
+    /// own time unless told otherwise (a report asked for later).
+    public var now: Date
+    /// Set when the dashboard stopped answering: the reading is the last good one.
+    public var dashboardDown: Bool
+    /// Whether the setting follows the account this Mac is signed into.
+    public var followsSignIn: Bool
 
     public init(snapshot: UsageSnapshot, threshold: Double, followed: [UsageAccount] = [], inUse: Set<String> = [],
-                signedInKnown: Bool = true, excluded: Set<String> = [], timeZone: TimeZone = .current) {
+                signedInKnown: Bool = true, excluded: Set<String> = [], timeZone: TimeZone = .current,
+                now: Date? = nil, dashboardDown: Bool = false, followsSignIn: Bool = true) {
         self.snapshot = snapshot
         self.threshold = threshold
         self.followed = followed
@@ -435,10 +486,14 @@ public struct UsageView: Sendable {
         self.signedInKnown = signedInKnown
         self.excluded = excluded
         self.timeZone = timeZone
+        self.now = now ?? snapshot.fetchedAt
+        self.dashboardDown = dashboardDown
+        self.followsSignIn = followsSignIn
     }
 
-    /// The reading's own time: every "renews in" counts from it.
-    public var now: Date { snapshot.fetchedAt }
+    /// The reading is old enough to say so: the dashboard is down, or it is
+    /// more than two polls old (the Mac slept).
+    public var readingIsOld: Bool { dashboardDown || now.timeIntervalSince(snapshot.fetchedAt) > 150 }
 
     /// The dashboard's pick for `tool`, optionally passing over one account
     /// (the one in use, for "then").
@@ -489,7 +544,7 @@ public enum UsageText {
 
     /// "trimo · Claude weekly 94%".
     public static func headline(_ alert: UsageAlert) -> String {
-        "\(alert.account.label) · \(alert.account.toolName) \(alert.window.shortName) \(percent(alert.window.pct))"
+        "\(alert.account.name) · \(alert.account.toolName) \(alert.window.shortName) \(percent(alert.window.pct))"
     }
 
     /// The macOS banner for one tick's crossings: what crossed, when it
@@ -502,18 +557,26 @@ public enum UsageText {
                 return "No \(toolName(tool)) account has a fresh reading."
             }
             switch pick.mode {
-            case .safe: return "Use first: \(pick.account.label) (\(pick.left)% left)."
-            case .fallback: return "All near a limit; \(pick.account.label) frees up first."
+            case .safe: return "Use first: \(pick.account.name) (\(pick.left)% left)."
+            case .fallback: return "All near a limit; \(pick.account.name) frees up first."
             }
         } ?? ""
         guard alerts.count == 1, let alert = alerts.first else {
-            let names = alerts.map(headline).joined(separator: ", ")
-            return ("\(alerts.count) limits passed \(percent(view.threshold))", names, advice)
+            // "trimo: session 91%, weekly 92% · cress: weekly 100%"
+            var names: [String] = []
+            var parts: [String: [String]] = [:]
+            for alert in alerts {
+                if parts[alert.account.name] == nil { names.append(alert.account.name) }
+                parts[alert.account.name, default: []].append("\(alert.window.shortName) \(percent(alert.window.pct))")
+            }
+            let subtitle = names.map { "\($0): " + (parts[$0] ?? []).joined(separator: ", ") }.joined(separator: " · ")
+            return ("\(alerts.count) limits at \(percent(view.threshold))+", subtitle, advice)
         }
-        let renews = until(alert.window.resetsAt, now: view.now).map { "renews in \($0)" }
-            ?? (alert.window.pct.rounded() >= 100 ? "limit reached" : "")
-        return ("\(alert.account.label): \(alert.account.toolName) \(alert.window.shortName) limit at \(percent(alert.window.pct))",
-                renews, advice)
+        // The number first: a one-line title is cut at its end.
+        let renews = until(alert.window.resetsAt, now: view.now).map { " · renews in \($0)" }
+            ?? (alert.window.pct.rounded() >= 100 ? " · limit reached" : "")
+        return ("\(alert.account.toolName) \(alert.window.shortName) limit at \(percent(alert.window.pct))",
+                alert.account.name + renews, advice)
     }
 
     /// What one Telegram message may hold: Telegram takes 4096 UTF-16 units
@@ -537,15 +600,14 @@ public enum UsageText {
     ///     Use first: looiytube2
     ///     Most usage left: looiytube2
     public static func alertMessage(_ alerts: [UsageAlert], view: UsageView) -> String {
-        let reached = alerts.contains { $0.window.pct.rounded() >= 100 }
         var blocks: [String] = []
         var seen: [String] = []
         for alert in alerts where !seen.contains(alert.account.key) {
             seen.append(alert.account.key)
-            let crossed = alerts.filter { $0.account.key == alert.account.key }
-                .map { "\(html($0.window.shortName)) at <b>\(percent($0.window.pct))</b>" }
-                .joined(separator: ", ")
-            blocks.append("\(reached ? "⛔️" : "⚠️") <b>\(html(alert.account.label))</b> — \(alert.account.toolName) \(crossed)")
+            let mine = alerts.filter { $0.account.key == alert.account.key }
+            let crossed = mine.map { "\(html($0.window.shortName)) at <b>\(percent($0.window.pct))</b>" }.joined(separator: ", ")
+            let reached = mine.contains { $0.window.pct.rounded() >= 100 }
+            blocks.append("\(reached ? "⛔️" : "⚠️") <b>\(html(alert.account.name))</b> — \(alert.account.toolName) \(crossed)")
         }
         blocks.append("")
         blocks += tableBlocks(view)
@@ -559,16 +621,27 @@ public enum UsageText {
     /// "📊 AI usage" title.
     public static func reportMessage(_ view: UsageView, lead: String? = nil) -> String {
         var blocks = [lead ?? "📊 <b>AI usage</b> · \(clock(view.now, now: view.now, timeZone: view.timeZone))"]
+        if view.readingIsOld {
+            let age = until(view.now, now: view.snapshot.fetchedAt).map { " (\($0) ago)" } ?? ""
+            blocks.append("⚠️ " + (view.dashboardDown ? "The dashboard is not answering: " : "")
+                + "these numbers are from \(clock(view.snapshot.fetchedAt, now: view.now, timeZone: view.timeZone))\(age).")
+        }
         if view.followed.isEmpty {
-            blocks.append(view.signedInKnown ? "No account on the dashboard matches the one this Mac is signed into."
-                                             : "Can't tell which Claude account this Mac is signed into.")
+            if view.followsSignIn {
+                blocks.append(view.signedInKnown ? "No account on the dashboard matches the one this Mac is signed into."
+                                                 : "Can't tell which Claude account this Mac is signed into.")
+            } else {
+                blocks.append("usageAlertAccounts names no account on the dashboard.")
+            }
         }
         blocks.append("")
         blocks += tableBlocks(view)
         blocks.append("")
         var tools = view.followed.map(\.tool).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
         if tools.isEmpty { tools = ["claude"] }
-        blocks += adviceLines(view, tools: tools)
+        // As in an alert: an account at the threshold is no place to go, even
+        // though the dashboard still counts 90% as usable.
+        blocks += adviceLines(view.leaving(), tools: tools)
         return fit(blocks)
     }
 
@@ -580,8 +653,8 @@ public enum UsageText {
         for tool in tools {
             let name = tools.count > 1 ? " (\(toolName(tool)))" : ""
             let pick = view.useFirst(tool: tool) ?? (view.ownExcluded == nil ? nil : view.freesUpFirst(tool: tool))
-            lines.append("Use first\(name): " + (pick.map { "<b>\(html($0.account.label))</b>" } ?? "—"))
-            lines.append("Most usage left\(name): " + (view.mostLeft(tool: tool).map { "<b>\(html($0.account.label))</b>" } ?? "—"))
+            lines.append("Use first\(name): " + (pick.map { "<b>\(html($0.account.name))</b>" } ?? "—"))
+            lines.append("Most usage left\(name): " + (view.mostLeft(tool: tool).map { "<b>\(html($0.account.name))</b>" } ?? "—"))
         }
         return lines
     }
@@ -598,49 +671,103 @@ public enum UsageText {
     /// the accounts this Mac uses first (◀), ⚠ at the threshold, ? unreadable.
     ///     account       session    week
     ///     cresswell-nex 64% 3h27m  70% 21h ◀
+    /// Columns are as wide as their widest cell (by screen width, so a label
+    /// in CJK or with an emoji keeps the rest aligned).
     static func tableBlocks(_ view: UsageView) -> [String] {
         let now = view.now
         let ordered = view.snapshot.accounts.enumerated().sorted { lhs, rhs in
             let l = view.inUse.contains(lhs.element.key), r = view.inUse.contains(rhs.element.key)
             return l != r ? l : lhs.offset < rhs.offset
         }.map(\.element)
-        func cell(_ window: UsageWindow?) -> String {
+        let names = shortNames(ordered.map(\.name))
+        // "77% 3h10m": used, then when it renews. A number that is not a
+        // reading of the running period (old, or its period over) gets a "?".
+        func cell(_ window: UsageWindow?, renewal: Bool = true) -> String {
             guard let window else { return "-" }
-            let renews = window.pct > 0 ? compact(window.resetsAt, now: now).map { " " + $0 } ?? "" : ""
+            guard window.isCurrent(at: now) || window.pct == 0 else { return percent(window.pct) + "?" }
+            let renews = renewal && window.pct > 0 ? compact(window.resetsAt, now: now).map { " " + $0 } ?? "" : ""
             return percent(window.pct) + renews
-        }
-        func line(_ cells: [String], _ widths: [Int]) -> String {
-            var text = ""
-            for (cell, width) in zip(cells, widths) { text += pad(cell, width) }
-            while text.hasSuffix(" ") { text.removeLast() }
-            return text
         }
         func marks(_ account: UsageAccount) -> String {
             let state = account.readable ? (account.isOver(view.threshold, at: now) ? " ⚠" : "") : " ?"
             return state + (view.inUse.contains(account.key) ? " ◀" : "")
         }
         var out: [String] = []
-        let claude = ordered.filter { $0.tool == "claude" }
+        let claude = ordered.enumerated().filter { $0.element.tool == "claude" }
         if !claude.isEmpty {
-            // The Fable column only once some account uses it.
-            let fable = claude.contains { ($0.window("weekly_scoped")?.pct ?? 0) > 0 }
-            let widths = fable ? [14, 11, 10, 0] : [14, 11, 0]
-            let header = line(["account", "session", "week"] + (fable ? ["fable"] : []), widths)
-            let rows = claude.map { account in
-                line([String(account.label.prefix(13)), cell(account.window("session")), cell(account.window("weekly_all"))]
-                     + (fable ? [cell(account.window("weekly_scoped"))] : []), widths) + marks(account)
+            // The Fable column (by its label) only once some account uses it;
+            // its renewal is the week's, so it shows the number alone.
+            func fable(_ account: UsageAccount) -> UsageWindow? {
+                account.windows.first { $0.kind == "weekly_scoped" && $0.label.lowercased().contains("fable") }
             }
+            let showFable = claude.contains { ($0.element.windows.contains { $0.kind == "weekly_scoped" && $0.label.lowercased().contains("fable") && $0.pct > 0 }) }
+            var rows = [["account", "session", "week"] + (showFable ? ["fable"] : [])]
+            for (index, account) in claude {
+                rows.append([names[index], cell(account.window("session")), cell(account.window("weekly_all"))]
+                            + (showFable ? [cell(fable(account), renewal: false)] : []))
+            }
+            let lines = aligned(rows)
             out.append("<b>Claude Code</b>")
-            out.append(table([header] + capped(rows)))
+            out.append(table([lines[0]] + capped(zip(lines.dropFirst(), claude).map { $0 + marks($1.element) })))
         }
-        let codex = ordered.filter { $0.tool == "codex" }
+        let codex = ordered.enumerated().filter { $0.element.tool == "codex" }
         if !codex.isEmpty {
+            let lines = aligned(codex.map { [names[$0.offset], cell(UsageAdvice.renewal($0.element))] })
             out.append("<b>Codex</b>")
-            out.append(table(capped(codex.map { account in
-                line([String(account.label.prefix(13)), cell(UsageAdvice.renewal(account))], [14, 0]) + marks(account)
-            })))
+            out.append(table(capped(zip(lines, codex).map { $0 + marks($1.element) })))
         }
         return out
+    }
+
+    /// Rows of cells as lines, each column as wide as its widest cell plus a space.
+    static func aligned(_ rows: [[String]]) -> [String] {
+        let columns = rows.map(\.count).max() ?? 0
+        let widths = (0..<columns).map { column in
+            rows.map { column < $0.count ? width($0[column]) : 0 }.max() ?? 0
+        }
+        return rows.map { row in
+            var line = ""
+            for (column, cell) in row.enumerated() {
+                line += cell
+                if column < row.count - 1 { line += String(repeating: " ", count: widths[column] - width(cell) + 1) }
+            }
+            return line
+        }
+    }
+
+    /// Labels cut to 13 columns; two that would read the same keep their
+    /// own endings ("cresswell-…ch", "cresswell-…lo").
+    static func shortNames(_ names: [String], max: Int = 13) -> [String] {
+        func cut(_ name: String, to columns: Int) -> String {
+            var out = ""
+            for character in name {
+                guard width(out) + width(String(character)) <= columns else { break }
+                out.append(character)
+            }
+            return out
+        }
+        let plain = names.map { width($0) <= max ? $0 : cut($0, to: max) }
+        return names.enumerated().map { index, name in
+            let short = plain[index]
+            guard short != name, plain.enumerated().contains(where: { $0.offset != index && $0.element == short }) else { return short }
+            return cut(name, to: max - 3) + "…" + String(name.suffix(2))
+        }
+    }
+
+    /// Columns a monospaced font gives `text`: East Asian wide characters
+    /// and emoji take two.
+    static func width(_ text: String) -> Int {
+        text.reduce(0) { total, character in
+            let scalars = character.unicodeScalars
+            let wide = scalars.contains { scalar in
+                scalar.properties.isEmojiPresentation
+                    || (0x1100...0x115F).contains(scalar.value) || (0x2E80...0xA4CF).contains(scalar.value)
+                    || (0xAC00...0xD7A3).contains(scalar.value) || (0xF900...0xFAFF).contains(scalar.value)
+                    || (0xFE30...0xFE4F).contains(scalar.value) || (0xFF00...0xFF60).contains(scalar.value)
+                    || (0xFFE0...0xFFE6).contains(scalar.value) || (0x20000...0x3FFFD).contains(scalar.value)
+            }
+            return total + (wide ? 2 : 1)
+        }
     }
 
     /// "45m", "3h27m", "21h", "2d8h": a renewal time that fits a table cell.
@@ -704,18 +831,18 @@ public enum UsageText {
 
     /// One menu row: "trimo — weekly 94% · session 27%".
     public static func menuRow(_ account: UsageAccount) -> String {
-        "\(account.label) — " + windows(account)
+        "\(account.name) — " + windows(account)
     }
 
     /// "cresswell-nexxatech at 66% weekly · 50% session": the account and its
     /// limits, fullest first (an unused Fable window left out).
     public static func atUsage(_ account: UsageAccount) -> String {
-        guard account.readable else { return "\(account.label) (not readable)" }
+        guard account.readable else { return "\(account.name) (not readable)" }
         let parts = account.windows
             .filter { $0.kind != "weekly_scoped" || $0.pct > 0 }
             .sorted { $0.pct > $1.pct }
             .map { "\(percent($0.pct)) \($0.shortName)" }
-        return parts.isEmpty ? account.label : "\(account.label) at " + parts.joined(separator: " · ")
+        return parts.isEmpty ? account.name : "\(account.name) at " + parts.joined(separator: " · ")
     }
 
     /// "weekly 94% · session 27%", fullest first; "not readable".

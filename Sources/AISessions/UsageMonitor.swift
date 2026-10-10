@@ -20,9 +20,10 @@ final class UsageMonitor {
         /// The dashboard's "Use first" opt-outs, read with the reading.
         var excluded: Set<String> = []
 
-        /// The accounts whose crossings alert, in the snapshot's order.
+        /// The accounts whose crossings alert, in the snapshot's order. While
+        /// no sign-in can be read, only the ones named in the setting.
         var covered: [UsageAccount] {
-            guard let snapshot, !(scope.needsSignedIn && signedIn == nil) else { return [] }
+            guard let snapshot else { return [] }
             return snapshot.accounts.filter { scope.covers($0, signedIn: signedIn) }
         }
 
@@ -54,6 +55,10 @@ final class UsageMonitor {
     private var candidate: (emails: Set<String>?, polls: Int)?
     /// The last sign-in that named an account, to tell a switch from a return.
     private var lastKnown: Set<String>?
+    /// The accounts (record ids) the last poll's alerts followed.
+    private var previouslyCovered = Set<String>()
+    /// Each dashboard row's address as last read, for a scan that misses it.
+    private var knownEmails: [String: String] = [:]
     /// Polls in a row a new sign-in must hold before the alerts follow it;
     /// losing it altogether (logged out) takes longer.
     static let switchPolls = 2
@@ -148,7 +153,7 @@ final class UsageMonitor {
             guard let parsed = UsageSnapshot.parse(data, fetchedAt: now()) else {
                 return report("the dashboard's data.json was not in the expected shape")
             }
-            snapshot = parsed
+            snapshot = withKnownEmails(parsed)
         } catch {
             guard asked == generation else { return askAgain() }
             return report("the usage dashboard is not reachable at \(base.absoluteString)")
@@ -161,24 +166,24 @@ final class UsageMonitor {
         status = Status(snapshot: snapshot, problem: nil, signedIn: signedIn,
                         scope: UsageAlertScope(config.usageAlertAccounts),
                         excluded: SuggestExclusions.load(from: AppPaths.expand(config.usageExcludeFile)))
-        var alerts: [UsageAlert] = []
-        // Who is signed in decides whose alerts these are. Until that can be
-        // read nothing is evaluated: a guess would forget the real account's
-        // records (and announce them again) or announce someone else's.
-        if !(status.scope.needsSignedIn && status.signedIn == nil) {
-            let covered = Set(status.covered.map(\.key))
-            let firstRun = engine.isFirstRun
-            // Signed in to another account: whatever it crossed while the
-            // alerts followed the old one is news now.
-            if let joined = switchedTo, !joined.isEmpty {
-                engine.forget(snapshot.accounts.filter { $0.isSignedIn(joined) })
-            }
-            alerts = engine.evaluate(snapshot) { covered.contains($0.key) }
-            if firstRun {
-                let over = status.covered.flatMap { $0.windows.filter { $0.isOver(config.usageAlertThreshold, at: snapshot.fetchedAt) } }
-                Log.shared.info("usage alerts: first reading; \(over.count) window(s) already at "
-                    + "\(Int(config.usageAlertThreshold))%+ recorded without alerting")
-            }
+        // Every account is evaluated, so each keeps its own edge; only the
+        // followed ones are announced. While no sign-in can be read, the
+        // accounts named in the setting still are.
+        let covered = Set(status.covered.map(\.recordID))
+        let firstRun = engine.isFirstRun
+        // Signed in to another account: what it crossed while the alerts did
+        // not follow it is news now. One followed already (scope "all", a
+        // named account) keeps its records.
+        if let joined = switchedTo {
+            let newcomers = snapshot.accounts.filter { $0.isSignedIn(joined) && !previouslyCovered.contains($0.recordID) }
+            engine.forget(Set(newcomers.map(\.recordID)))
+        }
+        let alerts = engine.evaluate(snapshot).filter { covered.contains($0.account.recordID) }
+        previouslyCovered = covered
+        if firstRun {
+            let over = snapshot.accounts.flatMap { $0.windows.filter { $0.isOver(config.usageAlertThreshold, at: snapshot.fetchedAt) } }
+            Log.shared.info("usage alerts: first reading; \(over.count) window(s) already at "
+                + "\(Int(config.usageAlertThreshold))%+ recorded without alerting")
         }
         logCoverage()
         onStatus(status)
@@ -202,7 +207,10 @@ final class UsageMonitor {
         } else {
             let polls = candidate.map { $0.emails == seen ? $0.polls + 1 : 1 } ?? 1
             candidate = (seen, polls)
-            if polls >= (seen == nil ? Self.lossPolls : Self.switchPolls) {
+            // Losing an account (all of them, or one of several config dirs)
+            // waits longer than a switch: it is how a login begins.
+            let loss = seen.map { followed.map($0.isStrictSubset(of:)) ?? false } ?? true
+            if polls >= (loss ? Self.lossPolls : Self.switchPolls) {
                 adopt = true
                 candidate = nil
             }
@@ -217,17 +225,33 @@ final class UsageMonitor {
         return (followed, adopted.subtracting(previous))
     }
 
+    /// `snapshot` with each row's address filled in from earlier readings
+    /// when this scan missed it, so the row stays the same account.
+    private func withKnownEmails(_ snapshot: UsageSnapshot) -> UsageSnapshot {
+        var accounts = snapshot.accounts
+        for index in accounts.indices {
+            let key = accounts[index].key
+            if let email = accounts[index].email, !email.isEmpty {
+                knownEmails[key] = email
+            } else if let email = knownEmails[key] {
+                accounts[index].email = email
+            }
+        }
+        return UsageSnapshot(accounts: accounts, fetchedAt: snapshot.fetchedAt)
+    }
+
     /// One line whenever the accounts that alert change: at launch, after a
     /// sign-in to another account, or when the address is not on the dashboard.
     private func logCoverage() {
-        let labels = status.covered.map(\.label)
+        let labels = status.covered.map(\.name)
         let unknown = status.scope.needsSignedIn && status.signedIn == nil
-        let key = unknown ? ["?"] : labels
+        let key = (unknown ? ["?"] : []) + labels
         guard key != loggedCovered else { return }
         loggedCovered = key
         if unknown {
             let files = accounts.configDirs.map(\.path).joined(separator: ", ")
-            Log.shared.warn("usage alerts: cannot tell which Claude account is signed in (\(files)); none evaluated until it can")
+            Log.shared.warn("usage alerts: cannot tell which Claude account is signed in (\(files)); its alerts wait for it"
+                + (labels.isEmpty ? "" : "; still following " + labels.joined(separator: ", ")))
         } else if labels.isEmpty {
             let emails = (status.signedIn ?? []).sorted().joined(separator: ", ")
             Log.shared.warn("usage alerts: no dashboard account to follow" + (emails.isEmpty ? "" : " (signed in: \(emails))"))

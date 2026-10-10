@@ -172,11 +172,15 @@ enum UsageMenu {
             return over.isEmpty ? "Usage limits — all under \(threshold)%\(stale)"
                                 : "Usage limits — \(over.count) at \(threshold)%+\(stale)"
         }
-        if scope.needsSignedIn, state.status.signedIn == nil { return "Usage limits — can't tell which account is in use" }
         let covered = state.status.covered
+        if scope.needsSignedIn, state.status.signedIn == nil, covered.isEmpty {
+            return "Usage limits — can't tell which account is in use"
+        }
         switch covered.count {
         case 0:
-            guard let email = state.status.signedIn?.sorted().first else { return "Usage limits — no account followed" }
+            guard scope.current, let email = state.status.signedIn?.sorted().first else {
+                return "Usage limits — usageAlertAccounts names no account on the dashboard"
+            }
             return "Usage limits — \(email) is not on the dashboard"
         case 1:
             return "Usage limits — \(UsageText.atUsage(covered[0]))\(stale)"
@@ -191,11 +195,13 @@ enum UsageMenu {
     static func followed(_ state: State) -> String {
         let scope = state.status.scope
         if scope.everyAccount { return "Alerts for every account" }
-        if scope.needsSignedIn, state.status.signedIn == nil { return "Alerts wait: no Claude sign-in found" }
         let inUse = state.status.inUse
-        let labels = state.status.covered.map { inUse.contains($0.key) ? "\($0.label) (in use)" : $0.label }
-        return labels.isEmpty ? "Alerts for nobody: the account in use is not on the dashboard"
-                              : "Alerts for " + labels.joined(separator: ", ")
+        let labels = state.status.covered.map { inUse.contains($0.key) ? "\($0.name) (in use)" : $0.name }
+        let waiting = scope.needsSignedIn && state.status.signedIn == nil
+        if !labels.isEmpty { return "Alerts for " + labels.joined(separator: ", ") + (waiting ? "; no Claude sign-in found" : "") }
+        if waiting { return "Alerts wait: no Claude sign-in found" }
+        return scope.current ? "Alerts for nobody: the account in use is not on the dashboard"
+                             : "Alerts for nobody: usageAlertAccounts names no account on the dashboard"
     }
 
     /// A warning only for an account the alerts follow.

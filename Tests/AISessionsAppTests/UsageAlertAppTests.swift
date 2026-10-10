@@ -100,7 +100,7 @@ final class UsageAlertAppTests: XCTestCase {
     /// reading who is signed in from the scratch home's `~/.claude.json`.
     /// `delay` holds each answer back, as a dashboard busy rescanning does.
     private func monitor(for app: AppDelegate, _ dashboard: Dashboard, delay: UInt64 = 0,
-                         alertAccounts: [String]? = nil, excludeFile: URL? = nil) -> UsageMonitor {
+                         alertAccounts: [String]? = nil, excludeFile: URL? = nil, configDirs: [URL]? = nil) -> UsageMonitor {
         var config = app.config
         if let alertAccounts { config.usageAlertAccounts = alertAccounts }
         // Never the real ~/.ai-accounts file in a test.
@@ -115,7 +115,7 @@ final class UsageAlertAppTests: XCTestCase {
                                 return body
                             },
                             now: { [unowned self] in clockNow },
-                            accounts: { _ in SignedInAccounts(configDirs: [home.appendingPathComponent(".claude")], home: home) })
+                            accounts: { _ in SignedInAccounts(configDirs: configDirs ?? [home.appendingPathComponent(".claude")], home: home) })
     }
 
     /// Claude Code signed in as `label`'s account (nil: the file is gone).
@@ -148,16 +148,16 @@ final class UsageAlertAppTests: XCTestCase {
         await settle(app)
         XCTAssertEqual(center.posted.map(\.identifier), ["usage:claude|trimo|weekly_all"])
         let content = try XCTUnwrap(center.posted.first?.content)
-        XCTAssertEqual(content.title, "trimo: Claude weekly limit at 94%")
+        XCTAssertEqual(content.title, "Claude weekly limit at 94%")
         XCTAssertEqual(content.categoryIdentifier, Notifier.usageCategoryIdentifier)
         XCTAssertEqual(content.userInfo["openURL"] as? String, "http://127.0.0.1:8787")
-        XCTAssertEqual(content.subtitle, "renews in 2d 7h")
+        XCTAssertEqual(content.subtitle, "trimo · renews in 2d 7h")
         XCTAssertEqual(content.body, "Use first: cresswell-nexxatech (35% left).", "the dashboard's own pick")
         XCTAssertEqual(sent.count, 1)
         XCTAssertEqual(sent.first?.settings.chatId, 222)
         let html = sent.first?.html ?? ""
         XCTAssertTrue(html.hasPrefix("⚠️ <b>trimo</b> — Claude weekly at <b>94%</b>\n\n<b>Claude Code</b>\n"), html)
-        XCTAssertTrue(html.contains("trimo         28% 2h46m  94% 2d7h ⚠ ◀"), "with when each limit renews: \(html)")
+        XCTAssertTrue(html.contains("trimo         28% 2h46m 94% 2d7h ⚠ ◀"), "with when each limit renews: \(html)")
         XCTAssertTrue(html.hasSuffix("Use first: <b>cresswell-nexxatech</b>\nMost usage left: <b>cresswell-nexxatech</b>"), html)
         XCTAssertEqual(sent.first?.markup, .usageNowButton, "a button under the alert for a fresh report")
 
@@ -327,8 +327,8 @@ final class UsageAlertAppTests: XCTestCase {
         await settle(app)
         XCTAssertEqual(center.posted.map(\.identifier), ["usage:claude|trimo|weekly_all"])
         let html = sent.first?.html ?? ""
-        XCTAssertTrue(html.contains("trimo         28% 2h46m  92% 2d7h ⚠ ◀"), "the account in use is marked: \(html)")
-        XCTAssertTrue(html.contains("cresswell-nex 97% 2h46m  93% 2d7h ⚠\n"), "and only it")
+        XCTAssertTrue(html.contains("trimo         28% 2h46m 92% 2d7h ⚠ ◀"), "the account in use is marked: \(html)")
+        XCTAssertTrue(html.contains("cresswell-nex 97% 2h46m 93% 2d7h ⚠\n"), "and only it")
     }
 
     func testSigningInToAnAccountAlreadyOverTheLimitAlerts() async throws {
@@ -345,8 +345,8 @@ final class UsageAlertAppTests: XCTestCase {
         await monitor.poll()
         XCTAssertTrue(center.posted.isEmpty, "a new sign-in is followed once a second poll still sees it")
         await monitor.poll()
-        XCTAssertEqual(center.posted.map(\.content.title), ["CoreOS: Claude weekly limit at 100%"],
-                       "the account now in use is already at its limit")
+        XCTAssertEqual(center.posted.map { "\($0.content.title) / \($0.content.subtitle)" },
+                       ["Claude weekly limit at 100% / CoreOS · renews in 2d 7h"], "the account now in use is already at its limit")
         await monitor.poll()
         XCTAssertEqual(center.posted.count, 1, "once")
         try signIn("cresswell-nexxatech")
@@ -368,6 +368,112 @@ final class UsageAlertAppTests: XCTestCase {
         await monitor.poll()
         XCTAssertEqual(center.posted.first?.content.body, "All near a limit; CoreOS frees up first.",
                        "cresswell-nexxatech is opted out on the dashboard: not where to go")
+    }
+
+    func testUnderEveryAccountASwitchIsNotNewsAgain() async throws {
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard, alertAccounts: ["all"])
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 50, cresswellWeekly: 95)
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1, "cresswell crossed; every account is followed")
+        try signIn("cresswell-nexxatech")
+        for _ in 0..<3 { await monitor.poll() }
+        XCTAssertEqual(center.posted.count, 1, "this Mac switched to it: the alert was already given")
+    }
+
+    func testNamedAccountsAlertWhileTheSignInCannotBeRead() async throws {
+        try signIn(nil)
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard, alertAccounts: ["current", "cresswell-nexxatech"])
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 50, cresswellWeekly: 95)
+        await monitor.poll()
+        XCTAssertEqual(center.posted.map(\.identifier), ["usage:claude|cresswell-nexxatech|weekly_all"],
+                       "a named account does not wait for Claude's sign-in")
+        let state = UsageMenu.State(status: monitor.status)
+        XCTAssertEqual(UsageMenu.followed(state), "Alerts for cresswell-nexxatech; no Claude sign-in found")
+    }
+
+    func testOneOfTwoConfigDirsLosingItsAccountBrieflyIsNotASwitch() async throws {
+        let work = home.appendingPathComponent("profiles/work")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: ["oauthAccount": ["emailAddress": "cresswell-nexxatech@example.com"]])
+            .write(to: work.appendingPathComponent(".claude.json"))
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard, configDirs: [home.appendingPathComponent(".claude"), work])
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 95)
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1, "trimo crossed")
+        try signIn(nil) // a /login in ~/.claude, two polls long
+        await monitor.poll()
+        await monitor.poll()
+        try signIn("trimo")
+        for _ in 0..<3 { await monitor.poll() }
+        XCTAssertEqual(center.posted.count, 1, "back to the same account: not a switch, not news")
+    }
+
+    func testWideningTheSettingAnnouncesNothingOld() async throws {
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50) // CoreOS at 100% from before
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        var all = monitor.config
+        all.usageAlertAccounts = ["all"]
+        monitor.apply(all)
+        await monitor.poll()
+        await monitor.poll()
+        XCTAssertTrue(center.posted.isEmpty, "CoreOS was at its limit before the first reading: not news under any setting")
+    }
+
+    func testANoReportReplySaysWhy() async throws {
+        let app = makeApp()
+        XCTAssertEqual(app.noReportReason(), "📊 No usage reading yet: the dashboard at http://127.0.0.1:8787 is not answering.")
+        try Data(#"{"usageAlertsEnabled": false}"#.utf8).write(to: home.appendingPathComponent("config.json"))
+        let off = makeApp()
+        XCTAssertEqual(off.noReportReason(), "📊 Usage limits are off in AI Sessions (usageAlertsEnabled in config.json).")
+    }
+
+    func testUnderEveryAccountARowWithoutItsEmailIsStillTheSameAccount() async throws {
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard, alertAccounts: ["all"])
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 95)
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1)
+        dashboard.body = dashboardJSON(trimoWeekly: 95, trimoEmail: false) // the scan could not read trimo's profile
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1, "its address is remembered: the same account, the same crossing")
+    }
+
+    func testAReportAfterTheDashboardStoppedSaysHowOld() async throws {
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = nil
+        clockNow += 5 * 3600
+        let report = await app.usageReport() ?? ""
+        XCTAssertTrue(report.contains("⚠️ The dashboard is not answering: these numbers are from"), report)
+        XCTAssertTrue(report.contains("(5h ago)"), report)
+        XCTAssertTrue(report.hasSuffix("Use first: —\nMost usage left: —"), "no advice from old numbers: \(report)")
     }
 
     func testARowThatLosesItsEmailForAMomentIsNotAlertedTwice() async throws {
@@ -505,6 +611,8 @@ final class UsageAlertAppTests: XCTestCase {
         private var _calls: [(method: String, body: [String: Any])] = []
         var backlogNewest: Int64?
         var getUpdatesStatus = 200
+        /// Long polls that lose their connection before answering.
+        var dropsLeft = 0
 
         var calls: [(method: String, body: [String: Any])] { lock.withLock { _calls } }
         func sent() -> [[String: Any]] { calls.filter { $0.method == "sendMessage" }.map(\.body) }
@@ -514,6 +622,13 @@ final class UsageAlertAppTests: XCTestCase {
             { [self] request in
                 let method = request.url!.lastPathComponent
                 let body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any] ?? [:]
+                let dropped: Bool = lock.withLock {
+                    guard method == "getUpdates", (body["offset"] as? NSNumber)?.intValue != -1, dropsLeft > 0 else { return false }
+                    dropsLeft -= 1
+                    _calls.append((method, body))
+                    return true
+                }
+                if dropped { throw URLError(.networkConnectionLost) }
                 let (result, status): (Any, Int) = lock.withLock {
                     _calls.append((method, body))
                     guard method == "getUpdates" else { return (true, 200) }
@@ -589,7 +704,7 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual((reports.first?["chat_id"] as? NSNumber)?.int64Value, 222)
         let text = reports.first?["text"] as? String ?? ""
         XCTAssertTrue(text.hasPrefix("📊 <b>AI usage</b> · "), text)
-        XCTAssertTrue(text.contains("trimo         28% 2h46m  50% 2d7h ◀"), text)
+        XCTAssertTrue(text.contains("trimo         28% 2h46m 50% 2d7h ◀"), text)
         XCTAssertTrue(text.hasSuffix("Use first: <b>trimo</b>\nMost usage left: <b>trimo</b>"),
                       "same renewal for all: the less used first: \(text)")
         let keyboard = reports.first?["reply_markup"] as? [String: Any]
@@ -623,6 +738,30 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual(api.calls.filter { $0.method == "getUpdates" }.count, 1, "no retrying a revoked token")
         XCTAssertTrue(app.usageMenuState().telegramProblem?.contains("@BotFather") ?? false,
                       app.usageMenuState().telegramProblem ?? "no problem shown")
+    }
+
+    func testADroppedLongPollIsRiddenOutQuietly() async throws {
+        let api = FakeBotAPI()
+        api.dropsLeft = 3 // a Wi-Fi blip: three long polls lose their connection
+        try connectTelegram()
+        let app = makeApp()
+        let bot = TelegramBot(transport: api.transport(), clock: { [unowned self] in clockNow })
+        bot.pauseAfter = { _, _ in 0.01 }
+        app.telegramBot = bot
+        app.syncTelegramBot()
+        defer { bot.stop() }
+        var said: [String?] = []
+        let tellApp = bot.onProblem
+        bot.onProblem = { problem in
+            said.append(problem)
+            tellApp(problem)
+        }
+        try await until("listening again") {
+            api.calls.filter { $0.method == "getUpdates" && ($0.body["offset"] as? NSNumber)?.intValue != -1 }.count >= 5
+        }
+        XCTAssertEqual(said.compactMap { $0 }, [], "three drops in a row are routine: never shown")
+        XCTAssertNil(app.usageMenuState().telegramProblem)
+        XCTAssertTrue(bot.isListening)
     }
 
     func testTheBotStepsAsideWhileSetupReadsTheChat() async throws {
@@ -746,6 +885,14 @@ final class UsageAlertAppTests: XCTestCase {
                        "CoreOS at 100% is not the account in use: no warning on top")
         state.status.signedIn = ["someone@example.com"]
         XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — someone@example.com is not on the dashboard")
+        let signedIn = state.status.signedIn
+        state.status.scope = UsageAlertScope(["codex:typo"])
+        state.status.signedIn = ["trimo@example.com"]
+        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — usageAlertAccounts names no account on the dashboard",
+                       "the setting is the problem, not the sign-in")
+        XCTAssertEqual(UsageMenu.followed(state), "Alerts for nobody: usageAlertAccounts names no account on the dashboard")
+        state.status.scope = UsageAlertScope(["current"])
+        state.status.signedIn = signedIn
         state.status.signedIn = nil
         XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — can't tell which account is in use")
         XCTAssertEqual(UsageMenu.followed(state), "Alerts wait: no Claude sign-in found")
