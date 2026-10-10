@@ -229,6 +229,7 @@ final class TelegramTests: XCTestCase {
         XCTAssertNil(parse(message("/usage", chat: 999, from: 999)), "a stranger who found the bot")
         XCTAssertNil(parse(message("/usage", chat: 222, type: "group")), "not the private chat")
         XCTAssertNil(parse(message("/usage", from: 999)), "someone else in that chat")
+        XCTAssertNil(parse(message("/usage", chat: 999, from: nil)), "another chat, sender unknown")
         XCTAssertNil(parse(message("/usage", age: 3600)), "typed an hour ago, while the Mac slept")
 
         let tap: [String: Any] = ["update_id": 2, "callback_query": ["id": "cb-9", "data": "usage", "from": ["id": 222],

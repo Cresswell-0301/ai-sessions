@@ -349,20 +349,14 @@ final class UsageTests: XCTestCase {
 
     private func lines(_ html: String) -> [String] { html.components(separatedBy: "\n") }
 
-    func testTheReportShowsTheAccountInUseItsRenewalsAndTheAdvice() {
-        // now = Sat 10 Oct 02:40 UTC; sessions renew 05:26, weeks Mon 10:13.
+    func testTheReportIsTablesThenUseFirstAndMostUsageLeft() {
+        // The user's layout. now = Sat 10 Oct 02:40 UTC; sessions renew in
+        // 2h 46m, weeks in 2d 7h: each limit's cell says when it renews.
         let snap = snapshot([claude("cress", session: 69, weekly: 72), claude("full", session: 0, weekly: 100),
                              claude("roomy", session: 0, weekly: 53, weeklyResets: now.timeIntervalSince1970 + 6 * 86_400),
                              row("codex", "cx", [window("weekly", 37, resets: now.timeIntervalSince1970 + 3 * 86_400)])])
         XCTAssertEqual(lines(UsageText.reportMessage(view(snap, inUse: ["cress"]))), [
             "📊 <b>AI usage</b> · 02:40",
-            "<b>cress</b> · Claude · in use on this Mac",
-            "• Session 69% · renews in 2h 46m (05:26)",
-            "• Weekly 72% · renews in 2d 7h (Mon 10:13)",
-            "",
-            "👉 Use first: <b>cress</b> · 28% left · renews in 2d — the one you're on",
-            "    then <b>roomy</b> · 47% left · renews in 6d",
-            "📈 Most usage left: <b>roomy</b> · 47% left",
             "",
             "<b>Claude Code</b>",
             "<pre>account       session    week",
@@ -371,6 +365,9 @@ final class UsageTests: XCTestCase {
             "roomy         0%         53% 6d</pre>",
             "<b>Codex</b>",
             "<pre>cx            37% 3d</pre>",
+            "",
+            "Use first: <b>cress</b>",
+            "Most usage left: <b>roomy</b>",
         ])
     }
 
@@ -378,17 +375,18 @@ final class UsageTests: XCTestCase {
         let snap = snapshot([claude("tr<i>mo", session: 28, weekly: 94),
                              claude("roomy", session: 0, weekly: 53, weeklyResets: now.timeIntervalSince1970 + 6 * 86_400)])
         let html = UsageText.alertMessage([try crossing(snap, 0, "weekly_all")], view: view(snap, inUse: ["tr<i>mo"]))
-        XCTAssertEqual(Array(lines(html).prefix(7)), [
-            "⚠️ <b>tr&lt;i&gt;mo</b> — Claude weekly at <b>94%</b> · in use on this Mac",
-            "• Session 28% · renews in 2h 46m (05:26)",
-            "• Weekly 94% · renews in 2d 7h (Mon 10:13)",
+        XCTAssertEqual(lines(html), [
+            "⚠️ <b>tr&lt;i&gt;mo</b> — Claude weekly at <b>94%</b>",
             "",
-            "👉 Use first: <b>roomy</b> · 47% left · renews in 6d",
-            "📈 Most usage left: <b>roomy</b> · 47% left",
+            "<b>Claude Code</b>",
+            "<pre>account       session    week",
+            "tr&lt;i&gt;mo       28% 2h46m  94% 2d7h ⚠ ◀",
+            "roomy         0%         53% 6d</pre>",
             "",
+            "Use first: <b>roomy</b>",
+            "Most usage left: <b>roomy</b>",
         ])
         XCTAssertFalse(html.contains("<i>mo"), "labels are escaped, not markup")
-        XCTAssertTrue(html.contains("tr&lt;i&gt;mo       28% 2h46m  94% 2d7h ⚠ ◀"), html)
     }
 
     func testAdviceSkipsOptedOutAndStaleAccountsAndSaysWhenNobodyIsFree() {
@@ -403,10 +401,9 @@ final class UsageTests: XCTestCase {
                        "opted out on the dashboard")
         XCTAssertEqual(UsageAdvice.useFirst(snap.accounts, tool: "claude", excluded: excluded, now: now)?.account.label, "cress")
         let dark = snapshot([row("claude", "a", [], error: "Rate Limit"), row("claude", "b", [], error: "token expired — re-login")])
-        XCTAssertTrue(UsageText.reportMessage(view(dark)).contains("👉 Use first: no account is free with a fresh reading"))
+        XCTAssertTrue(UsageText.reportMessage(view(dark)).hasSuffix("Use first: —\nMost usage left: —"))
         let near = snapshot([claude("a", session: 91, weekly: 92), claude("b", session: 100, weekly: 100)])
-        XCTAssertTrue(UsageText.reportMessage(view(near)).contains("⏳ All near a limit: <b>a</b> frees up in 2d"),
-                      UsageText.reportMessage(view(near)))
+        XCTAssertTrue(UsageText.reportMessage(view(near)).contains("Use first: <b>a</b>"), "the one that frees up first")
     }
 
     func testAnAlertSendsTheUserElsewhere() throws {
@@ -418,16 +415,16 @@ final class UsageTests: XCTestCase {
         let alert = try crossing(snap, 0, "weekly_all")
         let v = view(snap, inUse: ["cress"])
         XCTAssertEqual(v.useFirst(tool: "claude")?.account.label, "edge", "the dashboard's own pick, unchanged")
-        XCTAssertTrue(UsageText.alertMessage([alert], view: v).contains("👉 Use first: <b>roomy</b> · 47% left · renews in 6d"))
+        XCTAssertTrue(UsageText.alertMessage([alert], view: v).contains("Use first: <b>roomy</b>\nMost usage left: <b>roomy</b>"))
         XCTAssertEqual(UsageText.notification(for: [alert], view: v).body, "Use first: roomy (47% left).")
-        XCTAssertTrue(UsageText.reportMessage(v).contains("👉 Use first: <b>edge</b> · 10% left"), "the report mirrors the dashboard")
+        XCTAssertTrue(UsageText.reportMessage(v).contains("Use first: <b>edge</b>\n"), "the report mirrors the dashboard")
 
         // Every account full: when work can go on, and where.
         let full = snapshot([claude("cress", session: 20, weekly: 95),
                              claude("other", session: 0, weekly: 100, weeklyResets: now.timeIntervalSince1970 + 3 * 3600)])
         let fullAlert = try crossing(full, 0, "weekly_all")
         XCTAssertTrue(UsageText.alertMessage([fullAlert], view: view(full, inUse: ["cress"]))
-            .contains("⏳ All near a limit: <b>other</b> frees up in 3h"))
+            .contains("Use first: <b>other</b>\nMost usage left: —"), "frees up first; nobody has room")
         XCTAssertEqual(UsageText.notification(for: [fullAlert], view: view(full)).body, "All near a limit; other frees up first.")
     }
 
@@ -497,8 +494,6 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(UsageText.clock(now.addingTimeInterval(3600), now: now, timeZone: utc), "03:40")
         XCTAssertEqual(UsageText.clock(now.addingTimeInterval(2 * 86_400), now: now, timeZone: utc), "Mon 02:40")
         XCTAssertEqual(UsageText.clock(now.addingTimeInterval(8 * 86_400), now: now, timeZone: utc), "18 Oct 02:40")
-        let idle = UsageWindow(kind: "session", label: "Session (5hr)", pct: 0)
-        XCTAssertEqual(UsageText.renewal(idle, view: view(snapshot([]))), "not started")
     }
 
     func testDurationsAndMenuRows() throws {

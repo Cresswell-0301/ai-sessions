@@ -156,10 +156,9 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual(sent.count, 1)
         XCTAssertEqual(sent.first?.settings.chatId, 222)
         let html = sent.first?.html ?? ""
-        XCTAssertTrue(html.hasPrefix("⚠️ <b>trimo</b> — Claude weekly at <b>94%</b> · in use on this Mac\n"
-            + "• Session 28% · renews in 2h 46m"), html)
-        XCTAssertTrue(html.contains("👉 Use first: <b>cresswell-nexxatech</b> · 35% left · renews in 2d"), html)
-        XCTAssertTrue(html.contains("📈 Most usage left: <b>cresswell-nexxatech</b> · 35% left"), html)
+        XCTAssertTrue(html.hasPrefix("⚠️ <b>trimo</b> — Claude weekly at <b>94%</b>\n\n<b>Claude Code</b>\n"), html)
+        XCTAssertTrue(html.contains("trimo         28% 2h46m  94% 2d7h ⚠ ◀"), "with when each limit renews: \(html)")
+        XCTAssertTrue(html.hasSuffix("Use first: <b>cresswell-nexxatech</b>\nMost usage left: <b>cresswell-nexxatech</b>"), html)
         XCTAssertEqual(sent.first?.markup, .usageNowButton, "a button under the alert for a fresh report")
 
         await monitor.poll() // still over: nothing new
@@ -388,6 +387,27 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual(center.posted.count, 1, "the same crossing: not news again")
     }
 
+    func testSwitchingBackToAnAccountThatCrossedRemindsOnce() async throws {
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 95)
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1, "trimo crossed")
+        try signIn("cresswell-nexxatech")
+        await monitor.poll()
+        await monitor.poll()
+        try signIn("trimo") // back, the same week
+        await monitor.poll()
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 2, "back on an account at 95%: said again")
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 2, "once")
+    }
+
     func testWhileNoSignInCanBeReadNothingIsEvaluated() async throws {
         let app = makeApp()
         let dashboard = Dashboard()
@@ -569,10 +589,9 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual((reports.first?["chat_id"] as? NSNumber)?.int64Value, 222)
         let text = reports.first?["text"] as? String ?? ""
         XCTAssertTrue(text.hasPrefix("📊 <b>AI usage</b> · "), text)
-        XCTAssertTrue(text.contains("<b>trimo</b> · Claude · in use on this Mac\n• Session 28% · renews in 2h 46m"), text)
-        XCTAssertTrue(text.contains("👉 Use first: <b>trimo</b> · 50% left · renews in 2d — the one you're on\n"
-            + "    then <b>cresswell-nexxatech</b> · 35% left"), "same renewal for all: the less used first: \(text)")
-        XCTAssertTrue(text.contains("📈 Most usage left: <b>trimo</b> · 50% left (in use)"), text)
+        XCTAssertTrue(text.contains("trimo         28% 2h46m  50% 2d7h ◀"), text)
+        XCTAssertTrue(text.hasSuffix("Use first: <b>trimo</b>\nMost usage left: <b>trimo</b>"),
+                      "same renewal for all: the less used first: \(text)")
         let keyboard = reports.first?["reply_markup"] as? [String: Any]
         XCTAssertEqual(keyboard?["is_persistent"] as? Bool, true, "the button stays under the chat")
         let polls = api.calls.filter { $0.method == "getUpdates" }.compactMap { ($0.body["offset"] as? NSNumber)?.intValue }

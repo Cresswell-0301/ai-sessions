@@ -166,12 +166,21 @@ accounts' sign-ins.
 3. Confirm the name it found. A first message, with every account's usage,
    arrives right away. The token is also cleared from the clipboard.
 
-**What the messages say.** An alert names the limit that crossed, then the
-account's session and weekly limits with when each renews ("Session 64% ·
-renews in 3h 27m (13:50)"), the account to **use first** — the dashboard's own
-pick, leaving out the account that just crossed and any account already at the
-threshold — and the one with the **most usage left**, then every account's
-limits with when they renew (◀ marks the one this Mac uses).
+**What the messages say.** An alert names the limit that crossed; then, as in
+every report, a *Claude Code* and a *Codex* table give each account's limits
+with when each renews ("77% 3h10m": 77% used, renews in 3 h 10 min; ◀ marks the
+account this Mac uses, ⚠ one at the threshold), and two names close it:
+
+```
+Use first: looiytube2
+Most usage left: looiytube2
+```
+
+*Use first* is the dashboard's own pick (the account whose week renews soonest
+among those with room, so its quota is not wasted; accounts opted out on the
+dashboard are skipped). In an alert it leaves out every account already at the
+threshold, so it names somewhere to go; when there is nowhere, the account that
+frees up first. *Most usage left* is the account with the most room now.
 
 **The Usage button.** *📊 Usage* stays under the chat: tap it (or send
 `/usage`) any time for the same report about now. An alert carries a *📊 Usage

@@ -522,10 +522,20 @@ public enum UsageText {
     /// Rows per table before "…and N more" (eleven accounts today).
     static let maxTableRows = 30
 
-    /// The Telegram alert (parse_mode HTML) for one tick's crossings: what
-    /// crossed, each crossing account's limits with when they renew, the
-    /// account to use first, the one with the most usage left, and every
-    /// account's limits.
+    /// The Telegram alert (parse_mode HTML) for one tick's crossings, in the
+    /// user's layout: what crossed, every account's limits with when they
+    /// renew, then the account to use first and the one with the most usage
+    /// left, by name.
+    ///
+    ///     ⚠️ cresswell-nexxatech — Claude weekly at 91%
+    ///
+    ///     Claude Code
+    ///     <table>
+    ///     Codex
+    ///     <table>
+    ///
+    ///     Use first: looiytube2
+    ///     Most usage left: looiytube2
     public static func alertMessage(_ alerts: [UsageAlert], view: UsageView) -> String {
         let reached = alerts.contains { $0.window.pct.rounded() >= 100 }
         var blocks: [String] = []
@@ -535,89 +545,45 @@ public enum UsageText {
             let crossed = alerts.filter { $0.account.key == alert.account.key }
                 .map { "\(html($0.window.shortName)) at <b>\(percent($0.window.pct))</b>" }
                 .joined(separator: ", ")
-            blocks.append("\(reached ? "⛔️" : "⚠️") <b>\(html(alert.account.label))</b> — \(alert.account.toolName) \(crossed)"
-                + (view.inUse.contains(alert.account.key) ? " · in use on this Mac" : ""))
-            blocks.append(windowLines(alert.account, view: view))
+            blocks.append("\(reached ? "⛔️" : "⚠️") <b>\(html(alert.account.label))</b> — \(alert.account.toolName) \(crossed)")
         }
         blocks.append("")
+        blocks += tableBlocks(view)
+        blocks.append("")
         blocks += adviceLines(view.leaving(), tools: adviceTool(view, alerts: alerts).map { [$0] } ?? [])
-        return fit(blocks + [""] + tableBlocks(view))
+        return fit(blocks)
     }
 
-    /// The usage report: the account this Mac uses with when its limits
-    /// renew, the account to use first, the one with the most usage left and
-    /// every account's limits. `lead` replaces the "📊 AI usage" title.
+    /// The usage report, in the same layout: every account's limits with when
+    /// they renew, then use first and most usage left. `lead` replaces the
+    /// "📊 AI usage" title.
     public static func reportMessage(_ view: UsageView, lead: String? = nil) -> String {
         var blocks = [lead ?? "📊 <b>AI usage</b> · \(clock(view.now, now: view.now, timeZone: view.timeZone))"]
         if view.followed.isEmpty {
             blocks.append(view.signedInKnown ? "No account on the dashboard matches the one this Mac is signed into."
                                              : "Can't tell which Claude account this Mac is signed into.")
         }
-        for account in view.followed {
-            blocks.append("<b>\(html(account.label))</b> · \(account.toolName)"
-                + (view.inUse.contains(account.key) ? " · in use on this Mac" : ""))
-            blocks.append(windowLines(account, view: view))
-        }
+        blocks.append("")
+        blocks += tableBlocks(view)
         blocks.append("")
         var tools = view.followed.map(\.tool).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
         if tools.isEmpty { tools = ["claude"] }
         blocks += adviceLines(view, tools: tools)
-        return fit(blocks + [""] + tableBlocks(view))
+        return fit(blocks)
     }
 
-    /// "• Session 64% · renews in 3h 27m (13:50)", one line per limit the
-    /// account has (an unused Fable limit left out).
-    static func windowLines(_ account: UsageAccount, view: UsageView) -> String {
-        guard account.readable else { return "• not readable just now" + (account.error.map { " (\(html($0)))" } ?? "") }
-        let order = ["session": 0, "five_hour": 0, "weekly_all": 1, "weekly": 1, "weekly_scoped": 2]
-        return account.windows
-            .filter { $0.kind != "weekly_scoped" || $0.pct > 0 }
-            .enumerated()
-            .sorted { (order[$0.element.kind] ?? 3, $0.offset) < (order[$1.element.kind] ?? 3, $1.offset) }
-            .map { "• \(html(capitalized($0.element.shortName))) \(percent($0.element.pct)) · " + renewal($0.element, view: view) }
-            .joined(separator: "\n")
-    }
-
-    /// "renews in 3h 27m (13:50)"; "not started" for an idle session.
-    static func renewal(_ window: UsageWindow, view: UsageView) -> String {
-        guard let resets = window.resetsAt else { return window.pct > 0 ? "no renewal time given" : "not started" }
-        guard let left = until(resets, now: view.now) else { return "renewed, new reading due" }
-        return "renews in \(left) (\(clock(resets, now: view.now, timeZone: view.timeZone)))"
-    }
-
-    /// The pick to use first, and the account with the most usage left, per tool.
+    /// "Use first: looiytube2" and "Most usage left: looiytube2", per tool,
+    /// names only. When no account is free (an alert's view leaves out every
+    /// account at the threshold), use first is the one that frees up first.
     static func adviceLines(_ view: UsageView, tools: [String]) -> [String] {
         var lines: [String] = []
         for tool in tools {
             let name = tools.count > 1 ? " (\(toolName(tool)))" : ""
-            if let pick = view.useFirst(tool: tool) ?? (view.ownExcluded == nil ? nil : view.freesUpFirst(tool: tool)) {
-                lines.append(useFirstLine(pick, name: name, view: view))
-                if pick.mode == .safe, view.inUse.contains(pick.account.key),
-                   let next = view.useFirst(tool: tool, excluding: pick.account) {
-                    lines.append("    then " + useFirstLine(next, name: "", view: view, bare: true))
-                }
-            } else {
-                lines.append("👉 Use first\(name): no account is free with a fresh reading")
-            }
-            if let most = view.mostLeft(tool: tool) {
-                lines.append("📈 Most usage left\(name): <b>\(html(most.account.label))</b> · \(most.left)% left"
-                    + (view.inUse.contains(most.account.key) ? " (in use)" : ""))
-            }
+            let pick = view.useFirst(tool: tool) ?? (view.ownExcluded == nil ? nil : view.freesUpFirst(tool: tool))
+            lines.append("Use first\(name): " + (pick.map { "<b>\(html($0.account.label))</b>" } ?? "—"))
+            lines.append("Most usage left\(name): " + (view.mostLeft(tool: tool).map { "<b>\(html($0.account.label))</b>" } ?? "—"))
         }
         return lines
-    }
-
-    private static func useFirstLine(_ pick: UseFirst, name: String, view: UsageView, bare: Bool = false) -> String {
-        let label = "<b>\(html(pick.account.label))</b>"
-        switch pick.mode {
-        case .safe:
-            let renews = pick.hours.map { " · renews in " + UsageAdvice.span($0) } ?? ""
-            let mine = view.inUse.contains(pick.account.key) ? " — the one you're on" : ""
-            return (bare ? "" : "👉 Use first\(name): ") + "\(label) · \(pick.left)% left\(renews)\(mine)"
-        case .fallback:
-            let frees = pick.hours.flatMap { $0.isFinite ? "in " + UsageAdvice.span($0) : nil } ?? "later"
-            return (bare ? "" : "⏳ All near a limit\(name): ") + "\(label) frees up \(frees)"
-        }
     }
 
     /// Which tool's accounts to advise on for these alerts: Claude first.
@@ -704,8 +670,6 @@ public enum UsageText {
         }
         return formatter.string(from: date)
     }
-
-    static func capitalized(_ text: String) -> String { text.prefix(1).uppercased() + text.dropFirst() }
 
     private static func table(_ rows: [String]) -> String {
         "<pre>" + html(rows.joined(separator: "\n")) + "</pre>"
