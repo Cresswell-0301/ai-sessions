@@ -15,10 +15,9 @@ enum TelegramSetup {
     /// the user cancelled. `snapshot`'s usage goes into the welcome message.
     /// While a setup is open this only brings it forward and returns false.
     @discardableResult
-    static func run(snapshot: UsageSnapshot?, threshold: Double, inUse: Set<String> = [],
-                    completion: @escaping (TelegramSettings?) -> Void) -> Bool {
+    static func run(view: UsageView?, completion: @escaping (TelegramSettings?) -> Void) -> Bool {
         NSApp.activate(ignoringOtherApps: true)
-        return run({ await flow(snapshot: snapshot, threshold: threshold, inUse: inUse) }, completion: completion)
+        return run({ await flow(view: view) }, completion: completion)
     }
 
     /// The guard around any flow (tests pass one that waits on them).
@@ -34,7 +33,7 @@ enum TelegramSetup {
         return true
     }
 
-    private static func flow(snapshot: UsageSnapshot?, threshold: Double, inUse: Set<String>) async -> TelegramSettings? {
+    private static func flow(view: UsageView?) async -> TelegramSettings? {
         // 1. The token.
         var client: TelegramClient
         var bot: TelegramClient.Bot
@@ -82,7 +81,8 @@ enum TelegramSetup {
             break
         }
         // 3. Save, then prove it with a first message.
-        let settings = TelegramSettings(botToken: client.token, chatId: chat.id, botUsername: bot.username, chatName: chat.name)
+        let settings = TelegramSettings(botToken: client.token, chatId: chat.id, botUsername: bot.username, chatName: chat.name,
+                                        keyboardShown: true)
         do {
             try settings.save()
         } catch {
@@ -90,11 +90,11 @@ enum TelegramSetup {
             return nil
         }
         let cleared = clearClipboard(ifItHolds: client.token)
-        let welcome = UsageText.telegram(
-            lead: "✅ <b>AI Sessions is connected.</b>\nYou will get a message here when a Claude or Codex usage limit passes the alert threshold.",
-            snapshot: snapshot, threshold: threshold, inUse: inUse)
+        let lead = "✅ <b>AI Sessions is connected.</b>\nYou will get a message here when the account this Mac uses passes "
+            + "the usage alert threshold. Tap <b>📊 Usage</b> below (or send /usage) any time to see it now."
+        let welcome = view.map { UsageText.reportMessage($0, lead: lead) } ?? lead
         do {
-            try await client.send(html: welcome, to: chat.id)
+            try await client.send(html: welcome, to: chat.id, markup: .usageKeyboard)
             Log.shared.info("Telegram connected: \(settings.summary)")
             show("Telegram is connected", "Usage alerts will also go to \(settings.summary). A first message is waiting there."
                 + (cleared ? "\n\nThe token was also cleared from the clipboard." : ""))

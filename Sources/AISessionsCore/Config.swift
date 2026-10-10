@@ -35,6 +35,9 @@ public struct Config: Codable, Equatable, Sendable {
     /// by its dashboard label ("trimo"), tool and label ("codex:nexxaflo") or
     /// email. A single string is read as a list of one.
     public var usageAlertAccounts: [String] = ["current"]
+    /// The dashboard's opt-outs from its "Use first" pick, honoured by the
+    /// alerts' advice so both name the same account.
+    public var usageExcludeFile: String = "~/.ai-accounts/.suggest-exclude.json"
 
     public init() {}
 
@@ -42,7 +45,7 @@ public struct Config: Codable, Equatable, Sendable {
         case notificationsEnabled, sound, minTurnSecondsToNotify, claudeConfigDirs,
              codexHomes, codexRecentHours, showAutomationSessions, pollIntervalSeconds,
              usageAlertsEnabled, usageAlertThreshold, usageDashboardURL, usagePollSeconds, telegramAlerts,
-             usageAlertAccounts
+             usageAlertAccounts, usageExcludeFile
     }
 
     public init(from decoder: Decoder) throws {
@@ -64,6 +67,7 @@ public struct Config: Codable, Equatable, Sendable {
         usageAlertAccounts = (try? c.decodeIfPresent([String].self, forKey: .usageAlertAccounts))
             ?? (try? c.decodeIfPresent(String.self, forKey: .usageAlertAccounts)).flatMap { $0.map { [$0] } }
             ?? d.usageAlertAccounts
+        usageExcludeFile = (try? c.decodeIfPresent(String.self, forKey: .usageExcludeFile)) ?? d.usageExcludeFile
     }
 
     /// The settings a process starts with (see `launch`).

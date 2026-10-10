@@ -103,6 +103,7 @@ warning until the file is fixed.
 | `usagePollSeconds` | `60` | How often to read it (limited to 15–3600) |
 | `telegramAlerts` | `true` | Also send usage alerts to the connected Telegram chat |
 | `usageAlertAccounts` | `["current"]` | Whose limits alert: `"current"` (the account in use), `"all"`, or accounts by dashboard label (`"trimo"`), tool and label (`"codex:nexxaflo"`) or email |
+| `usageExcludeFile` | `"~/.ai-accounts/.suggest-exclude.json"` | The dashboard's opt-outs from its "Use first" pick, honoured by the alerts' advice |
 
 ```json
 { "minTurnSecondsToNotify": 30, "sound": false }
@@ -165,6 +166,20 @@ accounts' sign-ins.
 3. Confirm the name it found. A first message, with every account's usage,
    arrives right away. The token is also cleared from the clipboard.
 
+**What the messages say.** An alert names the limit that crossed, then the
+account's session and weekly limits with when each renews ("Session 64% ·
+renews in 3h 27m (13:50)"), the account to **use first** — the dashboard's own
+pick, leaving out the account that just crossed and any account already at the
+threshold — and the one with the **most usage left**, then every account's
+limits with when they renew (◀ marks the one this Mac uses).
+
+**The Usage button.** *📊 Usage* stays under the chat: tap it (or send
+`/usage`) any time for the same report about now. An alert carries a *📊 Usage
+now* button too. Only your own chat is answered; anyone else who finds the bot
+gets nothing. The app listens with Telegram's long polling while Telegram is
+connected, steps aside while the setup runs, and does not answer taps made while
+the Mac was asleep or the app was not running (they would be old).
+
 The token is kept in `state/telegram.json`, readable by you alone, and never in
 `config.json` or the log. Use a bot made only for these alerts: the setup reads
 the bot's incoming messages, so a bot that sends them to a webhook, or that
@@ -214,6 +229,7 @@ $AISESSIONS --route claude:9eb4   # print how it would get back to a session (ke
 $AISESSIONS --route claude:9eb4 --open   # …and do it
 $AISESSIONS --test-notification   # ask the running app for a sample banner (optionally: a session key)
 $AISESSIONS --usage               # every account's usage limits, as the alerts see them
+$AISESSIONS --usage-report        # print the report the Telegram 📊 Usage button sends (sends nothing)
 $AISESSIONS --telegram-test       # send a test message to the connected Telegram chat
 $AISESSIONS --version
 ```

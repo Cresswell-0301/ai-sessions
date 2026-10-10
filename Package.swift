@@ -27,7 +27,9 @@ let package = Package(
         .testTarget(
             name: "AISessionsCoreTests",
             dependencies: ["AISessionsCore"],
-            path: "Tests/AISessionsCoreTests"
+            path: "Tests/AISessionsCoreTests",
+            // Read by path (#filePath), not bundled.
+            exclude: ["Fixtures"]
         ),
         // App-layer logic (menu text, notification policy, state files, routing
         // execution) — @testable import of the executable target.

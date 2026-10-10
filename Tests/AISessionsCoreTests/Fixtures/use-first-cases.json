@@ -1,0 +1,2024 @@
+{
+ "source": "the ai-accounts dashboard page script recommend()/pickChip(), run verbatim in node with a pinned clock (2026-10-10); synthetic accounts only",
+ "cases": [
+  {
+   "name": "V01 earliest weekly renew beats more headroom",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 20,
+        "left": 80,
+        "resets": 1791608416.0
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791705616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791957616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "A",
+     "mode": "safe",
+     "used": 50,
+     "left": 50,
+     "chip": "Use first → A · 50% left · renews in 30h"
+    }
+   }
+  },
+  {
+   "name": "V02 a 95% session disqualifies even with low weekly",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 95,
+        "left": 5,
+        "resets": 1791604816.0
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 20,
+        "left": 80,
+        "resets": 1791633616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 40,
+        "left": 60,
+        "resets": 1791777616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "B",
+     "mode": "safe",
+     "used": 40,
+     "left": 60,
+     "chip": "Use first → B · 60% left · renews in 2d"
+    }
+   }
+  },
+  {
+   "name": "V03 exactly 90% used is still safe (headroom 10 >= 10)",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 90,
+        "left": 10,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 0,
+        "left": 100,
+        "resets": 1791957616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "A",
+     "mode": "safe",
+     "used": 90,
+     "left": 10,
+     "chip": "Use first → A · 10% left · renews in 5h"
+    }
+   }
+  },
+  {
+   "name": "V04 90.5% used is not safe",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 90.5,
+        "left": 9.5,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 0,
+        "left": 100,
+        "resets": 1791957616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "B",
+     "mode": "safe",
+     "used": 0,
+     "left": 100,
+     "chip": "Use first → B · 100% left · renews in 4d"
+    }
+   }
+  },
+  {
+   "name": "V05 weekly_scoped (Fable) counts toward the binding window",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791608416.0
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 40,
+        "left": 60,
+        "resets": 1791669616.0
+       },
+       {
+        "label": "Weekly Fable",
+        "kind": "weekly_scoped",
+        "pct": 92,
+        "left": 8,
+        "resets": 1791669616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 70,
+        "left": 30,
+        "resets": 1791849616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "B",
+     "mode": "safe",
+     "used": 70,
+     "left": 30,
+     "chip": "Use first → B · 30% left · renews in 3d"
+    }
+   }
+  },
+  {
+   "name": "V06 same weekly reset epoch -> lower used% wins (lo listed first)",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "lo",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 30,
+        "left": 70,
+        "resets": 1791684016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "hi",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 60,
+        "left": 40,
+        "resets": 1791684016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "lo",
+     "mode": "safe",
+     "used": 30,
+     "left": 70,
+     "chip": "Use first → lo · 70% left · renews in 24h"
+    }
+   }
+  },
+  {
+   "name": "V06b same weekly reset epoch -> lower used% wins (hi listed first)",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "hi",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 60,
+        "left": 40,
+        "resets": 1791684016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "lo",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 30,
+        "left": 70,
+        "resets": 1791684016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "lo",
+     "mode": "safe",
+     "used": 30,
+     "left": 70,
+     "chip": "Use first → lo · 70% left · renews in 24h"
+    }
+   }
+  },
+  {
+   "name": "V07 full tie -> label, case-sensitive difference (alpha vs Beta)",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "alpha",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791684016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "Beta",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791684016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "alpha",
+     "mode": "safe",
+     "used": 50,
+     "left": 50,
+     "chip": "Use first → alpha · 50% left · renews in 24h"
+    }
+   }
+  },
+  {
+   "name": "V07b full tie -> label (Beta listed first)",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "Beta",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791684016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "alpha",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791684016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "alpha",
+     "mode": "safe",
+     "used": 50,
+     "left": 50,
+     "chip": "Use first → alpha · 50% left · renews in 24h"
+    }
+   }
+  },
+  {
+   "name": "V08 excluded by tool:email key",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": "a@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791633616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": "b@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791669616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [
+    "claude:a@x.com"
+   ],
+   "expect": {
+    "claude": {
+     "label": "B",
+     "mode": "safe",
+     "used": 50,
+     "left": 50,
+     "chip": "Use first → B · 50% left · renews in 20h"
+    }
+   }
+  },
+  {
+   "name": "V09 no email -> key is tool:label; a label key does not exclude a row that has an email",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "slot9",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791633616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": "a@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791651616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": "b@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791669616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [
+    "claude:slot9",
+    "claude:A"
+   ],
+   "expect": {
+    "claude": {
+     "label": "A",
+     "mode": "safe",
+     "used": 50,
+     "left": 50,
+     "chip": "Use first → A · 50% left · renews in 15h"
+    }
+   }
+  },
+  {
+   "name": "V10 exclusion is per tool (claude:t@x.com does not exclude the codex row)",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "trimo",
+     "tool": "claude",
+     "email": "t@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "tcodex",
+     "tool": "codex",
+     "email": "t@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly",
+        "pct": 23,
+        "left": 77,
+        "resets": 1791946816.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "ncodex",
+     "tool": "codex",
+     "email": "n@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly",
+        "pct": 37,
+        "left": 63,
+        "resets": 1792137616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "other",
+     "tool": "claude",
+     "email": "o@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 60,
+        "left": 40,
+        "resets": 1791741616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [
+    "claude:t@x.com"
+   ],
+   "expect": {
+    "claude": {
+     "label": "other",
+     "mode": "safe",
+     "used": 60,
+     "left": 40,
+     "chip": "Use first → other · 40% left · renews in 40h"
+    },
+    "codex": {
+     "label": "tcodex",
+     "mode": "safe",
+     "used": 23,
+     "left": 77,
+     "chip": "Use first → tcodex · 77% left · renews in 4d"
+    }
+   }
+  },
+  {
+   "name": "V11 unreadable/dead/rate-limited/stale rows never qualify; a benign error does not disqualify",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "dead1",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": "token expired — re-login"
+     }
+    },
+    {
+     "label": "dead2",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": "refresh failed: invalid_grant — re-login"
+     }
+    },
+    {
+     "label": "dead3",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [],
+      "as_of": null,
+      "error": "not signed in"
+     }
+    },
+    {
+     "label": "rl",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 5,
+        "left": 95,
+        "resets": 1791601216.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": "Rate Limit"
+     }
+    },
+    {
+     "label": "stale",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 5,
+        "left": 95,
+        "resets": 1791604816.0
+       }
+      ],
+      "as_of": 1791596416.0,
+      "error": null
+     }
+    },
+    {
+     "label": "oldDead",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 5,
+        "left": 95,
+        "resets": 1791604816.0
+       }
+      ],
+      "as_of": 1791585616.0,
+      "error": null
+     }
+    },
+    {
+     "label": "nolimits",
+     "tool": "claude",
+     "email": null,
+     "limits": null
+    },
+    {
+     "label": "nowin",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "benign",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 60,
+        "left": 40,
+        "resets": 1791885616.0
+       }
+      ],
+      "as_of": 1791597436.0,
+      "error": "HTTP 500"
+     }
+    },
+    {
+     "label": "edge14_9",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791957616.0
+       }
+      ],
+      "as_of": 1791596722.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "benign",
+     "mode": "safe",
+     "used": 60,
+     "left": 40,
+     "chip": "Use first → benign · 40% left · renews in 3d"
+    }
+   }
+  },
+  {
+   "name": "V12 codex fresh window is 75 min",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "cA",
+     "tool": "codex",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791633616.0
+       }
+      ],
+      "as_of": 1791593176.0,
+      "error": null
+     }
+    },
+    {
+     "label": "cB",
+     "tool": "codex",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791593056.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "codex": {
+     "label": "cA",
+     "mode": "safe",
+     "used": 50,
+     "left": 50,
+     "chip": "Use first → cA · 50% left · renews in 10h"
+    }
+   }
+  },
+  {
+   "name": "V13 codex has no weekly_all: renew window = binding window (5h can lead)",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "cA",
+     "tool": "codex",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "five_hour",
+        "pct": 60,
+        "left": 40,
+        "resets": 1791604816.0
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly",
+        "pct": 30,
+        "left": 70,
+        "resets": 1791957616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "cB",
+     "tool": "codex",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791777616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "codex": {
+     "label": "cA",
+     "mode": "safe",
+     "used": 60,
+     "left": 40,
+     "chip": "Use first → cA · 40% left · renews in 2h"
+    }
+   }
+  },
+  {
+   "name": "V14 renew window without a reset time sorts after any finite reset",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "left": 90,
+        "resets": null
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 70,
+        "left": 30,
+        "resets": 1792137616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "B",
+     "mode": "safe",
+     "used": 70,
+     "left": 30,
+     "chip": "Use first → B · 30% left · renews in 6d"
+    }
+   }
+  },
+  {
+   "name": "V14b only a no-reset account -> picked, no 'renews' suffix",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 0,
+        "left": 100,
+        "resets": null
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "left": 90,
+        "resets": null
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "A",
+     "mode": "safe",
+     "used": 10,
+     "left": 90,
+     "chip": "Use first → A · 90% left"
+    }
+   }
+  },
+  {
+   "name": "V15 a weekly reset already in the past sorts first (negative hours)",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791594016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "A",
+     "mode": "safe",
+     "used": 50,
+     "left": 50,
+     "chip": "Use first → A · 50% left · renews in 0h"
+    }
+   }
+  },
+  {
+   "name": "V16 fallback: nobody safe -> latest over-limit reset that is soonest",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 100,
+        "left": 0,
+        "resets": 1791705616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 92,
+        "left": 8,
+        "resets": 1791604816.0
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 95,
+        "left": 5,
+        "resets": 1791633616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "B",
+     "mode": "fallback",
+     "used": 95,
+     "left": 5,
+     "chip": "All near limit — B frees up in 10h"
+    }
+   }
+  },
+  {
+   "name": "V17 fallback: an account is gated by its LATEST over-limit window",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 0,
+        "left": 100,
+        "resets": null
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 100,
+        "left": 0,
+        "resets": 1791777616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 100,
+        "left": 0,
+        "resets": 1791601216.0
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 95,
+        "left": 5,
+        "resets": 1791813616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "A",
+     "mode": "fallback",
+     "used": 100,
+     "left": 0,
+     "chip": "All near limit — A frees up in 2d"
+    }
+   }
+  },
+  {
+   "name": "V18 fallback: over-limit windows with no reset time -> Infinity, 'later'; finite wins",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "cB",
+     "tool": "codex",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Usage",
+        "kind": "usage",
+        "pct": 100,
+        "left": 0,
+        "resets": null
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "cA",
+     "tool": "codex",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Usage",
+        "kind": "usage",
+        "pct": 100,
+        "left": 0,
+        "resets": null
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "codex": {
+     "label": "cA",
+     "mode": "fallback",
+     "used": 100,
+     "left": 0,
+     "chip": "All near limit — cA frees up later"
+    }
+   }
+  },
+  {
+   "name": "V18b fallback: finite reset beats Infinity",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "cB",
+     "tool": "codex",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Usage",
+        "kind": "usage",
+        "pct": 100,
+        "left": 0,
+        "resets": null
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "cC",
+     "tool": "codex",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly",
+        "pct": 100,
+        "left": 0,
+        "resets": 1792317616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "codex": {
+     "label": "cC",
+     "mode": "fallback",
+     "used": 100,
+     "left": 0,
+     "chip": "All near limit — cC frees up in 8d"
+    }
+   }
+  },
+  {
+   "name": "V19 nothing eligible -> no suggestion",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": "a@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791595816.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [
+    "claude:a@x.com"
+   ],
+   "expect": {
+    "claude": null
+   }
+  },
+  {
+   "name": "V20 excluded safe account is not used; fallback among the rest",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": "a@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "left": 90,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": "b@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 100,
+        "left": 0,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [
+    "claude:a@x.com"
+   ],
+   "expect": {
+    "claude": {
+     "label": "B",
+     "mode": "fallback",
+     "used": 100,
+     "left": 0,
+     "chip": "All near limit — B frees up in 5h"
+    }
+   }
+  },
+  {
+   "name": "V21 rounding: 87.5% used, renew 22.5h",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 87.5,
+        "left": 12.5,
+        "resets": 1791678616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "A",
+     "mode": "safe",
+     "used": 88,
+     "left": 13,
+     "chip": "Use first → A · 13% left · renews in 23h"
+    }
+   }
+  },
+  {
+   "name": "V21b rounding: renew 60h = 2.5 days",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 40,
+        "left": 60,
+        "resets": 1791813616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "A",
+     "mode": "safe",
+     "used": 40,
+     "left": 60,
+     "chip": "Use first → A · 60% left · renews in 3d"
+    }
+   }
+  },
+  {
+   "name": "V22 binding tie inside a row keeps the FIRST window; renew still weekly_all",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791608416.0
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 50,
+        "left": 50,
+        "resets": 1791741616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "A",
+     "mode": "safe",
+     "used": 50,
+     "left": 50,
+     "chip": "Use first → A · 50% left · renews in 40h"
+    }
+   }
+  },
+  {
+   "name": "V23 live shape: 100% account renewing soonest is skipped",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "looizijian7",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 0,
+        "left": 100,
+        "resets": null
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 100,
+        "left": 0,
+        "resets": 1791608416.0
+       },
+       {
+        "label": "Weekly Fable",
+        "kind": "weekly_scoped",
+        "pct": 0,
+        "left": 100,
+        "resets": 1791608416.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "cresswell-nexxatech",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 46,
+        "left": 54,
+        "resets": 1791611404.0
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 65,
+        "left": 35,
+        "resets": 1791676816.0
+       },
+       {
+        "label": "Weekly Fable",
+        "kind": "weekly_scoped",
+        "pct": 0,
+        "left": 100,
+        "resets": 1791676816.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "looiytube2",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 0,
+        "left": 100,
+        "resets": null
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 53,
+        "left": 47,
+        "resets": 1792101616.0
+       },
+       {
+        "label": "Weekly Fable",
+        "kind": "weekly_scoped",
+        "pct": 0,
+        "left": 100,
+        "resets": 1792101616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "cresswell-nexxatech",
+     "mode": "safe",
+     "used": 65,
+     "left": 35,
+     "chip": "Use first → cresswell-nexxatech · 35% left · renews in 22h"
+    }
+   }
+  },
+  {
+   "name": "V24 everything excluded -> no suggestion (no fallback to excluded rows)",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A",
+     "tool": "claude",
+     "email": "a@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": "b@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 20,
+        "resets": 1791630016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "cx",
+     "tool": "codex",
+     "email": "a@x.com",
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly",
+        "pct": 5,
+        "resets": 1791630016.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [
+    "claude:a@x.com",
+    "claude:b@x.com",
+    "codex:a@x.com"
+   ],
+   "expect": {
+    "claude": null,
+    "codex": null
+   }
+  },
+  {
+   "name": "V25 codex refusal row (usage 100%) is never safe; a safe codex wins",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "cR",
+     "tool": "codex",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Usage",
+        "kind": "usage",
+        "pct": 100,
+        "resets": 1791604816.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "cS",
+     "tool": "codex",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly",
+        "pct": 80,
+        "resets": 1792029616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "codex": {
+     "label": "cS",
+     "mode": "safe",
+     "used": 80,
+     "left": 20,
+     "chip": "Use first → cS · 20% left · renews in 5d"
+    }
+   }
+  },
+  {
+   "name": "V26 claude age exactly 15.0 min is stale; 14.99 fresh",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "A15",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "resets": 1791601216.0
+       }
+      ],
+      "as_of": 1791596716.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 10,
+        "resets": 1791777616.0
+       }
+      ],
+      "as_of": 1791596716.6,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "B",
+     "mode": "safe",
+     "used": 10,
+     "left": 90,
+     "chip": "Use first → B · 90% left · renews in 2d"
+    }
+   }
+  },
+  {
+   "name": "V27 rate-limited row with no as_of is 'ratelimited' (not nodata); still ineligible",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "rl",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 1,
+        "resets": 1791601216.0
+       }
+      ],
+      "as_of": null,
+      "error": "Rate Limit"
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 89,
+        "resets": 1791813616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "B",
+     "mode": "safe",
+     "used": 89,
+     "left": 11,
+     "chip": "Use first → B · 11% left · renews in 3d"
+    }
+   }
+  },
+  {
+   "name": "V28 inferred 0% after a passed reset: still sorts by its (past) reset -> first, renews in 0h",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "I",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Session (5hr)",
+        "kind": "session",
+        "pct": 0,
+        "resets": null
+       },
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 0,
+        "resets": 1791586816.0,
+        "inferred": "window reset, no activity since"
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "B",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 30,
+        "resets": 1791615616.0
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "I",
+     "mode": "safe",
+     "used": 0,
+     "left": 100,
+     "chip": "Use first → I · 100% left · renews in 0h"
+    }
+   }
+  },
+  {
+   "name": "V29 Infinity tie in fallback broken by label",
+   "now": 1791597616.0,
+   "rows": [
+    {
+     "label": "zeta",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 100,
+        "resets": null
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    },
+    {
+     "label": "Alpha",
+     "tool": "claude",
+     "email": null,
+     "limits": {
+      "windows": [
+       {
+        "label": "Weekly (7 day)",
+        "kind": "weekly_all",
+        "pct": 95,
+        "resets": null
+       }
+      ],
+      "as_of": 1791597556.0,
+      "error": null
+     }
+    }
+   ],
+   "excluded": [],
+   "expect": {
+    "claude": {
+     "label": "Alpha",
+     "mode": "fallback",
+     "used": 95,
+     "left": 5,
+     "chip": "All near limit — Alpha frees up later"
+    }
+   }
+  }
+ ]
+}

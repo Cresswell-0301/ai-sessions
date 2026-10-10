@@ -28,8 +28,9 @@ final class UsageTests: XCTestCase {
     /// `skipped` as the real dashboard sends it on every Claude row: a note
     /// on its token-cost scan, not on the limits.
     private func row(_ tool: String, _ label: String, _ windows: [[String: Any]], error: String? = nil,
-                     skipped: Any = "signed in — no usage recorded yet") -> [String: Any] {
-        var limits: [String: Any] = ["windows": windows, "live": true, "plan": "max"]
+                     skipped: Any = "signed in — no usage recorded yet", age: Double = 60) -> [String: Any] {
+        var limits: [String: Any] = ["windows": windows, "live": true, "plan": "max",
+                                     "as_of": now.timeIntervalSince1970 - age]
         limits["error"] = error ?? NSNull()
         return ["tool": tool, "label": label, "email": "\(label)@example.com", "skipped": skipped, "limits": limits]
     }
@@ -39,12 +40,13 @@ final class UsageTests: XCTestCase {
     }
 
     /// One Claude account with session, weekly and Fable windows.
-    private func claude(_ label: String, session: Double, weekly: Double, weeklyResets: Double = 1_791_800_000) -> [String: Any] {
+    private func claude(_ label: String, session: Double, weekly: Double, weeklyResets: Double = 1_791_800_000,
+                        age: Double = 60) -> [String: Any] {
         row("claude", label, [
             window("session", session, resets: session > 0 ? 1_791_610_000 : nil, label: "Session (5hr)"),
             window("weekly_all", weekly, resets: weeklyResets, label: "Weekly (7 day)"),
             window("weekly_scoped", 0, resets: weeklyResets, label: "Weekly Fable"),
-        ])
+        ], age: age)
     }
 
     private func snapshot(_ rows: [[String: Any]], at date: Date? = nil) -> UsageSnapshot {
@@ -59,8 +61,8 @@ final class UsageTests: XCTestCase {
     private func codex(_ windows: [[String: Any]]) -> [String: Any] { codex("acct", windows) }
 
     private func codex(_ label: String, _ windows: [[String: Any]]) -> [String: Any] {
-        ["tool": "codex", "label": label, "email": NSNull(),
-         "limits": ["windows": windows, "plan": "plus", "as_of": 1_790_000_000] as [String: Any]]
+        ["tool": "codex", "label": label, "email": "\(label)@example.com",
+         "limits": ["windows": windows, "plan": "plus", "as_of": now.timeIntervalSince1970 - 600] as [String: Any]]
     }
 
     /// A Codex window; `inferred` is the dashboard's note on a number it did not read now.
@@ -310,9 +312,7 @@ final class UsageTests: XCTestCase {
                              codex("stale", [cwindow("weekly", 95, resets: R + 86_400, inferred: "stale — account ran after this reading")]),
                              codex("live", [cwindow("weekly", 95, resets: R + 86_400)])], at: R)
         XCTAssertEqual(snap.over(90).map(\.label), ["live"])
-        let room = snapshot([codex("busy", [cwindow("weekly", 60, resets: R + 86_400)]),
-                             codex("ended", [cwindow("weekly", 95, resets: R - 60)])], at: R)
-        XCTAssertEqual(room.mostRoom(tool: "codex", threshold: 90)?.label, "ended", "its week restarted from 0, not 95")
+
     }
 
     func testAnAccountTheDashboardDropsIsForgotten() {
@@ -336,48 +336,125 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(engine.evaluate(snapshot([claude("trimo", session: 0, weekly: 76)])).count, 1)
     }
 
-    // MARK: Most room
-
-    func testMostRoomIsTheLowestWeeklyAmongAccountsUnderTheThreshold() {
-        let snap = snapshot([claude("full", session: 0, weekly: 100), claude("busy", session: 65, weekly: 44),
-                             claude("fresh", session: 0, weekly: 53), claude("hot", session: 95, weekly: 5)])
-        XCTAssertEqual(snap.mostRoom(threshold: 90)?.label, "busy", "lowest weekly; 'hot' has a window over 90%")
-        XCTAssertNil(snapshot([claude("full", session: 0, weekly: 100)]).mostRoom(threshold: 90))
-    }
-
     // MARK: Words
 
-    func testTheBannerForOneCrossing() throws {
+    private let utc = TimeZone(identifier: "UTC")!
+
+    /// The words' inputs, the accounts named in `inUse` signed in on this Mac.
+    private func view(_ snap: UsageSnapshot, inUse: [String] = [], excluded: Set<String> = []) -> UsageView {
+        let followed = snap.accounts.filter { inUse.contains($0.label) }
+        return UsageView(snapshot: snap, threshold: 90, followed: followed, inUse: Set(followed.map(\.key)),
+                         excluded: excluded, timeZone: utc)
+    }
+
+    private func lines(_ html: String) -> [String] { html.components(separatedBy: "\n") }
+
+    func testTheReportShowsTheAccountInUseItsRenewalsAndTheAdvice() {
+        // now = Sat 10 Oct 02:40 UTC; sessions renew 05:26, weeks Mon 10:13.
+        let snap = snapshot([claude("cress", session: 69, weekly: 72), claude("full", session: 0, weekly: 100),
+                             claude("roomy", session: 0, weekly: 53, weeklyResets: now.timeIntervalSince1970 + 6 * 86_400),
+                             row("codex", "cx", [window("weekly", 37, resets: now.timeIntervalSince1970 + 3 * 86_400)])])
+        XCTAssertEqual(lines(UsageText.reportMessage(view(snap, inUse: ["cress"]))), [
+            "📊 <b>AI usage</b> · 02:40",
+            "<b>cress</b> · Claude · in use on this Mac",
+            "• Session 69% · renews in 2h 46m (05:26)",
+            "• Weekly 72% · renews in 2d 7h (Mon 10:13)",
+            "",
+            "👉 Use first: <b>cress</b> · 28% left · renews in 2d — the one you're on",
+            "    then <b>roomy</b> · 47% left · renews in 6d",
+            "📈 Most usage left: <b>roomy</b> · 47% left",
+            "",
+            "<b>Claude Code</b>",
+            "<pre>account       session    week",
+            "cress         69% 2h46m  72% 2d7h ◀",
+            "full          0%         100% 2d7h ⚠",
+            "roomy         0%         53% 6d</pre>",
+            "<b>Codex</b>",
+            "<pre>cx            37% 3d</pre>",
+        ])
+    }
+
+    func testTheAlertNamesTheCrossingWithRenewalsAndWhereToGo() throws {
+        let snap = snapshot([claude("tr<i>mo", session: 28, weekly: 94),
+                             claude("roomy", session: 0, weekly: 53, weeklyResets: now.timeIntervalSince1970 + 6 * 86_400)])
+        let html = UsageText.alertMessage([try crossing(snap, 0, "weekly_all")], view: view(snap, inUse: ["tr<i>mo"]))
+        XCTAssertEqual(Array(lines(html).prefix(7)), [
+            "⚠️ <b>tr&lt;i&gt;mo</b> — Claude weekly at <b>94%</b> · in use on this Mac",
+            "• Session 28% · renews in 2h 46m (05:26)",
+            "• Weekly 94% · renews in 2d 7h (Mon 10:13)",
+            "",
+            "👉 Use first: <b>roomy</b> · 47% left · renews in 6d",
+            "📈 Most usage left: <b>roomy</b> · 47% left",
+            "",
+        ])
+        XCTAssertFalse(html.contains("<i>mo"), "labels are escaped, not markup")
+        XCTAssertTrue(html.contains("tr&lt;i&gt;mo       28% 2h46m  94% 2d7h ⚠ ◀"), html)
+    }
+
+    func testAdviceSkipsOptedOutAndStaleAccountsAndSaysWhenNobodyIsFree() {
+        let snap = snapshot([claude("cress", session: 69, weekly: 72),
+                             claude("roomy", session: 0, weekly: 53, weeklyResets: now.timeIntervalSince1970 + 6 * 86_400),
+                             claude("old", session: 0, weekly: 5, age: 20 * 60),
+                             claude("full", session: 0, weekly: 100)])
+        let excluded: Set<String> = ["claude:roomy@example.com"]
+        XCTAssertEqual(UsageAdvice.mostLeft(snap.accounts, tool: "claude", excluded: [], now: now)?.account.label, "roomy",
+                       "the most left, not 'old' at 5%: its reading is 20 minutes old")
+        XCTAssertEqual(UsageAdvice.mostLeft(snap.accounts, tool: "claude", excluded: excluded, now: now)?.account.label, "cress",
+                       "opted out on the dashboard")
+        XCTAssertEqual(UsageAdvice.useFirst(snap.accounts, tool: "claude", excluded: excluded, now: now)?.account.label, "cress")
+        let dark = snapshot([row("claude", "a", [], error: "Rate Limit"), row("claude", "b", [], error: "token expired — re-login")])
+        XCTAssertTrue(UsageText.reportMessage(view(dark)).contains("👉 Use first: no account is free with a fresh reading"))
+        let near = snapshot([claude("a", session: 91, weekly: 92), claude("b", session: 100, weekly: 100)])
+        XCTAssertTrue(UsageText.reportMessage(view(near)).contains("⏳ All near a limit: <b>a</b> frees up in 2d"),
+                      UsageText.reportMessage(view(near)))
+    }
+
+    func testAnAlertSendsTheUserElsewhere() throws {
+        // cress crossed at exactly 90%, which the dashboard still counts as
+        // usable; so does "edge", renewing sooner. Neither is where to go.
+        let snap = snapshot([claude("cress", session: 20, weekly: 90),
+                             claude("edge", session: 0, weekly: 90, weeklyResets: now.timeIntervalSince1970 + 3600),
+                             claude("roomy", session: 0, weekly: 53, weeklyResets: now.timeIntervalSince1970 + 6 * 86_400)])
+        let alert = try crossing(snap, 0, "weekly_all")
+        let v = view(snap, inUse: ["cress"])
+        XCTAssertEqual(v.useFirst(tool: "claude")?.account.label, "edge", "the dashboard's own pick, unchanged")
+        XCTAssertTrue(UsageText.alertMessage([alert], view: v).contains("👉 Use first: <b>roomy</b> · 47% left · renews in 6d"))
+        XCTAssertEqual(UsageText.notification(for: [alert], view: v).body, "Use first: roomy (47% left).")
+        XCTAssertTrue(UsageText.reportMessage(v).contains("👉 Use first: <b>edge</b> · 10% left"), "the report mirrors the dashboard")
+
+        // Every account full: when work can go on, and where.
+        let full = snapshot([claude("cress", session: 20, weekly: 95),
+                             claude("other", session: 0, weekly: 100, weeklyResets: now.timeIntervalSince1970 + 3 * 3600)])
+        let fullAlert = try crossing(full, 0, "weekly_all")
+        XCTAssertTrue(UsageText.alertMessage([fullAlert], view: view(full, inUse: ["cress"]))
+            .contains("⏳ All near a limit: <b>other</b> frees up in 3h"))
+        XCTAssertEqual(UsageText.notification(for: [fullAlert], view: view(full)).body, "All near a limit; other frees up first.")
+    }
+
+    func testTheBanner() throws {
         let snap = snapshot([claude("trimo", session: 28, weekly: 94, weeklyResets: now.timeIntervalSince1970 + 2 * 86_400 + 4 * 3_600 + 60),
                              claude("cresswell", session: 65, weekly: 44)])
-        let alert = try crossing(snap, 0, "weekly_all")
-        let text = UsageText.notification(for: [alert], snapshot: snap, threshold: 90)
-        XCTAssertEqual(text.title, "trimo: Claude weekly limit at 94%")
-        XCTAssertEqual(text.subtitle, "resets in 2d 4h")
-        XCTAssertEqual(text.body, "Most room now: cresswell (56% of the week left).")
-    }
+        let one = UsageText.notification(for: [try crossing(snap, 0, "weekly_all")], view: view(snap))
+        XCTAssertEqual(one.title, "trimo: Claude weekly limit at 94%")
+        XCTAssertEqual(one.subtitle, "renews in 2d 4h")
+        XCTAssertEqual(one.body, "Use first: cresswell (35% left).")
 
-    func testTheBannerForSeveralCrossings() throws {
-        let snap = snapshot([claude("a", session: 91, weekly: 92), claude("b", session: 100, weekly: 100)])
-        let alerts = [try crossing(snap, 0, "session"), try crossing(snap, 0, "weekly_all")]
-        let text = UsageText.notification(for: alerts, snapshot: snap, threshold: 90)
-        XCTAssertEqual(text.title, "2 limits passed 90%")
-        XCTAssertEqual(text.subtitle, "a · Claude session 91%, a · Claude weekly 92%")
-        XCTAssertEqual(text.body, "No Claude account is under 90% right now.")
-    }
+        let both = snapshot([claude("a", session: 91, weekly: 92), claude("b", session: 100, weekly: 100)])
+        let several = UsageText.notification(for: [try crossing(both, 0, "session"), try crossing(both, 0, "weekly_all")], view: view(both))
+        XCTAssertEqual(several.title, "2 limits passed 90%")
+        XCTAssertEqual(several.subtitle, "a · Claude session 91%, a · Claude weekly 92%")
+        XCTAssertEqual(several.body, "All near a limit; a frees up first.")
 
-    func testTheTelegramMessageNamesTheCrossingAndEveryAccount() throws {
-        let snap = snapshot([claude("tr<i>mo", session: 28, weekly: 94), claude("cresswell", session: 65, weekly: 44),
-                             row("codex", "nexxaflo", [window("weekly", 27)])])
-        let alert = try crossing(snap, 0, "weekly_all")
-        let html = UsageText.telegram(for: [alert], snapshot: snap, threshold: 90)
-        XCTAssertTrue(html.hasPrefix("⚠️ <b>AI usage — limit almost hit</b>\n• <b>tr&lt;i&gt;mo</b> — Claude weekly at <b>94%</b>"), html)
-        XCTAssertFalse(html.contains("<i>mo"), "labels are escaped, not markup")
-        XCTAssertTrue(html.contains("<b>Claude Code</b>\n<pre>account"), html)
-        XCTAssertTrue(html.contains("cresswell       65%   44%   0%"), html)
-        XCTAssertTrue(html.contains("tr&lt;i&gt;mo         28%   94%   0% ⚠"), html)
-        XCTAssertTrue(html.contains("<b>Codex</b>\n<pre>nexxaflo        27%</pre>"), html)
-        XCTAssertTrue(html.hasSuffix("➡️ Most room now: <b>cresswell</b>"), html)
+        let codexSnap = snapshot([codex("nexxaflo", [cwindow("weekly", 95, resets: now.timeIntervalSince1970 + 3600)]),
+                                  codex("trimomalaysia", [cwindow("weekly", 23, resets: now.timeIntervalSince1970 + 86_400)]),
+                                  claude("trimo", session: 0, weekly: 40)])
+        XCTAssertEqual(UsageText.notification(for: [try crossing(codexSnap, 0, "weekly")], view: view(codexSnap)).body,
+                       "Use first: trimomalaysia (77% left).", "a Codex account for a Codex alert")
+
+        let refused = snapshot([codex("nexxaflo", [cwindow("usage", 100, resets: nil)])])
+        let refusal = try crossing(refused, 0, "usage")
+        XCTAssertEqual(UsageText.notification(for: [refusal], view: view(refused)).subtitle, "limit reached")
+        XCTAssertTrue(UsageText.alertMessage([refusal], view: view(refused)).hasPrefix("⛔️ <b>nexxaflo</b> — Codex usage at <b>100%</b>"))
     }
 
     func testAHugeTelegramMessageKeepsWholeBlocksWithinTelegramsLimit() {
@@ -386,20 +463,20 @@ final class UsageTests: XCTestCase {
         let alerts = snap.accounts.flatMap { account in
             account.windows.filter { $0.pct >= 90 }.map { UsageAlert(account: account, window: $0) }
         }
-        let html = UsageText.telegram(for: alerts, snapshot: snap, threshold: 90)
+        let html = UsageText.alertMessage(alerts, view: view(snap))
         XCTAssertLessThanOrEqual(html.utf16.count, UsageText.telegramBudget)
         for tag in ["pre", "b"] {
             XCTAssertEqual(html.components(separatedBy: "<\(tag)>").count, html.components(separatedBy: "</\(tag)>").count,
                            "every <\(tag)> is closed")
         }
-        XCTAssertTrue(html.hasPrefix("⚠️ <b>AI usage — limit almost hit</b>\n• <b>account-0</b>"), String(html.prefix(80)))
-        let tail = html.components(separatedBy: "\n").last ?? ""
+        XCTAssertTrue(html.hasPrefix("⚠️ <b>account-0</b> — Claude session at <b>95%</b>, weekly at <b>96%</b>"), String(html.prefix(90)))
+        let tail = lines(html).last ?? ""
         XCTAssertTrue(tail.hasPrefix("…") && tail.hasSuffix("more lines not shown: open the dashboard"), tail)
 
-        let summary = UsageText.summary(snapshot((0..<40).map { claude("a\($0)", session: 1, weekly: 1) }), threshold: 90)
-        XCTAssertTrue(summary.contains("a29 "), "30 rows shown")
-        XCTAssertFalse(summary.contains("a30 "))
-        XCTAssertTrue(summary.contains("…and 10 more</pre>"), summary)
+        let tables = UsageText.tableBlocks(view(snapshot((0..<40).map { claude("a\($0)", session: 1, weekly: 1) }))).joined()
+        XCTAssertTrue(tables.contains("a29 "), "30 rows shown")
+        XCTAssertFalse(tables.contains("a30 "))
+        XCTAssertTrue(tables.contains("…and 10 more</pre>"), tables)
     }
 
     func testFitKeepsWholeBlocksAndCountsTheRest() {
@@ -408,27 +485,20 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(UsageText.fit(blocks, budget: 120),
                        "head\n" + String(repeating: "x", count: 50) + "\n…4 more lines not shown: open the dashboard",
                        "the table is left out whole, never cut")
-        let alert = UsageText.telegram(lead: "🧪 <b>Test</b>", snapshot: nil, threshold: 90)
-        XCTAssertEqual(alert, "🧪 <b>Test</b>")
     }
 
-    func testWordsForCodexARefusalAPastResetAndNoReadableAccount() throws {
-        let snap = snapshot([codex("nexxaflo", [cwindow("weekly", 95, resets: now.timeIntervalSince1970 + 3600)]),
-                             codex("trimomalaysia", [cwindow("weekly", 23, resets: now.timeIntervalSince1970 + 86_400)]),
-                             claude("trimo", session: 0, weekly: 40)])
-        let codexText = UsageText.notification(for: [try crossing(snap, 0, "weekly")], snapshot: snap, threshold: 90)
-        XCTAssertEqual(codexText.body, "Most room now: trimomalaysia (77% of the week left).", "a Codex account for a Codex alert")
-
-        let refused = snapshot([codex("nexxaflo", [cwindow("usage", 100, resets: nil)])])
-        let refusal = UsageText.notification(for: [try crossing(refused, 0, "usage")], snapshot: refused, threshold: 90)
-        XCTAssertEqual(refusal.subtitle, "limit reached")
-        XCTAssertEqual(refusal.body, "No Codex account is under 90% right now.")
-        XCTAssertTrue(UsageText.telegram(for: [try crossing(refused, 0, "usage")], snapshot: refused, threshold: 90)
-            .hasPrefix("⛔️ <b>AI usage — limit reached</b>"))
-
-        let dark = snapshot([row("claude", "a", [], error: "Rate Limit"), row("claude", "b", [], error: "token expired")])
-        XCTAssertTrue(UsageText.summary(dark, threshold: 90).hasSuffix("⏳ No Claude account could be read just now."))
-        XCTAssertEqual(UsageText.until(now.addingTimeInterval(-60), now: now), nil, "a reset that passed is not 'in 1m'")
+    func testTimesInWords() {
+        XCTAssertEqual(UsageText.until(now.addingTimeInterval(-60), now: now), nil, "a renewal that passed is not 'in 1m'")
+        XCTAssertEqual(UsageText.compact(now.addingTimeInterval(45 * 60), now: now), "45m")
+        XCTAssertEqual(UsageText.compact(now.addingTimeInterval(3 * 3600 + 27 * 60), now: now), "3h27m")
+        XCTAssertEqual(UsageText.compact(now.addingTimeInterval(21 * 3600 + 37 * 60), now: now), "21h")
+        XCTAssertEqual(UsageText.compact(now.addingTimeInterval(2 * 86_400 + 8 * 3600), now: now), "2d8h")
+        XCTAssertEqual(UsageText.compact(now.addingTimeInterval(6 * 86_400), now: now), "6d")
+        XCTAssertEqual(UsageText.clock(now.addingTimeInterval(3600), now: now, timeZone: utc), "03:40")
+        XCTAssertEqual(UsageText.clock(now.addingTimeInterval(2 * 86_400), now: now, timeZone: utc), "Mon 02:40")
+        XCTAssertEqual(UsageText.clock(now.addingTimeInterval(8 * 86_400), now: now, timeZone: utc), "18 Oct 02:40")
+        let idle = UsageWindow(kind: "session", label: "Session (5hr)", pct: 0)
+        XCTAssertEqual(UsageText.renewal(idle, view: view(snapshot([]))), "not started")
     }
 
     func testDurationsAndMenuRows() throws {

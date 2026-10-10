@@ -57,7 +57,7 @@ final class SignedInAccountsTests: XCTestCase {
         try write("b@example.com", to: file)
         XCTAssertEqual(accounts.emails(), ["b@example.com"], "signed in to another account")
         try write(nil, to: file)
-        XCTAssertEqual(accounts.emails(), [], "signed out: known, and nobody")
+        XCTAssertNil(accounts.emails(), "no account in the file (a login saves it so for a moment): not known")
         try FileManager.default.removeItem(at: file)
         XCTAssertNil(accounts.emails(), "no file: not known")
     }

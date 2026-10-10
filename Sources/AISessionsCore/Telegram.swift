@@ -10,12 +10,17 @@ public struct TelegramSettings: Codable, Equatable, Sendable {
     public var botUsername: String?
     /// Who the chat is with, for the menu ("Telegram → Cresswell").
     public var chatName: String?
+    /// The chat has been given the "📊 Usage" button (a reply keyboard stays
+    /// once sent); a connection made before the button existed gets it once.
+    public var keyboardShown: Bool?
 
-    public init(botToken: String, chatId: Int64, botUsername: String? = nil, chatName: String? = nil) {
+    public init(botToken: String, chatId: Int64, botUsername: String? = nil, chatName: String? = nil,
+                keyboardShown: Bool? = nil) {
         self.botToken = botToken
         self.chatId = chatId
         self.botUsername = botUsername
         self.chatName = chatName
+        self.keyboardShown = keyboardShown
     }
 
     public static var standardURL: URL { AppPaths.stateDir.appendingPathComponent("telegram.json") }
@@ -90,11 +95,14 @@ public struct TelegramError: Error, Equatable, LocalizedError, Sendable {
     public var kind: Kind
     /// Telegram's own "retry after N s" (HTTP 429).
     public var retryAfter: TimeInterval?
+    /// The HTTP status Telegram answered with; nil when it was not reached.
+    public var status: Int?
 
-    public init(_ message: String, kind: Kind = .permanent, retryAfter: TimeInterval? = nil) {
+    public init(_ message: String, kind: Kind = .permanent, retryAfter: TimeInterval? = nil, status: Int? = nil) {
         self.message = message
         self.kind = kind
         self.retryAfter = retryAfter
+        self.status = status
     }
 
     public var errorDescription: String? { message }
@@ -131,6 +139,11 @@ public struct TelegramClient: Sendable {
 
     /// Telegram's limit for one message, in UTF-16 units after parsing.
     public static let maxMessageLength = 4096
+
+    /// The button kept under the chat: one tap asks for a usage report.
+    public static let usageButtonTitle = "📊 Usage"
+    /// What the "📊 Usage now" button under an alert sends back.
+    public static let usageCallbackData = "usage"
 
     public let token: String
     let transport: Transport
@@ -218,24 +231,52 @@ public struct TelegramClient: Sendable {
     /// Sends `html` (Telegram HTML parse mode) to `chatId`. Too long is an
     /// error rather than a cut: a cut can land inside a tag, and then
     /// Telegram rejects the whole message (`UsageText` keeps within it).
-    public func send(html: String, to chatId: Int64) async throws {
+    public func send(html: String, to chatId: Int64, markup: TelegramMarkup? = nil) async throws {
         guard html.utf16.count <= Self.maxMessageLength else {
             throw TelegramError("The message is \(html.utf16.count) characters long; Telegram takes \(Self.maxMessageLength)")
         }
-        _ = try await call("sendMessage", body: [
-            "chat_id": chatId, "text": html, "parse_mode": "HTML",
-            "disable_web_page_preview": true,
-        ])
+        var body: [String: Any] = ["chat_id": chatId, "text": html, "parse_mode": "HTML", "disable_web_page_preview": true]
+        if let markup { body["reply_markup"] = markup.json }
+        _ = try await call("sendMessage", body: body)
+    }
+
+    /// Waits up to `timeout` seconds for messages after `offset` (long
+    /// polling); asking past an update confirms it to Telegram.
+    public func updates(after offset: Int64?, timeout: Int) async throws -> [[String: Any]] {
+        var body: [String: Any] = ["timeout": timeout]
+        if let offset { body["offset"] = offset }
+        let result = try await call("getUpdates", body: body, timeout: TimeInterval(timeout) + 15)
+        return (result as? [Any] ?? []).compactMap { $0 as? [String: Any] }
+    }
+
+    /// The newest waiting update's id, with every earlier one confirmed: a
+    /// listener starts after what piled up while it was not running, so an
+    /// old tap is not answered late. nil: nothing waits.
+    public func skipBacklog() async throws -> Int64? {
+        let result = try await call("getUpdates", body: ["offset": -1, "timeout": 0])
+        return (result as? [Any] ?? []).compactMap { (($0 as? [String: Any])?["update_id"] as? NSNumber)?.int64Value }.max()
+    }
+
+    /// Stops the spinner on a pressed inline button.
+    public func answerCallback(_ id: String, text: String? = nil) async throws {
+        var body: [String: Any] = ["callback_query_id": id]
+        if let text { body["text"] = text }
+        _ = try await call("answerCallbackQuery", body: body)
+    }
+
+    /// The commands Telegram lists in the chat's menu, e.g. ("usage", "Show AI usage now").
+    public func setCommands(_ commands: [(command: String, description: String)]) async throws {
+        _ = try await call("setMyCommands", body: ["commands": commands.map { ["command": $0.command, "description": $0.description] }])
     }
 
     /// POSTs `body` as JSON to `bot<token>/<method>` and returns `result`.
-    func call(_ method: String, body: [String: Any]?) async throws -> Any {
+    func call(_ method: String, body: [String: Any]?, timeout: TimeInterval = 15) async throws -> Any {
         guard Self.looksLikeToken(token) else {
             throw TelegramError("That does not look like a bot token (it should look like 123456789:AA…)")
         }
         var request = URLRequest(url: Self.base.appendingPathComponent("bot\(token)").appendingPathComponent(method))
         request.httpMethod = "POST"
-        request.timeoutInterval = 15
+        request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body ?? [:])
         let data: Data
@@ -251,7 +292,7 @@ public struct TelegramClient: Sendable {
         let description = json?["description"] as? String ?? "HTTP \(status)"
         let retryAfter = ((json?["parameters"] as? [String: Any])?["retry_after"] as? NSNumber)?.doubleValue
         throw TelegramError(Self.explain(description, status: status), kind: Self.kind(status: status),
-                            retryAfter: retryAfter)
+                            retryAfter: retryAfter, status: status)
     }
 
     /// 429 (slow down) and server trouble pass; any other refusal stays
@@ -277,6 +318,63 @@ public struct TelegramClient: Sendable {
     public static let urlSession: Transport = { request in
         let (data, response) = try await URLSession.shared.data(for: request)
         return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+    }
+}
+
+/// Buttons a message can carry.
+public enum TelegramMarkup: Equatable, Sendable {
+    /// "📊 Usage" kept under the chat (a persistent reply keyboard): one tap
+    /// any time asks for a report.
+    case usageKeyboard
+    /// "📊 Usage now" under the message itself (an inline button).
+    case usageNowButton
+
+    var json: [String: Any] {
+        switch self {
+        case .usageKeyboard:
+            return ["keyboard": [[["text": TelegramClient.usageButtonTitle]]], "resize_keyboard": true, "is_persistent": true]
+        case .usageNowButton:
+            return ["inline_keyboard": [[["text": "📊 Usage now", "callback_data": TelegramClient.usageCallbackData]]]]
+        }
+    }
+}
+
+/// What a message to the bot asks for. Only the connected private chat is
+/// heard; anyone else who finds the bot gets no answer at all.
+public enum TelegramRequest: Equatable, Sendable {
+    /// "📊 Usage", /usage, /start or "usage" typed in the chat.
+    case report
+    /// The "📊 Usage now" button under an alert; its callback is answered.
+    case reportFromButton(callbackId: String)
+
+    /// The request in `update`, if it is one from `chatId`. A message older
+    /// than `maxAge` (typed while the Mac slept) is left unanswered.
+    public static func parse(_ update: [String: Any], chatId: Int64, bot: String?, now: Date,
+                             maxAge: TimeInterval = 600) -> TelegramRequest? {
+        func id(_ object: Any?) -> Int64? { ((object as? [String: Any])?["id"] as? NSNumber)?.int64Value }
+        if let message = update["message"] as? [String: Any] {
+            guard id(message["chat"]) == chatId, (message["chat"] as? [String: Any])?["type"] as? String == "private",
+                  id(message["from"]).map({ $0 == chatId }) ?? true,
+                  let text = message["text"] as? String, asksForUsage(text, bot: bot) else { return nil }
+            if let sent = (message["date"] as? NSNumber)?.doubleValue, now.timeIntervalSince1970 - sent > maxAge { return nil }
+            return .report
+        }
+        if let query = update["callback_query"] as? [String: Any] {
+            guard let callbackId = query["id"] as? String, query["data"] as? String == TelegramClient.usageCallbackData,
+                  id(query["from"]) == chatId, id((query["message"] as? [String: Any])?["chat"]) == chatId else { return nil }
+            return .reportFromButton(callbackId: callbackId)
+        }
+        return nil
+    }
+
+    /// The keyboard button's text, /usage (/usage@bot), /start, or "usage".
+    static func asksForUsage(_ text: String, bot: String?) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == TelegramClient.usageButtonTitle || trimmed.lowercased() == "usage" { return true }
+        guard let first = trimmed.split(whereSeparator: \.isWhitespace).first?.lowercased() else { return false }
+        let parts = first.split(separator: "@", maxSplits: 1).map(String.init)
+        if parts.count == 2, parts[1] != bot?.lowercased() { return false }
+        return parts.first == "/usage" || parts.first == "/start"
     }
 }
 

@@ -49,7 +49,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Usage alerts on their way to Telegram, kept until sent.
     private(set) var telegramOutbox = TelegramOutbox.standard()
     /// Sends one message to Telegram; tests swap in a recorder.
-    var sendTelegram: @MainActor (TelegramSettings, String) async throws -> Void = AppDelegate.postToTelegram
+    var sendTelegram: @MainActor (TelegramSettings, String, TelegramMarkup?) async throws -> Void = AppDelegate.postToTelegram
+    /// Answers the "📊 Usage" button and /usage while Telegram is connected;
+    /// tests put in one over a fake Telegram.
+    var telegramBot = TelegramBot()
+    /// Why the bot is not listening, for the menu; nil while it listens.
+    private var telegramBotProblem: String?
     /// The outbox's clock; tests move it past a retry pause.
     var clock: () -> Date = Date.init
     /// The send in progress: one message at a time, oldest first.
@@ -123,6 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notifier?.requestAuthorization()
         startUsageMonitor()
         flushTelegram() // what a restart interrupted
+        syncTelegramBot()
         Log.shared.info("\(AppInfo.name) \(AppInfo.version) started (pid \(getpid())); home \(AppPaths.home.path)"
             + (paused ? "; notifications paused" : ""))
         scheduleTimer()
@@ -254,6 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engine.apply(new)
         if new.pollIntervalSeconds != old.pollIntervalSeconds { scheduleTimer() }
         usage?.apply(new)
+        if new.telegramAlerts != old.telegramAlerts { syncTelegramBot() }
         refreshUsageMenu()
     }
 
@@ -276,7 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UsageMenu.State(
             enabled: config.usageAlertsEnabled, threshold: config.usageAlertThreshold,
             status: usage?.status ?? UsageMonitor.Status(), telegram: TelegramSettings.load()?.summary,
-            telegramEnabled: config.telegramAlerts, telegramProblem: telegramOutbox.problem,
+            telegramEnabled: config.telegramAlerts, telegramProblem: telegramOutbox.problem ?? telegramBotProblem,
             telegramWaiting: telegramOutbox.pending.count, telegramNextTry: telegramOutbox.nextAttempt,
             settingUpTelegram: TelegramSetup.isRunning)
     }
@@ -286,10 +293,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// silences banners only: it is for meetings, and a limit about to stop
     /// the work is exactly what should still reach the phone.
     func announce(_ alerts: [UsageAlert], _ snapshot: UsageSnapshot) {
-        let threshold = config.usageAlertThreshold
         for alert in alerts { Log.shared.info("usage alert: \(UsageText.headline(alert))") }
+        let view = usageView(snapshot)
         if config.notificationsEnabled, !paused, let notifier, let url = usage?.dashboardURL {
-            let text = UsageText.notification(for: alerts, snapshot: snapshot, threshold: threshold)
+            let text = UsageText.notification(for: alerts, view: view)
             // One id per set of windows: a later crossing must not replace
             // the banner of an earlier one.
             let id = alerts.count == 1 ? alerts[0].key : "several:" + alerts.map(\.key).sorted().joined(separator: ",")
@@ -297,15 +304,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                url: url, sound: config.sound)
         }
         if config.telegramAlerts, TelegramSettings.load() != nil {
-            let inUse = usage?.status.inUse ?? []
-            telegramOutbox.enqueue(UsageText.telegram(for: alerts, snapshot: snapshot, threshold: threshold, inUse: inUse),
-                                   now: clock())
+            telegramOutbox.enqueue(UsageText.alertMessage(alerts, view: view), now: clock())
             flushTelegram()
         }
     }
 
-    nonisolated static func postToTelegram(_ settings: TelegramSettings, _ html: String) async throws {
-        try await TelegramClient(token: settings.botToken).send(html: html, to: settings.chatId)
+    /// The words' inputs for `snapshot` (the latest reading by default): whose
+    /// limits alert, which accounts this Mac uses, the dashboard's opt-outs.
+    func usageView(_ snapshot: UsageSnapshot? = nil) -> UsageView {
+        let status = usage?.status ?? UsageMonitor.Status()
+        let reading = snapshot ?? status.snapshot ?? UsageSnapshot(accounts: [], fetchedAt: clock())
+        var current = status
+        current.snapshot = reading
+        return UsageView(snapshot: reading, threshold: config.usageAlertThreshold, followed: current.covered,
+                         inUse: current.inUse, signedInKnown: status.signedIn != nil, excluded: status.excluded)
+    }
+
+    /// A report for the "📊 Usage" button: a fresh reading first, when the
+    /// dashboard answers; nil when there has never been one.
+    func usageReport(lead: String? = nil) async -> String? {
+        await usage?.poll()
+        guard usage?.status.snapshot != nil else { return nil }
+        return UsageText.reportMessage(usageView(), lead: lead)
+    }
+
+    nonisolated static func postToTelegram(_ settings: TelegramSettings, _ html: String, _ markup: TelegramMarkup?) async throws {
+        try await TelegramClient(token: settings.botToken).send(html: html, to: settings.chatId, markup: markup)
+    }
+
+    /// Listens for the "📊 Usage" button while Telegram is connected and on,
+    /// and not while the setup reads the same updates. A chat connected
+    /// before the button existed is sent it once.
+    func syncTelegramBot() {
+        telegramBot.report = { [weak self] in await self?.usageReport() }
+        telegramBot.onProblem = { [weak self] problem in
+            self?.telegramBotProblem = problem
+            self?.refreshUsageMenu()
+        }
+        guard config.telegramAlerts, !TelegramSetup.isRunning, let settings = TelegramSettings.load() else {
+            telegramBot.stop()
+            telegramBotProblem = nil
+            return
+        }
+        telegramBot.start(settings)
+        guard settings.keyboardShown != true else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let lead = "📊 <b>New: the Usage button</b>\nTap <b>📊 Usage</b> below (or send /usage) any time to see "
+                + "this Mac's account, when its limits renew, which account to use first and which has the most usage left."
+            let html = await usageReport(lead: lead) ?? lead
+            do {
+                try await sendTelegram(settings, html, .usageKeyboard)
+                var shown = settings
+                shown.keyboardShown = true
+                // Only if the connection is still the same one.
+                if TelegramSettings.load()?.chatId == settings.chatId { try? shown.save() }
+                Log.shared.info("Telegram: the Usage button was added to the chat (\(settings.summary))")
+            } catch {
+                Log.shared.warn("Telegram: could not add the Usage button yet: \(TelegramError.from(error).message)")
+            }
+        }
     }
 
     /// Sends what the outbox has due. Runs after each alert and from
@@ -336,7 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func drainTelegram(_ settings: TelegramSettings) async {
         while let message = telegramOutbox.next(now: clock()).message {
             do {
-                try await sendTelegram(settings, Self.withDelayNote(message, now: clock()))
+                try await sendTelegram(settings, Self.withDelayNote(message, now: clock()), .usageNowButton)
                 let recovered = telegramOutbox.problem != nil
                 telegramOutbox.succeeded(message.id)
                 telegramProblemAnnounced = nil
@@ -385,13 +443,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setUpTelegram() {
-        let started = TelegramSetup.run(snapshot: usage?.status.snapshot, threshold: config.usageAlertThreshold,
-                                        inUse: usage?.status.inUse ?? []) { [weak self] settings in
+        // The setup reads the bot's updates itself: Telegram allows one reader.
+        telegramBot.stop()
+        let started = TelegramSetup.run(view: usage?.status.snapshot == nil ? nil : usageView()) { [weak self] settings in
             guard let self else { return }
             if settings != nil { telegramWorks() }
+            syncTelegramBot()
             refreshUsageMenu()
         }
-        if started { refreshUsageMenu() } // greys the item out meanwhile
+        if started { refreshUsageMenu() } else { syncTelegramBot() } // greys the item out meanwhile
     }
 
     /// A message just went through: what waits goes now, a new refusal
@@ -404,12 +464,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func testTelegram() {
         guard let settings = TelegramSettings.load() else { return setUpTelegram() }
-        let text = UsageText.telegram(lead: "🧪 <b>Test from AI Sessions</b>\nUsage alerts reach this chat.",
-                                      snapshot: usage?.status.snapshot, threshold: config.usageAlertThreshold,
-                                      inUse: usage?.status.inUse ?? [])
+        let lead = "🧪 <b>Test from AI Sessions</b>\nUsage alerts reach this chat. Tap <b>📊 Usage</b> below any time."
         Task { @MainActor in
+            let text = await usageReport(lead: lead) ?? lead
             do {
-                try await sendTelegram(settings, text)
+                try await sendTelegram(settings, text, .usageKeyboard)
                 Log.shared.info("Telegram test message sent (\(settings.summary))")
                 telegramWorks()
                 refreshUsageMenu()
@@ -426,6 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         TelegramSettings.delete()
         telegramOutbox.clear()
         telegramProblemAnnounced = nil
+        syncTelegramBot()
         Log.shared.info("Telegram disconnected")
         refreshUsageMenu()
     }

@@ -11,7 +11,7 @@ final class UsageAlertAppTests: XCTestCase {
     private var home: URL!
     private var savedHome: String?
     private var center: RecordingCenter!
-    private var sent: [(settings: TelegramSettings, html: String)] = []
+    private var sent: [(settings: TelegramSettings, html: String, markup: TelegramMarkup?)] = []
     /// What the fake Telegram answers; nil = delivered.
     private var telegramFailure: TelegramError?
     private var clockNow = Date(timeIntervalSince1970: 1_791_600_000)
@@ -59,10 +59,12 @@ final class UsageAlertAppTests: XCTestCase {
     }
 
     private func dashboardJSON(trimoWeekly: Double, trimoSession: Double = 28,
-                               cresswellSession: Double = 65, cresswellWeekly: Double = 44) -> Data {
+                               cresswellSession: Double = 65, cresswellWeekly: Double = 44, trimoEmail: Bool = true) -> Data {
         func row(_ label: String, session: Double, weekly: Double) -> [String: Any] {
-            ["tool": "claude", "label": label, "email": "\(label.lowercased())@example.com",
-             "skipped": "signed in — no usage recorded yet", "limits": ["error": NSNull(), "windows": [
+            ["tool": "claude", "label": label,
+             "email": label == "trimo" && !trimoEmail ? NSNull() : "\(label.lowercased())@example.com" as Any,
+             "skipped": "signed in — no usage recorded yet",
+             "limits": ["error": NSNull(), "as_of": 1_791_599_940, "windows": [
                 ["kind": "session", "label": "Session (5hr)", "pct": session, "resets": 1_791_610_000],
                 ["kind": "weekly_all", "label": "Weekly (7 day)", "pct": weekly, "resets": 1_791_800_000],
             ]] as [String: Any]]
@@ -81,9 +83,9 @@ final class UsageAlertAppTests: XCTestCase {
         let app = AppDelegate { config in SessionEngine(config: config, store: store, makeSources: { _ in [] }) }
         center = RecordingCenter()
         app.install(Notifier(center: center))
-        app.sendTelegram = { [unowned self] settings, html in
+        app.sendTelegram = { [unowned self] settings, html, markup in
             if let failure = self.telegramFailure { throw failure }
-            self.sent.append((settings, html))
+            self.sent.append((settings, html, markup))
         }
         app.clock = { [unowned self] in self.clockNow }
         return app
@@ -147,10 +149,16 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual(content.title, "trimo: Claude weekly limit at 94%")
         XCTAssertEqual(content.categoryIdentifier, Notifier.usageCategoryIdentifier)
         XCTAssertEqual(content.userInfo["openURL"] as? String, "http://127.0.0.1:8787")
-        XCTAssertTrue(content.body.contains("cresswell-nexxatech"), content.body)
+        XCTAssertEqual(content.subtitle, "renews in 2d 7h")
+        XCTAssertEqual(content.body, "Use first: cresswell-nexxatech (35% left).", "the dashboard's own pick")
         XCTAssertEqual(sent.count, 1)
         XCTAssertEqual(sent.first?.settings.chatId, 222)
-        XCTAssertTrue(sent.first?.html.contains("<b>trimo</b> — Claude weekly at <b>94%</b>") ?? false, sent.first?.html ?? "")
+        let html = sent.first?.html ?? ""
+        XCTAssertTrue(html.hasPrefix("⚠️ <b>trimo</b> — Claude weekly at <b>94%</b> · in use on this Mac\n"
+            + "• Session 28% · renews in 2h 46m"), html)
+        XCTAssertTrue(html.contains("👉 Use first: <b>cresswell-nexxatech</b> · 35% left · renews in 2d"), html)
+        XCTAssertTrue(html.contains("📈 Most usage left: <b>cresswell-nexxatech</b> · 35% left"), html)
+        XCTAssertEqual(sent.first?.markup, .usageNowButton, "a button under the alert for a fresh report")
 
         await monitor.poll() // still over: nothing new
         await settle(app)
@@ -244,7 +252,7 @@ final class UsageAlertAppTests: XCTestCase {
         app.housekeepIfDue(now: clockNow)
         await settle(app)
         XCTAssertEqual(sent.count, 1, "delivered once Telegram answers")
-        XCTAssertTrue(sent.first?.html.hasPrefix("⚠️ <b>AI usage — limit almost hit</b>\n• <b>trimo</b> — Claude weekly at <b>93%</b>") ?? false,
+        XCTAssertTrue(sent.first?.html.hasPrefix("⚠️ <b>trimo</b> — Claude weekly at <b>93%</b>") ?? false,
                       "31 s late is not worth a note: " + (sent.first?.html ?? ""))
         XCTAssertTrue(app.telegramOutbox.pending.isEmpty)
         XCTAssertEqual(UsageMenu.telegramLines(app.usageMenuState(), now: clockNow), ["Telegram: @my_usage_bot → Cress"])
@@ -318,8 +326,8 @@ final class UsageAlertAppTests: XCTestCase {
         await settle(app)
         XCTAssertEqual(center.posted.map(\.identifier), ["usage:claude|trimo|weekly_all"])
         let html = sent.first?.html ?? ""
-        XCTAssertTrue(html.contains("trimo           28%   92%   - ⚠ ◀"), "the account in use is marked: \(html)")
-        XCTAssertTrue(html.contains("cresswell-nexxa 97%   93%   - ⚠\n"), "and only it")
+        XCTAssertTrue(html.contains("trimo         28% 2h46m  92% 2d7h ⚠ ◀"), "the account in use is marked: \(html)")
+        XCTAssertTrue(html.contains("cresswell-nex 97% 2h46m  93% 2d7h ⚠\n"), "and only it")
     }
 
     func testSigningInToAnAccountAlreadyOverTheLimitAlerts() async throws {
@@ -334,13 +342,33 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertTrue(center.posted.isEmpty)
         try signIn("CoreOS") // /login to the full account
         await monitor.poll()
+        XCTAssertTrue(center.posted.isEmpty, "a new sign-in is followed once a second poll still sees it")
+        await monitor.poll()
         XCTAssertEqual(center.posted.map(\.content.title), ["CoreOS: Claude weekly limit at 100%"],
                        "the account now in use is already at its limit")
         await monitor.poll()
         XCTAssertEqual(center.posted.count, 1, "once")
         try signIn("cresswell-nexxatech")
         await monitor.poll()
+        await monitor.poll()
         XCTAssertEqual(center.posted.count, 1, "back on an account with room: nothing to say")
+    }
+
+    func testARowThatLosesItsEmailForAMomentIsNotAlertedTwice() async throws {
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 95)
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1)
+        dashboard.body = dashboardJSON(trimoWeekly: 95, trimoEmail: false) // one scan could not read the profile
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 95)
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1, "the same crossing: not news again")
     }
 
     func testWhileNoSignInCanBeReadNothingIsEvaluated() async throws {
@@ -353,10 +381,13 @@ final class UsageAlertAppTests: XCTestCase {
         dashboard.body = dashboardJSON(trimoWeekly: 95)
         await monitor.poll()
         XCTAssertEqual(center.posted.count, 1, "trimo crossed")
-        try signIn(nil) // ~/.claude.json gone for a moment
+        try signIn(nil) // ~/.claude.json gone (a login saves it without an account first)
         await monitor.poll()
         XCTAssertEqual(UsageMenu.title(UsageMenu.State(status: monitor.status), now: clockNow),
-                       "Usage limits — can't tell which account is in use")
+                       "Usage limits — trimo at 95% weekly · 28% session", "a moment without an account changes nothing")
+        for _ in 0..<4 { await monitor.poll() }
+        XCTAssertEqual(UsageMenu.title(UsageMenu.State(status: monitor.status), now: clockNow),
+                       "Usage limits — can't tell which account is in use", "five polls without one: not known")
         try signIn("trimo")
         await monitor.poll()
         XCTAssertEqual(center.posted.count, 1, "trimo's alert was kept, not forgotten and repeated")
@@ -425,6 +456,154 @@ final class UsageAlertAppTests: XCTestCase {
                                           content: UNMutableNotificationContent(), trigger: nil)) { _ in }
         app.notifier?.withdrawAll() // Mark All as Read
         XCTAssertEqual(center.delivered.keys.sorted(), usage, "session banners go, usage alerts stay")
+    }
+
+    // MARK: The Usage button
+
+    /// Telegram for the bot: hands out queued updates to its long poll (a
+    /// short wait when none), records every call.
+    private final class FakeBotAPI: @unchecked Sendable {
+        private let lock = NSLock()
+        private var queue: [[String: Any]] = []
+        private var _calls: [(method: String, body: [String: Any])] = []
+        var backlogNewest: Int64?
+        var getUpdatesStatus = 200
+
+        var calls: [(method: String, body: [String: Any])] { lock.withLock { _calls } }
+        func sent() -> [[String: Any]] { calls.filter { $0.method == "sendMessage" }.map(\.body) }
+        func push(_ updates: [String: Any]...) { lock.withLock { queue += updates } }
+
+        func transport() -> TelegramClient.Transport {
+            { [self] request in
+                let method = request.url!.lastPathComponent
+                let body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any] ?? [:]
+                let (result, status): (Any, Int) = lock.withLock {
+                    _calls.append((method, body))
+                    guard method == "getUpdates" else { return (true, 200) }
+                    if getUpdatesStatus != 200 { return ([], getUpdatesStatus) }
+                    if (body["offset"] as? NSNumber)?.intValue == -1 {
+                        return (backlogNewest.map { [["update_id": NSNumber(value: $0)]] } ?? [], 200)
+                    }
+                    let out = queue
+                    queue = []
+                    return (out, 200)
+                }
+                if status != 200 {
+                    return (Data(#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#.utf8), status)
+                }
+                if method == "getUpdates", (result as? [Any])?.isEmpty == true {
+                    try await Task.sleep(nanoseconds: 20_000_000) // a long poll that found nothing
+                }
+                return (try JSONSerialization.data(withJSONObject: ["ok": true, "result": result]), 200)
+            }
+        }
+    }
+
+    private func message(_ id: Int64, _ text: String, chat: Int64 = 222) -> [String: Any] {
+        ["update_id": id, "message": ["message_id": id, "date": clockNow.timeIntervalSince1970 - 2, "text": text,
+                                      "chat": ["id": chat, "type": "private"], "from": ["id": chat]]]
+    }
+
+    private func tap(_ id: Int64, chat: Int64 = 222) -> [String: Any] {
+        ["update_id": id, "callback_query": ["id": "cb-\(id)", "data": "usage", "from": ["id": chat],
+                                              "message": ["message_id": 7, "chat": ["id": chat, "type": "private"]]]]
+    }
+
+    /// Waits (up to 5 s) for `done`.
+    private func until(_ what: String, _ done: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while !done() {
+            guard Date() < deadline else { return XCTFail("timed out waiting for \(what)") }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    /// An app listening for the Usage button, trimo signed in, over a fake Telegram.
+    private func listeningApp(_ api: FakeBotAPI) async throws -> (AppDelegate, TelegramBot) {
+        try connectTelegram()
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        let bot = TelegramBot(transport: api.transport(), clock: { [unowned self] in clockNow })
+        app.telegramBot = bot
+        app.syncTelegramBot()
+        try await until("the bot to listen") { api.calls.contains { $0.method == "getUpdates" && ($0.body["offset"] as? NSNumber)?.intValue != -1 } }
+        return (app, bot)
+    }
+
+    func testTheUsageButtonGetsAReportBackAndStrangersGetNothing() async throws {
+        let api = FakeBotAPI()
+        api.backlogNewest = 40 // a tap from before the app started
+        let (app, bot) = try await listeningApp(api)
+        defer { bot.stop(); withExtendedLifetime(app) {} } // the report comes from the app
+        XCTAssertEqual(api.calls.first?.method, "getUpdates")
+        XCTAssertEqual((api.calls.first?.body["offset"] as? NSNumber)?.intValue, -1, "what piled up is skipped")
+        XCTAssertTrue(api.calls.contains { $0.method == "setMyCommands" }, "/usage is listed in the chat's menu")
+        XCTAssertEqual(sent.first?.markup, .usageKeyboard, "a chat connected before the button gets it once")
+        XCTAssertEqual(TelegramSettings.load()?.keyboardShown, true)
+
+        api.push(message(41, "/usage", chat: 999), message(42, "📊 Usage"))
+        try await until("a report") { bot.answered == 1 }
+        let reports = api.sent()
+        XCTAssertEqual(reports.count, 1, "the stranger got nothing")
+        XCTAssertEqual((reports.first?["chat_id"] as? NSNumber)?.int64Value, 222)
+        let text = reports.first?["text"] as? String ?? ""
+        XCTAssertTrue(text.hasPrefix("📊 <b>AI usage</b> · "), text)
+        XCTAssertTrue(text.contains("<b>trimo</b> · Claude · in use on this Mac\n• Session 28% · renews in 2h 46m"), text)
+        XCTAssertTrue(text.contains("👉 Use first: <b>trimo</b> · 50% left · renews in 2d — the one you're on\n"
+            + "    then <b>cresswell-nexxatech</b> · 35% left"), "same renewal for all: the less used first: \(text)")
+        XCTAssertTrue(text.contains("📈 Most usage left: <b>trimo</b> · 50% left (in use)"), text)
+        let keyboard = reports.first?["reply_markup"] as? [String: Any]
+        XCTAssertEqual(keyboard?["is_persistent"] as? Bool, true, "the button stays under the chat")
+        let polls = api.calls.filter { $0.method == "getUpdates" }.compactMap { ($0.body["offset"] as? NSNumber)?.intValue }
+        XCTAssertTrue(polls.contains(41), "listening starts after the skipped backlog: \(polls)")
+    }
+
+    func testTheButtonUnderAnAlertIsAnsweredAndADoubleTapSendsOneReport() async throws {
+        let api = FakeBotAPI()
+        let (app, bot) = try await listeningApp(api)
+        defer { bot.stop(); withExtendedLifetime(app) {} }
+        api.push(tap(5), tap(6))
+        try await until("both taps answered") { api.calls.filter { $0.method == "answerCallbackQuery" }.count == 2 }
+        try await until("a report") { bot.answered == 1 }
+        let answers = api.calls.filter { $0.method == "answerCallbackQuery" }.map { $0.body["text"] as? String }
+        XCTAssertEqual(answers, ["Checking usage…", "Just sent"])
+        XCTAssertEqual(api.sent().count, 1, "a second tap within 3 s sends nothing more")
+        XCTAssertEqual(bot.answered, 1)
+    }
+
+    func testARevokedTokenStopsListeningAndTheMenuSaysWhy() async throws {
+        let api = FakeBotAPI()
+        api.getUpdatesStatus = 401
+        try connectTelegram()
+        let app = makeApp()
+        let bot = TelegramBot(transport: api.transport(), clock: { [unowned self] in clockNow })
+        app.telegramBot = bot
+        app.syncTelegramBot()
+        try await until("the bot to give up") { !bot.isListening }
+        XCTAssertEqual(api.calls.filter { $0.method == "getUpdates" }.count, 1, "no retrying a revoked token")
+        XCTAssertTrue(app.usageMenuState().telegramProblem?.contains("@BotFather") ?? false,
+                      app.usageMenuState().telegramProblem ?? "no problem shown")
+    }
+
+    func testTheBotStepsAsideWhileSetupReadsTheChat() async throws {
+        let api = FakeBotAPI()
+        try connectTelegram()
+        let app = makeApp()
+        app.telegramBot = TelegramBot(transport: api.transport(), clock: { [unowned self] in clockNow })
+        var release: CheckedContinuation<Void, Never>?
+        XCTAssertTrue(TelegramSetup.run({ await withCheckedContinuation { release = $0 }; return nil }, completion: { _ in }))
+        app.syncTelegramBot()
+        XCTAssertFalse(app.telegramBot.isListening, "Telegram allows one reader: the setup")
+        while release == nil { await Task.yield() }
+        release?.resume()
+        while TelegramSetup.isRunning { await Task.yield() }
+        app.syncTelegramBot()
+        XCTAssertTrue(app.telegramBot.isListening)
+        app.telegramBot.stop()
     }
 
     // MARK: Setting up

@@ -17,6 +17,8 @@ final class UsageMonitor {
         var signedIn: Set<String>?
         /// Whose limits alert (config `usageAlertAccounts`).
         var scope = UsageAlertScope(["current"])
+        /// The dashboard's "Use first" opt-outs, read with the reading.
+        var excluded: Set<String> = []
 
         /// The accounts whose crossings alert, in the snapshot's order.
         var covered: [UsageAccount] {
@@ -46,6 +48,16 @@ final class UsageMonitor {
     private let makeAccounts: (Config) -> SignedInAccounts
     /// The covered accounts last logged, so a switch is logged once.
     private var loggedCovered: [String]?
+    /// The sign-in the alerts follow, and a different one seen meanwhile
+    /// with how many polls in a row saw it (see `followSignIn`).
+    private var followed: Set<String>?
+    private var candidate: (emails: Set<String>?, polls: Int)?
+    /// The last sign-in that named an account, to tell a switch from a return.
+    private var lastKnown: Set<String>?
+    /// Polls in a row a new sign-in must hold before the alerts follow it;
+    /// losing it altogether (logged out) takes longer.
+    static let switchPolls = 2
+    static let lossPolls = 5
     private var timer: Timer?
     private var inFlight = false
     private var loggedProblem: String?
@@ -145,20 +157,25 @@ final class UsageMonitor {
             Log.shared.info("usage dashboard reachable again")
             loggedProblem = nil
         }
-        status = Status(snapshot: snapshot, problem: nil, signedIn: accounts.emails(),
-                        scope: UsageAlertScope(config.usageAlertAccounts))
+        let (signedIn, switchedTo) = followSignIn()
+        status = Status(snapshot: snapshot, problem: nil, signedIn: signedIn,
+                        scope: UsageAlertScope(config.usageAlertAccounts),
+                        excluded: SuggestExclusions.load(from: AppPaths.expand(config.usageExcludeFile)))
         var alerts: [UsageAlert] = []
         // Who is signed in decides whose alerts these are. Until that can be
         // read nothing is evaluated: a guess would forget the real account's
         // records (and announce them again) or announce someone else's.
         if !(status.scope.needsSignedIn && status.signedIn == nil) {
-            let covered = status.covered
+            let covered = Set(status.covered.map(\.key))
             let firstRun = engine.isFirstRun
-            // Only covered accounts are evaluated, so the others' records go:
-            // switching to an account already over the threshold is news.
-            alerts = engine.evaluate(snapshot.only { account in covered.contains { $0.key == account.key } })
+            // Signed in to another account: whatever it crossed while the
+            // alerts followed the old one is news now.
+            if let joined = switchedTo, !joined.isEmpty {
+                engine.forget(snapshot.accounts.filter { $0.isSignedIn(joined) })
+            }
+            alerts = engine.evaluate(snapshot) { covered.contains($0.key) }
             if firstRun {
-                let over = covered.flatMap { $0.windows.filter { $0.isOver(config.usageAlertThreshold, at: snapshot.fetchedAt) } }
+                let over = status.covered.flatMap { $0.windows.filter { $0.isOver(config.usageAlertThreshold, at: snapshot.fetchedAt) } }
                 Log.shared.info("usage alerts: first reading; \(over.count) window(s) already at "
                     + "\(Int(config.usageAlertThreshold))%+ recorded without alerting")
             }
@@ -166,6 +183,38 @@ final class UsageMonitor {
         logCoverage()
         onStatus(status)
         if !alerts.isEmpty { onAlerts(alerts, snapshot) }
+    }
+
+    /// The sign-in the alerts follow. A different one is followed once
+    /// `switchPolls` polls in a row see it (`lossPolls` when no account can be
+    /// read), so the moment a login spends without an account, or a stale
+    /// write of the old one, cannot swing the alerts back and forth.
+    /// Returns the sign-in to follow, and the emails just switched to (a
+    /// different account than the last one known; nil when there was no
+    /// switch, including at launch and on coming back to the same account).
+    private func followSignIn() -> (followed: Set<String>?, switchedTo: Set<String>?) {
+        let seen = accounts.emails()
+        var adopt = false
+        if followed == nil {
+            adopt = true
+        } else if seen == followed {
+            candidate = nil
+        } else {
+            let polls = candidate.map { $0.emails == seen ? $0.polls + 1 : 1 } ?? 1
+            candidate = (seen, polls)
+            if polls >= (seen == nil ? Self.lossPolls : Self.switchPolls) {
+                adopt = true
+                candidate = nil
+            }
+        }
+        guard adopt else { return (followed, nil) }
+        followed = seen
+        guard let adopted = seen else { return (nil, nil) }
+        // A switch is a known account other than the last known one.
+        let previous = lastKnown
+        if !adopted.isEmpty { lastKnown = adopted }
+        guard let previous, !adopted.isEmpty, adopted != previous else { return (followed, nil) }
+        return (followed, adopted.subtracting(previous))
     }
 
     /// One line whenever the accounts that alert change: at launch, after a

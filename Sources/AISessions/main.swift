@@ -11,7 +11,7 @@ let launchMode = LaunchMode.parse(Array(CommandLine.arguments.dropFirst()))
 _ = umask(0o077)
 switch launchMode {
 case .gui, .headless, .testNotification: AppPaths.secureStateDirectory(create: true)
-case .route, .showUsage, .telegramTest, .version, .help, .invalid: AppPaths.secureStateDirectory(create: false)
+case .route, .showUsage, .usageReport, .telegramTest, .version, .help, .invalid: AppPaths.secureStateDirectory(create: false)
 }
 
 switch launchMode {
@@ -38,6 +38,8 @@ case .testNotification(let query):
     }
 case .showUsage:
     exit(runUsage())
+case .usageReport:
+    exit(runUsageReport())
 case .telegramTest:
     exit(runTelegramTest())
 case .version:
@@ -64,6 +66,7 @@ enum LaunchMode: Equatable {
     case route(query: String, open: Bool)
     case testNotification(query: String)
     case showUsage
+    case usageReport
     case telegramTest
     case version
     case help
@@ -87,6 +90,8 @@ enum LaunchMode: Equatable {
                                                 for a session (default: the first listed one)
                AISessions --usage                print every account's usage limits as the alerts
                                                 see them (read-only: the dashboard's last scan)
+               AISessions --usage-report         print the report the Telegram "📊 Usage" button sends
+                                                (HTML, as sent; nothing is sent)
                AISessions --telegram-test        send a test message to the connected Telegram chat
                AISessions --version
         """
@@ -102,6 +107,7 @@ enum LaunchMode: Equatable {
             case "--headless": next = .headless(useAppState: false)
             case "--version": next = .version
             case "--usage": next = .showUsage
+            case "--usage-report": next = .usageReport
             case "--telegram-test": next = .telegramTest
             case "--help", "-h": next = .help
             case "--open":
@@ -125,7 +131,7 @@ enum LaunchMode: Equatable {
                 return .invalid("unknown argument: \(argument)")
             }
             guard mode == nil else {
-                return .invalid("choose one of --headless, --route, --test-notification, --usage, --telegram-test, --version")
+                return .invalid("choose one of --headless, --route, --test-notification, --usage, --usage-report, --telegram-test, --version")
             }
             mode = next
         }
@@ -184,6 +190,20 @@ private func fetchUsage(_ config: Config) -> UsageFetch {
     }
 }
 
+/// What the alerts would see now: the reading, this Mac's sign-in, the
+/// dashboard's opt-outs. Read-only.
+private func usageStatus(_ config: Config, _ snapshot: UsageSnapshot) -> UsageMonitor.Status {
+    UsageMonitor.Status(snapshot: snapshot, problem: nil,
+                        signedIn: SignedInAccounts(configDirs: config.claudeConfigURLs).emails(),
+                        scope: UsageAlertScope(config.usageAlertAccounts),
+                        excluded: SuggestExclusions.load(from: AppPaths.expand(config.usageExcludeFile)))
+}
+
+private func usageView(_ config: Config, _ status: UsageMonitor.Status, _ snapshot: UsageSnapshot) -> UsageView {
+    UsageView(snapshot: snapshot, threshold: config.usageAlertThreshold, followed: status.covered,
+              inUse: status.inUse, signedInKnown: status.signedIn != nil, excluded: status.excluded)
+}
+
 func runUsage() -> Int32 {
     let config = Config.load()
     switch fetchUsage(config) {
@@ -193,9 +213,7 @@ func runUsage() -> Int32 {
     case .success(let snapshot):
         let threshold = config.usageAlertThreshold
         let now = Date()
-        let status = UsageMonitor.Status(snapshot: snapshot, problem: nil,
-                                         signedIn: SignedInAccounts(configDirs: config.claudeConfigURLs).emails(),
-                                         scope: UsageAlertScope(config.usageAlertAccounts))
+        let status = usageStatus(config, snapshot)
         let state = UsageMenu.State(enabled: config.usageAlertsEnabled, threshold: threshold, status: status)
         print("usage limits (alert at \(Int(threshold))%; \(config.usageAlertsEnabled ? "alerts on" : "alerts OFF"))")
         let signedIn = (status.signedIn ?? []).sorted().joined(separator: ", ")
@@ -209,10 +227,27 @@ func runUsage() -> Int32 {
                 + "\(Formatting.oneLine(UsageText.menuRow(account), max: 120) ?? "")\(resets)"
                 + (status.inUse.contains(account.key) ? "  ◀ in use" : ""))
         }
-        if let room = snapshot.mostRoom(threshold: threshold) { print("most room now: \(room.label)") }
+        let view = usageView(config, status, snapshot)
+        for tool in ["claude", "codex"] where snapshot.accounts.contains(where: { $0.tool == tool }) {
+            let name = tool == "codex" ? "Codex" : "Claude"
+            print("\(name): " + (view.useFirst(tool: tool)?.chip ?? "no account free to use first"))
+            if let most = view.mostLeft(tool: tool) { print("\(name): most usage left → \(most.account.label) · \(most.left)% left") }
+        }
         let telegram = TelegramSettings.load()
         print("telegram: \(telegram.map { $0.summary } ?? "not connected (menu: Usage limits › Set Up Telegram Alerts…)")"
             + (config.telegramAlerts ? "" : " — telegramAlerts is off"))
+        return 0
+    }
+}
+
+func runUsageReport() -> Int32 {
+    let config = Config.load()
+    switch fetchUsage(config) {
+    case .failure(let problem):
+        FileHandle.standardError.write(Data("\(problem)\n".utf8))
+        return 1
+    case .success(let snapshot):
+        print(UsageText.reportMessage(usageView(config, usageStatus(config, snapshot), snapshot)))
         return 0
     }
 }
@@ -223,13 +258,15 @@ func runTelegramTest() -> Int32 {
         return 1
     }
     let config = Config.load()
-    var snapshot: UsageSnapshot?
-    if case .success(let reading) = fetchUsage(config) { snapshot = reading }
-    let message = UsageText.telegram(lead: "🧪 <b>Test from AI Sessions</b> (command line)\nUsage alerts reach this chat.",
-                                     snapshot: snapshot, threshold: config.usageAlertThreshold)
+    let lead = "🧪 <b>Test from AI Sessions</b> (command line)\nUsage alerts reach this chat. Tap <b>📊 Usage</b> below any time."
+    var message = lead
+    if case .success(let snapshot) = fetchUsage(config) {
+        message = UsageText.reportMessage(usageView(config, usageStatus(config, snapshot), snapshot), lead: lead)
+    }
+    let text = message
     let outcome: String? = waitFor {
         do {
-            try await TelegramClient(token: settings.botToken).send(html: message, to: settings.chatId)
+            try await TelegramClient(token: settings.botToken).send(html: text, to: settings.chatId, markup: .usageKeyboard)
             return nil
         } catch {
             return error.localizedDescription

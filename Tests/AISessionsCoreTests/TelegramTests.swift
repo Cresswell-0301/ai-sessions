@@ -163,6 +163,87 @@ final class TelegramTests: XCTestCase {
         XCTAssertEqual(fake.requests[0].value(forHTTPHeaderField: "Content-Type"), "application/json")
     }
 
+    // MARK: The Usage button
+
+    func testMessagesCarryTheUsageButtons() async throws {
+        let fake = FakeTelegram()
+        fake.answers["sendMessage"] = (200, #"{"ok":true,"result":{"message_id":9}}"#)
+        let client = TelegramClient(token: token, transport: fake.transport())
+        try await client.send(html: "report", to: 222, markup: .usageKeyboard)
+        try await client.send(html: "alert", to: 222, markup: .usageNowButton)
+        try await client.send(html: "plain", to: 222)
+        let keyboard = try XCTUnwrap(fake.body(0)["reply_markup"] as? [String: Any])
+        XCTAssertEqual(((keyboard["keyboard"] as? [[[String: Any]]])?.first?.first?["text"] as? String), "📊 Usage")
+        XCTAssertEqual(keyboard["is_persistent"] as? Bool, true, "kept under the chat")
+        XCTAssertEqual(keyboard["resize_keyboard"] as? Bool, true)
+        let inline = try XCTUnwrap(fake.body(1)["reply_markup"] as? [String: Any])
+        let button = (inline["inline_keyboard"] as? [[[String: Any]]])?.first?.first
+        XCTAssertEqual(button?["text"] as? String, "📊 Usage now")
+        XCTAssertEqual(button?["callback_data"] as? String, "usage")
+        XCTAssertNil(fake.body(2)["reply_markup"])
+    }
+
+    func testListeningCallsAskTelegramTheRightWay() async throws {
+        let fake = FakeTelegram()
+        fake.responder = { [self] method, body in
+            switch method {
+            case "getUpdates" where (body["offset"] as? NSNumber)?.intValue == -1:
+                return (200, updates([update(41, chat: 222, text: "old"), update(42, chat: 222, text: "older")]))
+            case "getUpdates": return (200, updates([update(43, chat: 222, text: "/usage")]))
+            default: return (200, #"{"ok":true,"result":true}"#)
+            }
+        }
+        let client = TelegramClient(token: token, transport: fake.transport())
+        let newest = try await client.skipBacklog()
+        XCTAssertEqual(newest, 42, "what piled up is skipped, not answered")
+        XCTAssertEqual((fake.body(0)["timeout"] as? NSNumber)?.intValue, 0)
+        let got = try await client.updates(after: 43, timeout: 50)
+        XCTAssertEqual(got.count, 1)
+        XCTAssertEqual((fake.body(1)["offset"] as? NSNumber)?.intValue, 43)
+        XCTAssertEqual((fake.body(1)["timeout"] as? NSNumber)?.intValue, 50)
+        XCTAssertEqual(fake.requests[1].timeoutInterval, 65, "the request outlives the long poll")
+        try await client.answerCallback("cb-1", text: "Checking usage…")
+        XCTAssertEqual(fake.body(2)["callback_query_id"] as? String, "cb-1")
+        try await client.setCommands([(command: "usage", description: "Show AI usage now")])
+        XCTAssertEqual((fake.body(3)["commands"] as? [[String: Any]])?.first?["command"] as? String, "usage")
+    }
+
+    func testOnlyTheConnectedChatIsAnswered() {
+        let now = Date(timeIntervalSince1970: 1_791_600_000)
+        func message(_ text: String, chat: Int64 = 222, type: String = "private", from: Int64? = 222, age: Double = 5) -> [String: Any] {
+            var message: [String: Any] = ["message_id": 1, "date": now.timeIntervalSince1970 - age, "text": text,
+                                          "chat": ["id": chat, "type": type]]
+            if let from { message["from"] = ["id": from, "is_bot": false] }
+            return ["update_id": 1, "message": message]
+        }
+        func parse(_ update: [String: Any]) -> TelegramRequest? {
+            TelegramRequest.parse(update, chatId: 222, bot: "My_Usage_Bot", now: now)
+        }
+        XCTAssertEqual(parse(message("📊 Usage")), .report, "the button")
+        XCTAssertEqual(parse(message("/usage")), .report)
+        XCTAssertEqual(parse(message("/usage@my_usage_bot")), .report)
+        XCTAssertEqual(parse(message("/start")), .report)
+        XCTAssertEqual(parse(message(" Usage ")), .report)
+        XCTAssertNil(parse(message("/usage@other_bot")), "a command for another bot")
+        XCTAssertNil(parse(message("hello")))
+        XCTAssertNil(parse(message("/usage", chat: 999, from: 999)), "a stranger who found the bot")
+        XCTAssertNil(parse(message("/usage", chat: 222, type: "group")), "not the private chat")
+        XCTAssertNil(parse(message("/usage", from: 999)), "someone else in that chat")
+        XCTAssertNil(parse(message("/usage", age: 3600)), "typed an hour ago, while the Mac slept")
+
+        let tap: [String: Any] = ["update_id": 2, "callback_query": ["id": "cb-9", "data": "usage", "from": ["id": 222],
+                                                                    "message": ["message_id": 5, "chat": ["id": 222, "type": "private"]]]]
+        XCTAssertEqual(parse(tap), .reportFromButton(callbackId: "cb-9"))
+        var strangerTap = tap
+        strangerTap["callback_query"] = ["id": "cb-x", "data": "usage", "from": ["id": 999],
+                                         "message": ["message_id": 5, "chat": ["id": 222, "type": "private"]]]
+        XCTAssertNil(parse(strangerTap))
+        var otherData = tap
+        otherData["callback_query"] = ["id": "cb-y", "data": "other", "from": ["id": 222],
+                                       "message": ["message_id": 5, "chat": ["id": 222, "type": "private"]]]
+        XCTAssertNil(parse(otherData))
+    }
+
     func testAnOverlongMessageIsRefusedNotCut() async throws {
         let fake = FakeTelegram()
         fake.answers["sendMessage"] = (200, #"{"ok":true,"result":{"message_id":9}}"#)
@@ -190,6 +271,7 @@ final class TelegramTests: XCTestCase {
         let slowDown = await failure(429, #"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 7","parameters":{"retry_after":7}}"#)
         XCTAssertEqual(slowDown?.kind, .transient)
         XCTAssertEqual(slowDown?.retryAfter, 7)
+        XCTAssertEqual(slowDown?.status, 429)
         let down = await failure(502, "<html>Bad Gateway</html>")
         XCTAssertEqual(down?.kind, .transient)
         XCTAssertEqual(down?.message, "Telegram said: HTTP 502")

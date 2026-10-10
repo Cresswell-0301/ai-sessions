@@ -46,18 +46,17 @@ public final class SignedInAccounts {
         self.home = home
     }
 
-    /// The lower-cased emails signed in now; nil while no watched dir has
-    /// given an answer yet (none readable), so the caller can wait rather
-    /// than act on a guess.
+    /// The lower-cased emails signed in now; nil while no watched dir names
+    /// an account, so the caller waits rather than act on a guess. A file
+    /// without an account counts as not known, not as nobody: signing in to
+    /// another account first saves the file without one, then with the new
+    /// account once Anthropic has answered.
     public func emails() -> Set<String>? {
-        var known = false
         var emails = Set<String>()
         for dir in configDirs {
-            guard let answer = answer(for: dir) else { continue }
-            known = true
-            if case .signedIn(let email) = answer { emails.insert(email) }
+            if case .signedIn(let email)? = answer(for: dir) { emails.insert(email) }
         }
-        return known ? emails : nil
+        return emails.isEmpty ? nil : emails
     }
 
     /// Where `dir` keeps its account: inside it for a profile
