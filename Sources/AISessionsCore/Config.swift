@@ -30,13 +30,19 @@ public struct Config: Codable, Equatable, Sendable {
     public var usagePollSeconds: Double = 60
     /// Also send usage alerts to Telegram (once a bot is connected from the menu).
     public var telegramAlerts: Bool = true
+    /// Whose limits alert: "current" (the Claude account each watched config
+    /// dir is signed into: the one your sessions use), "all", or an account
+    /// by its dashboard label ("trimo"), tool and label ("codex:nexxaflo") or
+    /// email. A single string is read as a list of one.
+    public var usageAlertAccounts: [String] = ["current"]
 
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
         case notificationsEnabled, sound, minTurnSecondsToNotify, claudeConfigDirs,
              codexHomes, codexRecentHours, showAutomationSessions, pollIntervalSeconds,
-             usageAlertsEnabled, usageAlertThreshold, usageDashboardURL, usagePollSeconds, telegramAlerts
+             usageAlertsEnabled, usageAlertThreshold, usageDashboardURL, usagePollSeconds, telegramAlerts,
+             usageAlertAccounts
     }
 
     public init(from decoder: Decoder) throws {
@@ -55,6 +61,9 @@ public struct Config: Codable, Equatable, Sendable {
         usageDashboardURL = (try? c.decodeIfPresent(String.self, forKey: .usageDashboardURL)) ?? d.usageDashboardURL
         usagePollSeconds = (try? c.decodeIfPresent(Double.self, forKey: .usagePollSeconds)) ?? d.usagePollSeconds
         telegramAlerts = (try? c.decodeIfPresent(Bool.self, forKey: .telegramAlerts)) ?? d.telegramAlerts
+        usageAlertAccounts = (try? c.decodeIfPresent([String].self, forKey: .usageAlertAccounts))
+            ?? (try? c.decodeIfPresent(String.self, forKey: .usageAlertAccounts)).flatMap { $0.map { [$0] } }
+            ?? d.usageAlertAccounts
     }
 
     /// The settings a process starts with (see `launch`).

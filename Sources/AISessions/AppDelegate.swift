@@ -297,7 +297,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                url: url, sound: config.sound)
         }
         if config.telegramAlerts, TelegramSettings.load() != nil {
-            telegramOutbox.enqueue(UsageText.telegram(for: alerts, snapshot: snapshot, threshold: threshold), now: clock())
+            let inUse = usage?.status.inUse ?? []
+            telegramOutbox.enqueue(UsageText.telegram(for: alerts, snapshot: snapshot, threshold: threshold, inUse: inUse),
+                                   now: clock())
             flushTelegram()
         }
     }
@@ -383,7 +385,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setUpTelegram() {
-        let started = TelegramSetup.run(snapshot: usage?.status.snapshot, threshold: config.usageAlertThreshold) { [weak self] settings in
+        let started = TelegramSetup.run(snapshot: usage?.status.snapshot, threshold: config.usageAlertThreshold,
+                                        inUse: usage?.status.inUse ?? []) { [weak self] settings in
             guard let self else { return }
             if settings != nil { telegramWorks() }
             refreshUsageMenu()
@@ -402,7 +405,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func testTelegram() {
         guard let settings = TelegramSettings.load() else { return setUpTelegram() }
         let text = UsageText.telegram(lead: "🧪 <b>Test from AI Sessions</b>\nUsage alerts reach this chat.",
-                                      snapshot: usage?.status.snapshot, threshold: config.usageAlertThreshold)
+                                      snapshot: usage?.status.snapshot, threshold: config.usageAlertThreshold,
+                                      inUse: usage?.status.inUse ?? [])
         Task { @MainActor in
             do {
                 try await sendTelegram(settings, text)

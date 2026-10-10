@@ -193,12 +193,21 @@ func runUsage() -> Int32 {
     case .success(let snapshot):
         let threshold = config.usageAlertThreshold
         let now = Date()
+        let status = UsageMonitor.Status(snapshot: snapshot, problem: nil,
+                                         signedIn: SignedInAccounts(configDirs: config.claudeConfigURLs).emails(),
+                                         scope: UsageAlertScope(config.usageAlertAccounts))
+        let state = UsageMenu.State(enabled: config.usageAlertsEnabled, threshold: threshold, status: status)
         print("usage limits (alert at \(Int(threshold))%; \(config.usageAlertsEnabled ? "alerts on" : "alerts OFF"))")
-        for account in UsageMenu.sorted(snapshot.accounts) {
+        let signedIn = (status.signedIn ?? []).sorted().joined(separator: ", ")
+        print(UsageMenu.followed(state) + " — signed in: " + (signedIn.isEmpty ? "nobody found" : signedIn))
+        let followed = Set(status.covered.map(\.key))
+        for account in UsageMenu.sorted(snapshot.accounts, followed: followed) {
             let over = account.isOver(threshold, at: snapshot.fetchedAt)
             let resets = UsageMenu.resetsTooltip(account, now: now).map { "  (\($0))" } ?? ""
-            print("  \(over ? "⚠" : " ") \(account.toolName.padding(toLength: 7, withPad: " ", startingAt: 0))"
-                + "\(Formatting.oneLine(UsageText.menuRow(account), max: 120) ?? "")\(resets)")
+            let mark = followed.contains(account.key) ? "✓" : " "
+            print("  \(mark)\(over ? "⚠" : " ") \(account.toolName.padding(toLength: 7, withPad: " ", startingAt: 0))"
+                + "\(Formatting.oneLine(UsageText.menuRow(account), max: 120) ?? "")\(resets)"
+                + (status.inUse.contains(account.key) ? "  ◀ in use" : ""))
         }
         if let room = snapshot.mostRoom(threshold: threshold) { print("most room now: \(room.label)") }
         let telegram = TelegramSettings.load()

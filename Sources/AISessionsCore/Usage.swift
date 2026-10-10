@@ -67,15 +67,27 @@ public struct UsageAccount: Equatable, Codable, Sendable {
     public var windows: [UsageWindow]
     /// The dashboard could read this account's limits (not signed out, not erroring).
     public var readable: Bool
+    /// The account's sign-in address, as the dashboard read it from the profile.
+    public var email: String?
 
-    public init(tool: String, label: String, windows: [UsageWindow], readable: Bool = true) {
+    public init(tool: String, label: String, windows: [UsageWindow], readable: Bool = true, email: String? = nil) {
         self.tool = tool
         self.label = label
         self.windows = windows
         self.readable = readable
+        self.email = email
     }
 
     public var toolName: String { tool == "codex" ? "Codex" : "Claude" }
+
+    /// "claude|trimo": one account of one tool.
+    public var key: String { "\(tool)|\(label)" }
+
+    /// A Claude account signed in where the user's sessions run.
+    public func isSignedIn(_ emails: Set<String>?) -> Bool {
+        guard tool == "claude", let email = email?.lowercased(), let emails else { return false }
+        return emails.contains(email)
+    }
 
     /// The fullest window, the one that will stop this account first.
     public var binding: UsageWindow? { windows.max { $0.pct < $1.pct } }
@@ -122,7 +134,8 @@ public struct UsageSnapshot: Equatable, Sendable {
             }
             let error = limits["error"] as? String
             let readable = (error?.isEmpty ?? true) && !windows.isEmpty
-            accounts.append(UsageAccount(tool: tool, label: label, windows: windows, readable: readable))
+            accounts.append(UsageAccount(tool: tool, label: label, windows: windows, readable: readable,
+                                         email: row["email"] as? String))
         }
         return UsageSnapshot(accounts: accounts, fetchedAt: fetchedAt)
     }
@@ -153,6 +166,47 @@ public struct UsageSnapshot: Equatable, Sendable {
     /// Accounts with a window at or over `threshold` now.
     public func over(_ threshold: Double) -> [UsageAccount] {
         accounts.filter { $0.isOver(threshold, at: fetchedAt) }
+    }
+
+    /// The same reading, cut down to the accounts `keep` accepts.
+    public func only(_ keep: (UsageAccount) -> Bool) -> UsageSnapshot {
+        UsageSnapshot(accounts: accounts.filter(keep), fetchedAt: fetchedAt)
+    }
+}
+
+/// Whose limits alert (config `usageAlertAccounts`). "current": the Claude
+/// account each watched config dir is signed into, i.e. the one the user's
+/// sessions run under; "all": every account; anything else names an account
+/// by its dashboard label ("trimo"), tool and label ("codex:nexxaflo") or
+/// sign-in email. Case does not matter.
+public struct UsageAlertScope: Equatable, Sendable {
+    public var everyAccount = false
+    public var current = false
+    public var named: Set<String> = []
+
+    public init(_ entries: [String]) {
+        for raw in entries {
+            let entry = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            switch entry {
+            case "": continue
+            case "all": everyAccount = true
+            case "current": current = true
+            default: named.insert(entry)
+            }
+        }
+    }
+
+    /// Who is signed in decides what is covered: until that is known, nothing
+    /// is evaluated (a guess would forget the real account's alerts).
+    public var needsSignedIn: Bool { current && !everyAccount }
+
+    /// Whether `account`'s crossings alert, given the emails signed in now.
+    public func covers(_ account: UsageAccount, signedIn: Set<String>?) -> Bool {
+        if everyAccount { return true }
+        if current, account.isSignedIn(signedIn) { return true }
+        let label = account.label.lowercased()
+        return named.contains(label) || named.contains("\(account.tool):\(label)")
+            || account.email.map { named.contains($0.lowercased()) } == true
     }
 }
 
@@ -396,7 +450,8 @@ public enum UsageText {
     static let maxTableRows = 30
 
     /// The Telegram message (parse_mode HTML) for one tick's crossings.
-    public static func telegram(for alerts: [UsageAlert], snapshot: UsageSnapshot, threshold: Double) -> String {
+    public static func telegram(for alerts: [UsageAlert], snapshot: UsageSnapshot, threshold: Double,
+                                inUse: Set<String> = []) -> String {
         let now = snapshot.fetchedAt
         let reached = alerts.contains { $0.window.pct.rounded() >= 100 }
         var blocks = [reached ? "⛔️ <b>AI usage — limit reached</b>" : "⚠️ <b>AI usage — limit almost hit</b>"]
@@ -405,25 +460,27 @@ public enum UsageText {
             blocks.append("• <b>\(html(alert.account.label))</b> — \(alert.account.toolName) \(html(alert.window.shortName)) at <b>\(percent(alert.window.pct))</b>\(resets)")
         }
         blocks.append("")
-        return fit(blocks + summaryBlocks(snapshot, threshold: threshold))
+        return fit(blocks + summaryBlocks(snapshot, threshold: threshold, inUse: inUse))
     }
 
     /// `lead` (HTML), then every account's usage when there is a reading:
     /// the welcome and test messages.
-    public static func telegram(lead: String, snapshot: UsageSnapshot?, threshold: Double) -> String {
+    public static func telegram(lead: String, snapshot: UsageSnapshot?, threshold: Double,
+                                inUse: Set<String> = []) -> String {
         guard let snapshot else { return fit([lead]) }
-        return fit([lead, ""] + summaryBlocks(snapshot, threshold: threshold))
+        return fit([lead, ""] + summaryBlocks(snapshot, threshold: threshold, inUse: inUse))
     }
 
     /// Every account's usage as monospaced tables, plus the account with the
     /// most room: what the user needs in order to choose where to work next.
-    public static func summary(_ snapshot: UsageSnapshot, threshold: Double) -> String {
-        fit(summaryBlocks(snapshot, threshold: threshold))
+    public static func summary(_ snapshot: UsageSnapshot, threshold: Double, inUse: Set<String> = []) -> String {
+        fit(summaryBlocks(snapshot, threshold: threshold, inUse: inUse))
     }
 
     /// The summary in blocks that are only ever kept or left out whole: a
-    /// heading, a whole `<pre>` table, the advice line.
-    static func summaryBlocks(_ snapshot: UsageSnapshot, threshold: Double) -> [String] {
+    /// heading, a whole `<pre>` table, the advice line. Accounts in `inUse`
+    /// (keys) are marked "◀": the ones the user's sessions run on.
+    static func summaryBlocks(_ snapshot: UsageSnapshot, threshold: Double, inUse: Set<String> = []) -> [String] {
         var out: [String] = []
         let claude = snapshot.accounts.filter { $0.tool == "claude" }
         if !claude.isEmpty {
@@ -433,14 +490,18 @@ public enum UsageText {
                     account.window(kind).map { percent($0.pct) } ?? "-"
                 }
                 let mark = account.readable ? (account.isOver(threshold, at: snapshot.fetchedAt) ? " ⚠" : "") : " ?"
-                return pad(String(account.label.prefix(15)), 16) + pad(cells[0], 6) + pad(cells[1], 6) + cells[2] + mark
+                let used = inUse.contains(account.key) ? " ◀" : ""
+                return pad(String(account.label.prefix(15)), 16) + pad(cells[0], 6) + pad(cells[1], 6) + cells[2] + mark + used
             }
             out.append(table([pad("account", 16) + pad("sess", 6) + pad("week", 6) + "fable"] + capped(rows)))
         }
         let codex = snapshot.accounts.filter { $0.tool == "codex" }
         if !codex.isEmpty {
             out.append("<b>Codex</b>")
-            out.append(table(capped(codex.map { pad(String($0.label.prefix(15)), 16) + ($0.binding.map { percent($0.pct) } ?? "-") })))
+            out.append(table(capped(codex.map { account in
+                pad(String(account.label.prefix(15)), 16) + (account.binding.map { percent($0.pct) } ?? "-")
+                    + (inUse.contains(account.key) ? " ◀" : "")
+            })))
         }
         if let room = snapshot.mostRoom(threshold: threshold) {
             out.append("➡️ Most room now: <b>\(html(room.label))</b>")
@@ -483,14 +544,19 @@ public enum UsageText {
         return kept.joined(separator: "\n")
     }
 
-    /// One menu row: "trimo — week 94% · session 27%".
+    /// One menu row: "trimo — weekly 94% · session 27%".
     public static func menuRow(_ account: UsageAccount) -> String {
-        guard account.readable else { return "\(account.label) — not readable" }
-        let parts = account.windows
+        "\(account.label) — " + windows(account)
+    }
+
+    /// "weekly 94% · session 27%", fullest first; "not readable".
+    public static func windows(_ account: UsageAccount) -> String {
+        guard account.readable else { return "not readable" }
+        return account.windows
             .filter { $0.kind != "weekly_scoped" || $0.pct > 0 }
             .sorted { $0.pct > $1.pct }
             .map { "\($0.shortName) \(percent($0.pct))" }
-        return "\(account.label) — " + parts.joined(separator: " · ")
+            .joined(separator: " · ")
     }
 
     /// Escapes text for Telegram's HTML parse mode.

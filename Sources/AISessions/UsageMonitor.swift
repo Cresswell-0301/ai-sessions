@@ -12,6 +12,22 @@ final class UsageMonitor {
         /// Why the latest poll failed; nil after a good one. The last good
         /// snapshot is kept meanwhile, marked by its `fetchedAt`.
         var problem: String?
+        /// The Claude accounts signed in where the sessions run, by email;
+        /// nil while that cannot be read.
+        var signedIn: Set<String>?
+        /// Whose limits alert (config `usageAlertAccounts`).
+        var scope = UsageAlertScope(["current"])
+
+        /// The accounts whose crossings alert, in the snapshot's order.
+        var covered: [UsageAccount] {
+            guard let snapshot, !(scope.needsSignedIn && signedIn == nil) else { return [] }
+            return snapshot.accounts.filter { scope.covers($0, signedIn: signedIn) }
+        }
+
+        /// Accounts the user's sessions are signed into ("in use").
+        var inUse: Set<String> {
+            Set(snapshot?.accounts.filter { $0.isSignedIn(signedIn) }.map(\.key) ?? [])
+        }
     }
 
     typealias Fetch = @Sendable (URL) async throws -> Data
@@ -24,6 +40,12 @@ final class UsageMonitor {
     private let engine: UsageAlertEngine
     private let fetch: Fetch
     private let now: () -> Date
+    /// Who is signed in where the sessions run; rebuilt when the watched
+    /// Claude dirs change. Tests pass their own.
+    private(set) var accounts: SignedInAccounts
+    private let makeAccounts: (Config) -> SignedInAccounts
+    /// The covered accounts last logged, so a switch is logged once.
+    private var loggedCovered: [String]?
     private var timer: Timer?
     private var inFlight = false
     private var loggedProblem: String?
@@ -32,11 +54,15 @@ final class UsageMonitor {
     private var generation = 0
 
     init(config: Config, engine: UsageAlertEngine, fetch: @escaping Fetch = UsageMonitor.urlFetch,
-         now: @escaping () -> Date = Date.init) {
+         now: @escaping () -> Date = Date.init,
+         accounts makeAccounts: @escaping (Config) -> SignedInAccounts = { SignedInAccounts(configDirs: $0.claudeConfigURLs) }) {
         self.config = config
         self.engine = engine
         self.fetch = fetch
         self.now = now
+        self.makeAccounts = makeAccounts
+        accounts = makeAccounts(config)
+        status.scope = UsageAlertScope(config.usageAlertAccounts)
         engine.threshold = config.usageAlertThreshold
     }
 
@@ -70,10 +96,12 @@ final class UsageMonitor {
         if new.usageDashboardURL != old.usageDashboardURL || (new.usageAlertsEnabled && !old.usageAlertsEnabled) {
             Task { await poll() }
         }
+        if new.claudeConfigDirs != old.claudeConfigDirs { accounts = makeAccounts(new) }
         if !new.usageAlertsEnabled {
             status = Status()
-            onStatus(status)
         }
+        status.scope = UsageAlertScope(new.usageAlertAccounts)
+        if new != old { onStatus(status) }
     }
 
     private func reschedule() {
@@ -113,22 +141,50 @@ final class UsageMonitor {
             guard asked == generation else { return askAgain() }
             return report("the usage dashboard is not reachable at \(base.absoluteString)")
         }
-        let firstRun = engine.isFirstRun
-        let alerts = engine.evaluate(snapshot)
-        if firstRun {
-            let over = snapshot.accounts.flatMap { account in
-                account.windows.filter { $0.isOver(config.usageAlertThreshold, at: snapshot.fetchedAt) }
-            }
-            Log.shared.info("usage alerts: first reading of \(snapshot.accounts.count) accounts; "
-                + "\(over.count) window(s) already at \(Int(config.usageAlertThreshold))%+ recorded without alerting")
-        }
         if loggedProblem != nil {
             Log.shared.info("usage dashboard reachable again")
             loggedProblem = nil
         }
-        status = Status(snapshot: snapshot, problem: nil)
+        status = Status(snapshot: snapshot, problem: nil, signedIn: accounts.emails(),
+                        scope: UsageAlertScope(config.usageAlertAccounts))
+        var alerts: [UsageAlert] = []
+        // Who is signed in decides whose alerts these are. Until that can be
+        // read nothing is evaluated: a guess would forget the real account's
+        // records (and announce them again) or announce someone else's.
+        if !(status.scope.needsSignedIn && status.signedIn == nil) {
+            let covered = status.covered
+            let firstRun = engine.isFirstRun
+            // Only covered accounts are evaluated, so the others' records go:
+            // switching to an account already over the threshold is news.
+            alerts = engine.evaluate(snapshot.only { account in covered.contains { $0.key == account.key } })
+            if firstRun {
+                let over = covered.flatMap { $0.windows.filter { $0.isOver(config.usageAlertThreshold, at: snapshot.fetchedAt) } }
+                Log.shared.info("usage alerts: first reading; \(over.count) window(s) already at "
+                    + "\(Int(config.usageAlertThreshold))%+ recorded without alerting")
+            }
+        }
+        logCoverage()
         onStatus(status)
         if !alerts.isEmpty { onAlerts(alerts, snapshot) }
+    }
+
+    /// One line whenever the accounts that alert change: at launch, after a
+    /// sign-in to another account, or when the address is not on the dashboard.
+    private func logCoverage() {
+        let labels = status.covered.map(\.label)
+        let unknown = status.scope.needsSignedIn && status.signedIn == nil
+        let key = unknown ? ["?"] : labels
+        guard key != loggedCovered else { return }
+        loggedCovered = key
+        if unknown {
+            let files = accounts.configDirs.map(\.path).joined(separator: ", ")
+            Log.shared.warn("usage alerts: cannot tell which Claude account is signed in (\(files)); none evaluated until it can")
+        } else if labels.isEmpty {
+            let emails = (status.signedIn ?? []).sorted().joined(separator: ", ")
+            Log.shared.warn("usage alerts: no dashboard account to follow" + (emails.isEmpty ? "" : " (signed in: \(emails))"))
+        } else {
+            Log.shared.info("usage alerts: following " + labels.joined(separator: ", "))
+        }
     }
 
     /// This poll's answer is for settings changed while it waited (alerts

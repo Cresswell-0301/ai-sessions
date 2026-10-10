@@ -22,6 +22,8 @@ final class UsageAlertAppTests: XCTestCase {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         savedHome = ProcessInfo.processInfo.environment["AI_SESSIONS_HOME"]
         setenv("AI_SESSIONS_HOME", home.path, 1)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+        try signIn("trimo") // the account the tests' sessions use
         sent = []
         telegramFailure = nil
     }
@@ -59,7 +61,8 @@ final class UsageAlertAppTests: XCTestCase {
     private func dashboardJSON(trimoWeekly: Double, trimoSession: Double = 28,
                                cresswellSession: Double = 65, cresswellWeekly: Double = 44) -> Data {
         func row(_ label: String, session: Double, weekly: Double) -> [String: Any] {
-            ["tool": "claude", "label": label, "skipped": "signed in — no usage recorded yet", "limits": ["error": NSNull(), "windows": [
+            ["tool": "claude", "label": label, "email": "\(label.lowercased())@example.com",
+             "skipped": "signed in — no usage recorded yet", "limits": ["error": NSNull(), "windows": [
                 ["kind": "session", "label": "Session (5hr)", "pct": session, "resets": 1_791_610_000],
                 ["kind": "weekly_all", "label": "Weekly (7 day)", "pct": weekly, "resets": 1_791_800_000],
             ]] as [String: Any]]
@@ -91,18 +94,32 @@ final class UsageAlertAppTests: XCTestCase {
         await app.telegramTask?.value
     }
 
-    /// The monitor on the test's clock: the fixture's resets lie ahead of it.
+    /// The monitor on the test's clock (the fixture's resets lie ahead of it),
+    /// reading who is signed in from the scratch home's `~/.claude.json`.
     /// `delay` holds each answer back, as a dashboard busy rescanning does.
-    private func monitor(for app: AppDelegate, _ dashboard: Dashboard, delay: UInt64 = 0) -> UsageMonitor {
-        UsageMonitor(config: app.config,
-                     engine: UsageAlertEngine(url: home.appendingPathComponent("state/usage-alerts.json"), threshold: 90),
-                     fetch: { url in
-                         let body = dashboard.answer(url)
-                         if delay > 0 { try await Task.sleep(nanoseconds: delay) }
-                         guard let body else { throw URLError(.cannotConnectToHost) }
-                         return body
-                     },
-                     now: { [unowned self] in clockNow })
+    private func monitor(for app: AppDelegate, _ dashboard: Dashboard, delay: UInt64 = 0,
+                         alertAccounts: [String]? = nil) -> UsageMonitor {
+        var config = app.config
+        if let alertAccounts { config.usageAlertAccounts = alertAccounts }
+        let home = self.home!
+        return UsageMonitor(config: config,
+                            engine: UsageAlertEngine(url: home.appendingPathComponent("state/usage-alerts.json"), threshold: 90),
+                            fetch: { url in
+                                let body = dashboard.answer(url)
+                                if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+                                guard let body else { throw URLError(.cannotConnectToHost) }
+                                return body
+                            },
+                            now: { [unowned self] in clockNow },
+                            accounts: { _ in SignedInAccounts(configDirs: [home.appendingPathComponent(".claude")], home: home) })
+    }
+
+    /// Claude Code signed in as `label`'s account (nil: the file is gone).
+    private func signIn(_ label: String?) throws {
+        let file = home.appendingPathComponent(".claude.json")
+        guard let label else { return try FileManager.default.removeItem(at: file) }
+        let root: [String: Any] = ["numStartups": 9, "oauthAccount": ["emailAddress": "\(label.lowercased())@example.com"]]
+        try JSONSerialization.data(withJSONObject: root).write(to: file, options: .atomic)
     }
 
     private func connectTelegram() throws {
@@ -184,7 +201,7 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertNotNil(monitor.status.snapshot, "the last good reading stays")
         XCTAssertEqual(monitor.status.problem, "the usage dashboard is not reachable at http://127.0.0.1:8787")
         let state = UsageMenu.State(status: monitor.status)
-        XCTAssertEqual(UsageMenu.title(state, now: clockNow), "Usage limits — 1 at 90%+ (last known)")
+        XCTAssertEqual(UsageMenu.title(state, now: clockNow), "Usage limits — trimo: weekly 50% · session 28% (last known)")
     }
 
     // MARK: When Telegram fails
@@ -281,6 +298,70 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertTrue(sent.isEmpty)
     }
 
+    // MARK: The account in use
+
+    func testOnlyTheAccountInUseAlerts() async throws {
+        try connectTelegram()
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 50, cresswellSession: 97, cresswellWeekly: 93)
+        await monitor.poll()
+        await settle(app)
+        XCTAssertTrue(center.posted.isEmpty, "another account's limits are not this user's news")
+        XCTAssertTrue(sent.isEmpty)
+        dashboard.body = dashboardJSON(trimoWeekly: 92, cresswellSession: 97, cresswellWeekly: 93)
+        await monitor.poll()
+        await settle(app)
+        XCTAssertEqual(center.posted.map(\.identifier), ["usage:claude|trimo|weekly_all"])
+        let html = sent.first?.html ?? ""
+        XCTAssertTrue(html.contains("trimo           28%   92%   - ⚠ ◀"), "the account in use is marked: \(html)")
+        XCTAssertTrue(html.contains("cresswell-nexxa 97%   93%   - ⚠\n"), "and only it")
+    }
+
+    func testSigningInToAnAccountAlreadyOverTheLimitAlerts() async throws {
+        try signIn("cresswell-nexxatech")
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50) // CoreOS sits at 100% weekly
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        await monitor.poll()
+        XCTAssertTrue(center.posted.isEmpty)
+        try signIn("CoreOS") // /login to the full account
+        await monitor.poll()
+        XCTAssertEqual(center.posted.map(\.content.title), ["CoreOS: Claude weekly limit at 100%"],
+                       "the account now in use is already at its limit")
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1, "once")
+        try signIn("cresswell-nexxatech")
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1, "back on an account with room: nothing to say")
+    }
+
+    func testWhileNoSignInCanBeReadNothingIsEvaluated() async throws {
+        let app = makeApp()
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 50)
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 95)
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1, "trimo crossed")
+        try signIn(nil) // ~/.claude.json gone for a moment
+        await monitor.poll()
+        XCTAssertEqual(UsageMenu.title(UsageMenu.State(status: monitor.status), now: clockNow),
+                       "Usage limits — can't tell which account is in use")
+        try signIn("trimo")
+        await monitor.poll()
+        XCTAssertEqual(center.posted.count, 1, "trimo's alert was kept, not forgotten and repeated")
+    }
+
     // MARK: Settings that change while a poll waits
 
     func testTurningAlertsOffWhileAPollWaitsAnnouncesNothing() async throws {
@@ -328,7 +409,7 @@ final class UsageAlertAppTests: XCTestCase {
         let app = makeApp()
         let dashboard = Dashboard()
         dashboard.body = dashboardJSON(trimoWeekly: 50)
-        let monitor = monitor(for: app, dashboard)
+        let monitor = monitor(for: app, dashboard, alertAccounts: ["all"])
         app.startUsageMonitor(monitor)
         await monitor.poll()
         dashboard.body = dashboardJSON(trimoWeekly: 93, trimoSession: 95)
@@ -434,12 +515,28 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — checking…")
         state.status.problem = "the usage dashboard is not reachable at http://127.0.0.1:8787"
         XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — dashboard not reachable")
-        state.status = UsageMonitor.Status(snapshot: UsageSnapshot.parse(dashboardJSON(trimoWeekly: 94), fetchedAt: now))
-        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — 2 at 90%+")
+        let snapshot = UsageSnapshot.parse(dashboardJSON(trimoWeekly: 94), fetchedAt: now)
+        state.status = UsageMonitor.Status(snapshot: snapshot, signedIn: ["trimo@example.com"])
+        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — trimo: weekly 94% · session 28%",
+                       "the account in use, with its limits")
+        XCTAssertEqual(UsageMenu.followed(state), "Alerts for trimo (in use)")
         XCTAssertEqual(UsageMenu.topSymbol(state).name, "exclamationmark.triangle.fill")
-        XCTAssertEqual(UsageMenu.sorted(state.status.snapshot!.accounts).map(\.label),
-                       ["CoreOS", "trimo", "cresswell-nexxatech"], "fullest first")
+        XCTAssertEqual(UsageMenu.sorted(snapshot!.accounts, followed: ["claude|trimo"]).map(\.label),
+                       ["trimo", "CoreOS", "cresswell-nexxatech"], "followed first, then fullest first")
         XCTAssertEqual(UsageMenu.freshness(state, now: now), "Updated just now")
+
+        state.status.signedIn = ["cresswell-nexxatech@example.com"]
+        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — cresswell-nexxatech: session 65% · weekly 44%")
+        XCTAssertEqual(UsageMenu.topSymbol(state).name, "gauge.with.dots.needle.33percent",
+                       "CoreOS at 100% is not the account in use: no warning on top")
+        state.status.signedIn = ["someone@example.com"]
+        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — someone@example.com is not on the dashboard")
+        state.status.signedIn = nil
+        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — can't tell which account is in use")
+        XCTAssertEqual(UsageMenu.followed(state), "Alerts wait: no Claude sign-in found")
+        state.status.scope = UsageAlertScope(["all"])
+        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — 2 at 90%+")
+        XCTAssertEqual(UsageMenu.followed(state), "Alerts for every account")
         state.enabled = false
         XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — alerts off")
         for name in ["gauge.with.dots.needle.33percent", "exclamationmark.triangle.fill", "questionmark.circle"] {

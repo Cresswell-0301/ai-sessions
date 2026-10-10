@@ -156,28 +156,60 @@ enum UsageMenu {
         var settingUpTelegram = false
     }
 
-    /// "Usage limits — 2 at 90%+", "— all under 90%", "— dashboard not reachable".
+    /// The account the alerts follow, with its limits: "Usage limits —
+    /// cresswell-nexxatech: weekly 62% · session 31%". With every account
+    /// followed, the count over the threshold; otherwise why there is none.
     static func title(_ state: State, now: Date) -> String {
         guard state.enabled else { return "Usage limits — alerts off" }
         guard let snapshot = state.status.snapshot else {
             return state.status.problem == nil ? "Usage limits — checking…" : "Usage limits — dashboard not reachable"
         }
         let stale = state.status.problem == nil ? "" : " (last known)"
-        let over = snapshot.over(state.threshold)
         let threshold = Int(state.threshold.rounded())
-        return over.isEmpty ? "Usage limits — all under \(threshold)%\(stale)"
-                            : "Usage limits — \(over.count) at \(threshold)%+\(stale)"
+        let scope = state.status.scope
+        if scope.everyAccount {
+            let over = snapshot.over(state.threshold)
+            return over.isEmpty ? "Usage limits — all under \(threshold)%\(stale)"
+                                : "Usage limits — \(over.count) at \(threshold)%+\(stale)"
+        }
+        if scope.needsSignedIn, state.status.signedIn == nil { return "Usage limits — can't tell which account is in use" }
+        let covered = state.status.covered
+        switch covered.count {
+        case 0:
+            guard let email = state.status.signedIn?.sorted().first else { return "Usage limits — no account followed" }
+            return "Usage limits — \(email) is not on the dashboard"
+        case 1:
+            return "Usage limits — \(covered[0].label): \(UsageText.windows(covered[0]))\(stale)"
+        default:
+            let over = covered.filter { $0.isOver(state.threshold, at: snapshot.fetchedAt) }
+            return over.isEmpty ? "Usage limits — \(covered.count) followed, all under \(threshold)%\(stale)"
+                                : "Usage limits — \(over.count) of \(covered.count) followed at \(threshold)%+\(stale)"
+        }
     }
 
+    /// The submenu's first line: whose crossings alert.
+    static func followed(_ state: State) -> String {
+        let scope = state.status.scope
+        if scope.everyAccount { return "Alerts for every account" }
+        if scope.needsSignedIn, state.status.signedIn == nil { return "Alerts wait: no Claude sign-in found" }
+        let inUse = state.status.inUse
+        let labels = state.status.covered.map { inUse.contains($0.key) ? "\($0.label) (in use)" : $0.label }
+        return labels.isEmpty ? "Alerts for nobody: the account in use is not on the dashboard"
+                              : "Alerts for " + labels.joined(separator: ", ")
+    }
+
+    /// A warning only for an account the alerts follow.
     static func topSymbol(_ state: State) -> (name: String, tint: SymbolTint) {
         guard state.enabled, let snapshot = state.status.snapshot else { return ("gauge.with.dots.needle.33percent", .neutral) }
-        let anyOver = !snapshot.over(state.threshold).isEmpty
+        let anyOver = state.status.covered.contains { $0.isOver(state.threshold, at: snapshot.fetchedAt) }
         return anyOver ? ("exclamationmark.triangle.fill", .attention) : ("gauge.with.dots.needle.33percent", .neutral)
     }
 
-    /// Claude first, then Codex; fullest first within each.
-    static func sorted(_ accounts: [UsageAccount]) -> [UsageAccount] {
+    /// Followed accounts first; then Claude before Codex, fullest first.
+    static func sorted(_ accounts: [UsageAccount], followed: Set<String> = []) -> [UsageAccount] {
         accounts.sorted { lhs, rhs in
+            let l = followed.contains(lhs.key), r = followed.contains(rhs.key)
+            if l != r { return l }
             if lhs.tool != rhs.tool { return lhs.tool == "claude" }
             return (lhs.binding?.pct ?? -1) > (rhs.binding?.pct ?? -1)
         }
@@ -372,10 +404,15 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         let sub = NSMenu()
         sub.autoenablesItems = false
         if usage.enabled, let snapshot = usage.status.snapshot {
-            for account in UsageMenu.sorted(snapshot.accounts) {
-                let row = item(UsageText.menuRow(account), #selector(openDashboard))
+            sub.addItem(disabledItem(UsageMenu.followed(usage)))
+            let followed = Set(usage.status.covered.map(\.key))
+            let inUse = usage.status.inUse
+            for account in UsageMenu.sorted(snapshot.accounts, followed: followed) {
+                let title = UsageText.menuRow(account) + (inUse.contains(account.key) ? "  ◀ in use" : "")
+                let row = item(title, #selector(openDashboard))
                 let mark = UsageMenu.symbol(for: account, threshold: usage.threshold, at: snapshot.fetchedAt)
                 row.image = Self.image(mark.name, tint: mark.tint, pointSize: 12, description: account.label)
+                row.state = followed.contains(account.key) ? .on : .off
                 row.toolTip = UsageMenu.resetsTooltip(account, now: now)
                 sub.addItem(row)
             }

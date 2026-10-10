@@ -21,11 +21,10 @@ one click takes you back to that session's tab.
   *Mark as Read*. Turns shorter than 10 seconds are not announced, since you
   were probably watching, and neither is a turn you stopped yourself (Esc in
   Claude, Stop in Codex). A question is always announced.
-- **Usage-limit alerts.** When a Claude session or weekly limit, or a Codex
-  limit, reaches 90% on any account the ai-accounts dashboard tracks, a banner
-  names the account, when the limit resets and which account has the most
-  room. With your own Telegram bot connected, the same alert reaches your
-  phone. See [Usage-limit alerts](#usage-limit-alerts).
+- **Usage-limit alerts.** When the Claude account you are working on reaches
+  90% of its session or weekly limit, a banner says so, when the limit resets
+  and which account to switch to. With your own Telegram bot connected, the
+  same alert reaches your phone. See [Usage-limit alerts](#usage-limit-alerts).
 - **Back to the tab.** A Claude or Codex session in VS Code (or Cursor,
   Windsurf, VSCodium, Insiders, or another VS Code fork) opens in the exact
   editor window that owns it. An editor whose link scheme is unknown is just
@@ -103,6 +102,7 @@ warning until the file is fixed.
 | `usageDashboardURL` | `"http://127.0.0.1:8787"` | Where the ai-accounts dashboard runs |
 | `usagePollSeconds` | `60` | How often to read it (limited to 15–3600) |
 | `telegramAlerts` | `true` | Also send usage alerts to the connected Telegram chat |
+| `usageAlertAccounts` | `["current"]` | Whose limits alert: `"current"` (the account in use), `"all"`, or accounts by dashboard label (`"trimo"`), tool and label (`"codex:nexxaflo"`) or email |
 
 ```json
 { "minTurnSecondsToNotify": 30, "sound": false }
@@ -117,12 +117,23 @@ that file to do the same (for example, while sharing your screen).
 
 The ai-accounts dashboard (`http://127.0.0.1:8787`) already reads every Claude
 and Codex account's limits. Once a minute the app reads the dashboard's last
-scan (`GET /data.json`) and announces a limit the moment it reaches the
-threshold (90%): a banner such as *trimo: Claude weekly limit at 94% — resets
-in 2d 4h — Most room now: cresswell*, whose click opens the dashboard, and a
-Telegram message if you connected a bot. The app never talks to Anthropic or
-OpenAI itself: the dashboard holds the accounts' sign-ins.
+scan (`GET /data.json`) and announces a limit of **the account in use** the
+moment it reaches the threshold (90%): a banner such as *cresswell-nexxatech:
+Claude weekly limit at 91% — resets in 2d 4h — Most room now: looiytube2*,
+whose click opens the dashboard, and a Telegram message if you connected a bot.
+The app never talks to Anthropic or OpenAI itself: the dashboard holds the
+accounts' sign-ins.
 
+- **The account in use** is the one Claude Code is signed into for the
+  watched config dirs (`claudeConfigDirs`, normally `~/.claude`), read from
+  its `~/.claude.json` (`oauthAccount.emailAddress`, an address, not a
+  credential) and matched to the dashboard's row with the same email. Sign in
+  to another account (`/login`) and the alerts follow it within a minute; if
+  that account is already over the threshold, that is announced at once. The
+  other accounts still show in the menu, for choosing where to switch.
+- **Codex** has no such address outside its credentials file, so a Codex
+  account alerts only when you name it: `"usageAlertAccounts": ["current",
+  "codex:nexxaflo"]`. `["all"]` brings back alerts for every account.
 - **Once per crossing.** A limit alerts again only after it drops below the
   threshold in the same period, or when a new period starts. A restart does
   not repeat an alert, and the very first reading only records what is
@@ -137,8 +148,9 @@ OpenAI itself: the dashboard holds the accounts' sign-ins.
   the reset's own day ("try again at 6:33 PM") is the same week.
 - **Pause Notifications** silences the banner, not Telegram: a limit about to
   stop your work should still reach your phone.
-- **Usage limits** in the menu lists every account, fullest first. Hover a row
-  for when its limits reset; click it to open the dashboard.
+- **Usage limits** in the menu shows the account in use and its limits, then
+  every other account, fullest first; ✓ marks the accounts that alert. Hover a
+  row for when its limits reset; click it to open the dashboard.
 
 ### Telegram
 
@@ -257,9 +269,12 @@ Set `AI_SESSIONS_HOME=/some/dir` to keep a test run's log and state out of
   `watching …` line at startup names the directories being read.
 - **No usage alerts.** *Usage limits* in the menu says *dashboard not
   reachable* while the ai-accounts dashboard is down: check
-  `http://127.0.0.1:8787`. `AISessions --usage` prints what the alerts see. An
-  account already over the threshold when the app first read the dashboard
-  was recorded, not announced; it alerts after its next reset.
+  `http://127.0.0.1:8787`. It says *can't tell which account is in use* when
+  `~/.claude.json` names no account, and *… is not on the dashboard* when the
+  account you are signed into has no row there (add it on the dashboard).
+  `AISessions --usage` prints what the alerts see and which account they
+  follow. An account already over the threshold when the app first read the
+  dashboard was recorded, not announced; it alerts after its next reset.
 - **Telegram stays quiet.** The submenu's Telegram row turns into *not
   delivering* with the reason, and the log has a `usage alert not sent`
   line for each try. *Send Test Message to Telegram* or

@@ -15,10 +15,10 @@ enum TelegramSetup {
     /// the user cancelled. `snapshot`'s usage goes into the welcome message.
     /// While a setup is open this only brings it forward and returns false.
     @discardableResult
-    static func run(snapshot: UsageSnapshot?, threshold: Double,
+    static func run(snapshot: UsageSnapshot?, threshold: Double, inUse: Set<String> = [],
                     completion: @escaping (TelegramSettings?) -> Void) -> Bool {
         NSApp.activate(ignoringOtherApps: true)
-        return run({ await flow(snapshot: snapshot, threshold: threshold) }, completion: completion)
+        return run({ await flow(snapshot: snapshot, threshold: threshold, inUse: inUse) }, completion: completion)
     }
 
     /// The guard around any flow (tests pass one that waits on them).
@@ -34,7 +34,7 @@ enum TelegramSetup {
         return true
     }
 
-    private static func flow(snapshot: UsageSnapshot?, threshold: Double) async -> TelegramSettings? {
+    private static func flow(snapshot: UsageSnapshot?, threshold: Double, inUse: Set<String>) async -> TelegramSettings? {
         // 1. The token.
         var client: TelegramClient
         var bot: TelegramClient.Bot
@@ -92,7 +92,7 @@ enum TelegramSetup {
         let cleared = clearClipboard(ifItHolds: client.token)
         let welcome = UsageText.telegram(
             lead: "✅ <b>AI Sessions is connected.</b>\nYou will get a message here when a Claude or Codex usage limit passes the alert threshold.",
-            snapshot: snapshot, threshold: threshold)
+            snapshot: snapshot, threshold: threshold, inUse: inUse)
         do {
             try await client.send(html: welcome, to: chat.id)
             Log.shared.info("Telegram connected: \(settings.summary)")
