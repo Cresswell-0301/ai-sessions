@@ -156,8 +156,8 @@ enum UsageMenu {
         var settingUpTelegram = false
     }
 
-    /// The account the alerts follow, with its limits: "Usage limits —
-    /// cresswell-nexxatech: weekly 62% · session 31%". With every account
+    /// The account this Mac is signed into, with its limits: "Usage limits —
+    /// cresswell-nexxatech at 62% weekly · 31% session". With every account
     /// followed, the count over the threshold; otherwise why there is none.
     static func title(_ state: State, now: Date) -> String {
         guard state.enabled else { return "Usage limits — alerts off" }
@@ -179,7 +179,7 @@ enum UsageMenu {
             guard let email = state.status.signedIn?.sorted().first else { return "Usage limits — no account followed" }
             return "Usage limits — \(email) is not on the dashboard"
         case 1:
-            return "Usage limits — \(covered[0].label): \(UsageText.windows(covered[0]))\(stale)"
+            return "Usage limits — \(UsageText.atUsage(covered[0]))\(stale)"
         default:
             let over = covered.filter { $0.isOver(state.threshold, at: snapshot.fetchedAt) }
             return over.isEmpty ? "Usage limits — \(covered.count) followed, all under \(threshold)%\(stale)"

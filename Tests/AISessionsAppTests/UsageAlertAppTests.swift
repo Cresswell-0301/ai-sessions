@@ -201,7 +201,7 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertNotNil(monitor.status.snapshot, "the last good reading stays")
         XCTAssertEqual(monitor.status.problem, "the usage dashboard is not reachable at http://127.0.0.1:8787")
         let state = UsageMenu.State(status: monitor.status)
-        XCTAssertEqual(UsageMenu.title(state, now: clockNow), "Usage limits — trimo: weekly 50% · session 28% (last known)")
+        XCTAssertEqual(UsageMenu.title(state, now: clockNow), "Usage limits — trimo at 50% weekly · 28% session (last known)")
     }
 
     // MARK: When Telegram fails
@@ -517,7 +517,7 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — dashboard not reachable")
         let snapshot = UsageSnapshot.parse(dashboardJSON(trimoWeekly: 94), fetchedAt: now)
         state.status = UsageMonitor.Status(snapshot: snapshot, signedIn: ["trimo@example.com"])
-        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — trimo: weekly 94% · session 28%",
+        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — trimo at 94% weekly · 28% session",
                        "the account in use, with its limits")
         XCTAssertEqual(UsageMenu.followed(state), "Alerts for trimo (in use)")
         XCTAssertEqual(UsageMenu.topSymbol(state).name, "exclamationmark.triangle.fill")
@@ -526,7 +526,7 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual(UsageMenu.freshness(state, now: now), "Updated just now")
 
         state.status.signedIn = ["cresswell-nexxatech@example.com"]
-        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — cresswell-nexxatech: session 65% · weekly 44%")
+        XCTAssertEqual(UsageMenu.title(state, now: now), "Usage limits — cresswell-nexxatech at 65% session · 44% weekly")
         XCTAssertEqual(UsageMenu.topSymbol(state).name, "gauge.with.dots.needle.33percent",
                        "CoreOS at 100% is not the account in use: no warning on top")
         state.status.signedIn = ["someone@example.com"]

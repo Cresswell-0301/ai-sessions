@@ -549,6 +549,17 @@ public enum UsageText {
         "\(account.label) — " + windows(account)
     }
 
+    /// "cresswell-nexxatech at 66% weekly · 50% session": the account and its
+    /// limits, fullest first (an unused Fable window left out).
+    public static func atUsage(_ account: UsageAccount) -> String {
+        guard account.readable else { return "\(account.label) (not readable)" }
+        let parts = account.windows
+            .filter { $0.kind != "weekly_scoped" || $0.pct > 0 }
+            .sorted { $0.pct > $1.pct }
+            .map { "\(percent($0.pct)) \($0.shortName)" }
+        return parts.isEmpty ? account.label : "\(account.label) at " + parts.joined(separator: " · ")
+    }
+
     /// "weekly 94% · session 27%", fullest first; "not readable".
     public static func windows(_ account: UsageAccount) -> String {
         guard account.readable else { return "not readable" }
