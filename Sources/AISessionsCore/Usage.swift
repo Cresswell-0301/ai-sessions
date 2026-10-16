@@ -478,6 +478,9 @@ public struct UsageView: Sendable {
     /// For someone the owner shares reports with: a name that is an address
     /// (the dashboard's unnamed "project" row) shows only its part before the @.
     public var hidesAddresses = false
+    /// Some followed account was left out (`hiding`): the report must not
+    /// say that none matches.
+    public var followedHidden = false
 
     public init(snapshot: UsageSnapshot, threshold: Double, followed: [UsageAccount] = [], inUse: Set<String> = [],
                 signedInKnown: Bool = true, excluded: Set<String> = [], timeZone: TimeZone = .current,
@@ -525,6 +528,17 @@ public struct UsageView: Sendable {
         let name = account.name
         guard hidesAddresses, let at = name.firstIndex(of: "@"), at != name.startIndex else { return name }
         return String(name[..<at])
+    }
+
+    /// The view without the accounts `hidden` names (config
+    /// `telegramHiddenAccounts`): gone from the tables and the advice.
+    public func hiding(_ hidden: UsageAlertScope) -> UsageView {
+        func hide(_ account: UsageAccount) -> Bool { hidden.covers(account, signedIn: nil) }
+        var view = self
+        view.snapshot = snapshot.only { !hide($0) }
+        view.followed = followed.filter { !hide($0) }
+        view.followedHidden = followedHidden || view.followed.count < followed.count
+        return view
     }
 
     public func leaving() -> UsageView {
@@ -640,7 +654,7 @@ public enum UsageText {
             blocks.append("⚠️ " + (view.dashboardDown ? "The dashboard is not answering: " : "")
                 + "these numbers are from \(clock(view.snapshot.fetchedAt, now: view.now, timeZone: view.timeZone))\(age).")
         }
-        if view.followed.isEmpty {
+        if view.followed.isEmpty, !view.followedHidden {
             if view.followsSignIn {
                 blocks.append(view.signedInKnown ? "No account on the dashboard matches the one this Mac is signed into."
                                                  : "Can't tell which Claude account this Mac is signed into.")

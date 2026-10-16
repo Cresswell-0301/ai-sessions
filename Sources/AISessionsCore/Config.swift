@@ -38,6 +38,10 @@ public struct Config: Codable, Equatable, Sendable {
     /// The dashboard's opt-outs from its "Use first" pick, honoured by the
     /// alerts' advice so both name the same account.
     public var usageExcludeFile: String = "~/.ai-accounts/.suggest-exclude.json"
+    /// Accounts left out of every Telegram message (by dashboard label, tool
+    /// and label, or email): not in the tables, never named to use first,
+    /// and their alerts go to the Mac only. A single string is a list of one.
+    public var telegramHiddenAccounts: [String] = []
 
     public init() {}
 
@@ -45,7 +49,7 @@ public struct Config: Codable, Equatable, Sendable {
         case notificationsEnabled, sound, minTurnSecondsToNotify, claudeConfigDirs,
              codexHomes, codexRecentHours, showAutomationSessions, pollIntervalSeconds,
              usageAlertsEnabled, usageAlertThreshold, usageDashboardURL, usagePollSeconds, telegramAlerts,
-             usageAlertAccounts, usageExcludeFile
+             usageAlertAccounts, usageExcludeFile, telegramHiddenAccounts
     }
 
     public init(from decoder: Decoder) throws {
@@ -68,6 +72,9 @@ public struct Config: Codable, Equatable, Sendable {
             ?? (try? c.decodeIfPresent(String.self, forKey: .usageAlertAccounts)).flatMap { $0.map { [$0] } }
             ?? d.usageAlertAccounts
         usageExcludeFile = (try? c.decodeIfPresent(String.self, forKey: .usageExcludeFile)) ?? d.usageExcludeFile
+        telegramHiddenAccounts = (try? c.decodeIfPresent([String].self, forKey: .telegramHiddenAccounts))
+            ?? (try? c.decodeIfPresent(String.self, forKey: .telegramHiddenAccounts)).flatMap { $0.map { [$0] } }
+            ?? d.telegramHiddenAccounts
     }
 
     /// The settings a process starts with (see `launch`).

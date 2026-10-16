@@ -308,8 +308,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             notifier.postUsage(id: id, title: text.title, subtitle: text.subtitle, body: text.body,
                                url: url, sound: config.sound)
         }
-        if config.telegramAlerts, TelegramSettings.load() != nil {
-            telegramOutbox.enqueue(UsageText.alertMessage(alerts, view: view), now: clock())
+        // An account kept out of Telegram alerts on the Mac only.
+        let hidden = UsageAlertScope(config.telegramHiddenAccounts)
+        let shown = alerts.filter { !hidden.covers($0.account, signedIn: nil) }
+        if config.telegramAlerts, !shown.isEmpty, TelegramSettings.load() != nil {
+            telegramOutbox.enqueue(UsageText.alertMessage(shown, view: view.hiding(hidden)), now: clock())
             flushTelegram()
         }
     }
@@ -328,13 +331,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                          followsSignIn: status.scope.current)
     }
 
+    /// What Telegram may see of `view`: without `telegramHiddenAccounts`.
+    func telegramView(_ view: UsageView) -> UsageView {
+        view.hiding(UsageAlertScope(config.telegramHiddenAccounts))
+    }
+
     /// A report for the "📊 Usage" button: a fresh reading first, when the
     /// dashboard answers, about now; nil when there has never been one.
     /// `owner`: for someone the owner shares with, whose Mac "◀" marks.
     func usageReport(lead: String? = nil, owner: String? = nil) async -> String? {
         await usage?.poll()
         guard usage?.status.snapshot != nil else { return nil }
-        return UsageText.reportMessage(usageView(now: clock()), lead: lead, owner: owner)
+        return UsageText.reportMessage(telegramView(usageView(now: clock())), lead: lead, owner: owner)
     }
 
     /// Why there is no report to send.
@@ -467,7 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setUpTelegram() {
         // The setup reads the bot's updates itself: Telegram allows one reader.
         telegramBot.stop()
-        let started = TelegramSetup.run(view: usage?.status.snapshot == nil ? nil : usageView()) { [weak self] settings in
+        let started = TelegramSetup.run(view: usage?.status.snapshot == nil ? nil : telegramView(usageView())) { [weak self] settings in
             guard let self else { return }
             if settings != nil { telegramWorks() }
             syncTelegramBot()

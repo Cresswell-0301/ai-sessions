@@ -380,6 +380,21 @@ final class UsageTests: XCTestCase {
 
     private func lines(_ html: String) -> [String] { html.components(separatedBy: "\n") }
 
+    func testAHiddenAccountIsLeftOutOfTheMessage() {
+        let snap = snapshot([claude("cress", session: 69, weekly: 72), claude("roomy", session: 0, weekly: 10),
+                             claude("other", session: 0, weekly: 40)])
+        let shown = UsageText.reportMessage(view(snap, inUse: ["roomy"]))
+        XCTAssertTrue(shown.contains("roomy"), shown)
+        // By email, and by label: any case.
+        let hidden = UsageText.reportMessage(view(snap, inUse: ["roomy"]).hiding(UsageAlertScope(["ROOMY@example.com", "Cress"])))
+        XCTAssertFalse(hidden.contains("roomy"), "not in the table nor the advice: \(hidden)")
+        XCTAssertFalse(hidden.contains("cress"), hidden)
+        XCTAssertFalse(hidden.contains("No account on the dashboard"), "the followed one was hidden, not missing: \(hidden)")
+        XCTAssertTrue(hidden.hasSuffix("Use first: <b>other</b>\nMost usage left: <b>other</b>"), hidden)
+        XCTAssertEqual(UsageText.reportMessage(view(snap, inUse: ["roomy"]).hiding(UsageAlertScope([]))), shown,
+                       "nothing named: nothing hidden")
+    }
+
     func testSomeoneElsesReportSaysWhoseMacAndShowsNoAddress() {
         // The dashboard's unnamed row for an account goes by its address.
         var project = claude("project", session: 10, weekly: 20)

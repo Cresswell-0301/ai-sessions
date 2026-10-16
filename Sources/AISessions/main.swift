@@ -248,7 +248,8 @@ func runUsageReport() -> Int32 {
         FileHandle.standardError.write(Data("\(problem)\n".utf8))
         return 1
     case .success(let snapshot):
-        print(UsageText.reportMessage(usageView(config, usageStatus(config, snapshot), snapshot)))
+        print(UsageText.reportMessage(usageView(config, usageStatus(config, snapshot), snapshot)
+            .hiding(UsageAlertScope(config.telegramHiddenAccounts))))
         return 0
     }
 }
@@ -262,7 +263,8 @@ func runTelegramTest() -> Int32 {
     let lead = "🧪 <b>Test from AI Sessions</b> (command line)\nUsage alerts reach this chat. Tap <b>📊 Usage</b> below any time."
     var message = lead
     if case .success(let snapshot) = fetchUsage(config) {
-        message = UsageText.reportMessage(usageView(config, usageStatus(config, snapshot), snapshot), lead: lead)
+        message = UsageText.reportMessage(usageView(config, usageStatus(config, snapshot), snapshot)
+            .hiding(UsageAlertScope(config.telegramHiddenAccounts)), lead: lead)
     }
     let text = message
     let outcome: String? = waitFor {

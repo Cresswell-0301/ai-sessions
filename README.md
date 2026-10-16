@@ -104,6 +104,7 @@ warning until the file is fixed.
 | `telegramAlerts` | `true` | Also send usage alerts to the connected Telegram chat |
 | `usageAlertAccounts` | `["current"]` | Whose limits alert: `"current"` (the account in use), `"all"`, or accounts by dashboard label (`"trimo"`), tool and label (`"codex:nexxaflo"`) or email |
 | `usageExcludeFile` | `"~/.ai-accounts/.suggest-exclude.json"` | The dashboard's opt-outs from its "Use first" pick, honoured by the alerts' advice |
+| `telegramHiddenAccounts` | `[]` | Accounts left out of every Telegram message, by dashboard label, tool and label or email: not in the tables, never named to use first; their alerts reach the Mac only |
 
 ```json
 { "minTurnSecondsToNotify": 30, "sound": false }

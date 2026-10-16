@@ -167,6 +167,31 @@ final class UsageAlertAppTests: XCTestCase {
         XCTAssertEqual(sent.count, 1)
     }
 
+    func testAHiddenAccountsAlertReachesTheMacOnlyAndTelegramNeverNamesIt() async throws {
+        try connectTelegram()
+        try Data(#"{"telegramHiddenAccounts": ["trimo@example.com", "cresswell-nexxatech"]}"#.utf8)
+            .write(to: home.appendingPathComponent("config.json"))
+        let app = makeApp()
+        XCTAssertEqual(app.config.telegramHiddenAccounts, ["trimo@example.com", "cresswell-nexxatech"])
+        let dashboard = Dashboard()
+        dashboard.body = dashboardJSON(trimoWeekly: 85)
+        let monitor = monitor(for: app, dashboard)
+        app.startUsageMonitor(monitor)
+        await monitor.poll()
+        dashboard.body = dashboardJSON(trimoWeekly: 94)
+        await monitor.poll()
+        await settle(app)
+        XCTAssertEqual(center.posted.count, 1, "the Mac still hears about it")
+        XCTAssertTrue(sent.isEmpty, "Telegram does not")
+        XCTAssertTrue(app.telegramOutbox.pending.isEmpty)
+
+        let reply = await app.usageReport()
+        let report = try XCTUnwrap(reply)
+        XCTAssertFalse(report.contains("trimo"), report)
+        XCTAssertFalse(report.contains("cresswell"), report)
+        XCTAssertTrue(report.contains("CoreOS"), report)
+    }
+
     func testPauseSilencesTheBannerButNotTelegram() async throws {
         try connectTelegram()
         try Data("paused".utf8).write(to: PauseFlag.standard.url)

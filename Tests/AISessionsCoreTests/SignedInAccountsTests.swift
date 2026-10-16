@@ -121,5 +121,12 @@ final class SignedInAccountsTests: XCTestCase {
         XCTAssertEqual(try decode(#"{"usageAlertAccounts": ["current", "codex:nexxaflo"]}"#), ["current", "codex:nexxaflo"])
         XCTAssertEqual(try decode(#"{"usageAlertAccounts": "all"}"#), ["all"])
         XCTAssertEqual(try decode(#"{"usageAlertAccounts": 7}"#), ["current"], "nonsense keeps the default")
+
+        func hidden(_ json: String) throws -> [String] {
+            try JSONDecoder().decode(Config.self, from: Data(json.utf8)).telegramHiddenAccounts
+        }
+        XCTAssertEqual(try hidden("{}"), [], "nobody hidden by default")
+        XCTAssertEqual(try hidden(#"{"telegramHiddenAccounts": ["a@x.com", "b"]}"#), ["a@x.com", "b"])
+        XCTAssertEqual(try hidden(#"{"telegramHiddenAccounts": "a@x.com"}"#), ["a@x.com"])
     }
 }
