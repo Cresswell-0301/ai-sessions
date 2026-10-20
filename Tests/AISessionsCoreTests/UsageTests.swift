@@ -396,7 +396,7 @@ final class UsageTests: XCTestCase {
         XCTAssertTrue(report.contains("▸ CRESSWELL"), "\(report)")
         XCTAssertTrue(report.contains("▸ JUN HAO"))
         let cressAt = try XCTUnwrap(report.firstIndex(of: "▸ CRESSWELL")), junAt = try XCTUnwrap(report.firstIndex(of: "▸ JUN HAO"))
-        XCTAssertNotEqual(report[cressAt - 1], "", "no blank line above the first group")
+        XCTAssertEqual(report[cressAt - 1], "", "the unplaced account above it is set apart too")
         XCTAssertEqual(report[junAt - 1], "", "a blank line before each later group")
         XCTAssertFalse(report.contains("▸ NOBODY"), "an empty group is not shown")
         // The same address twice (an old sign-in beside a new one): the newest reading only.
@@ -407,6 +407,7 @@ final class UsageTests: XCTestCase {
         let twiceReport = UsageText.reportMessage(view(twice))
         XCTAssertTrue(twiceReport.contains("\nyz "), twiceReport)
         XCTAssertFalse(twiceReport.contains("yz-old"), twiceReport)
+        XCTAssertTrue(twiceReport.contains("week\n▸ YONG ZHEN\n"), "no blank line above the first group: \(twiceReport)")
         XCTAssertFalse(UsageText.reportMessage(view(snap, inUse: ["cress"]).hiding(UsageAlertScope(["cress"]))).contains("CRESSWELL"),
                        "a group whose only account is hidden goes too")
     }
