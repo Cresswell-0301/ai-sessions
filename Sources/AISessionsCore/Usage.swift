@@ -773,7 +773,11 @@ public enum UsageText {
             var body: [String] = []
             var index = 0
             for section in sections {
-                if let name = section.name { body.append("▸ " + (name.isEmpty ? "group" : name).uppercased()) }
+                if let name = section.name {
+                    // A blank line between groups, none above the first.
+                    if !body.isEmpty { body.append("") }
+                    body.append("▸ " + (name.isEmpty ? "group" : name).uppercased())
+                }
                 for account in section.accounts {
                     body.append(lines[index] + marks(account))
                     index += 1

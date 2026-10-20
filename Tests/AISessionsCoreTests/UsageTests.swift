@@ -395,6 +395,9 @@ final class UsageTests: XCTestCase {
                        "a new account first, ungrouped; then each group in the dashboard's order: \(report)")
         XCTAssertTrue(report.contains("▸ CRESSWELL"), "\(report)")
         XCTAssertTrue(report.contains("▸ JUN HAO"))
+        let cressAt = try XCTUnwrap(report.firstIndex(of: "▸ CRESSWELL")), junAt = try XCTUnwrap(report.firstIndex(of: "▸ JUN HAO"))
+        XCTAssertNotEqual(report[cressAt - 1], "", "no blank line above the first group")
+        XCTAssertEqual(report[junAt - 1], "", "a blank line before each later group")
         XCTAssertFalse(report.contains("▸ NOBODY"), "an empty group is not shown")
         // The same address twice (an old sign-in beside a new one): the newest reading only.
         var stale = claude("yz-old", session: 0, weekly: 99, age: 300_000)
