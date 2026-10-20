@@ -675,8 +675,6 @@ public enum UsageText {
         }
         blocks.append("")
         blocks += tableBlocks(view)
-        blocks.append("")
-        blocks += adviceLines(view.leaving(), tools: adviceTool(view, alerts: alerts).map { [$0] } ?? [])
         return fit(blocks)
     }
 
@@ -704,12 +702,6 @@ public enum UsageText {
         }
         blocks.append("")
         blocks += tableBlocks(view)
-        blocks.append("")
-        var tools = view.followed.map(\.tool).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
-        if tools.isEmpty { tools = ["claude"] }
-        // As in an alert: an account at the threshold is no place to go, even
-        // though the dashboard still counts 90% as usable.
-        blocks += adviceLines(view.leaving(), tools: tools)
         return fit(blocks)
     }
 

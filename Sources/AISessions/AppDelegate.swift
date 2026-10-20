@@ -381,7 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let lead = "📊 <b>New: the Usage button</b>\nTap <b>📊 Usage</b> below (or send /usage) any time to see "
-                + "this Mac's account, when its limits renew, which account to use first and which has the most usage left."
+                + "every account's limits and when they renew, grouped by person."
             let html = await usageReport(lead: lead) ?? lead
             do {
                 try await sendTelegram(settings, html, .usageKeyboard)

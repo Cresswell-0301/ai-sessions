@@ -172,21 +172,11 @@ accounts' sign-ins.
 **What the messages say.** An alert names the limit that crossed; then, as in
 every report, a *Claude Code* and a *Codex* table give each account's limits
 with when each renews ("77% 3h10m": 77% used, renews in 3 h 10 min; ◀ marks the
-account this Mac uses, ⚠ one at the threshold), and two names close it:
-
-```
-Use first: looiytube2
-Most usage left: looiytube2
-```
-
-*Use first* is the dashboard's own pick (the account whose week renews soonest
-among those with room, so its quota is not wasted; accounts opted out on the
-dashboard are skipped). In an alert it leaves out every account already at the
-threshold (the dashboard still counts exactly 90% as usable), in an alert and
-in a report alike; when there is nowhere, the account that frees up first.
-*Most usage left* is the account with the most room now. A report asked for
-while the dashboard is not answering says how old its numbers are and gives no
-advice from them.
+account this Mac uses, ⚠ one at the threshold). The tables follow the
+dashboard's groups and order, a "▸ NAME" line above each group and a blank line
+between groups. The messages name no account to use next; the Mac's banner
+still does (the dashboard's own *Use first* pick). A report asked for while the
+dashboard is not answering says how old its numbers are.
 
 **The Usage button.** *📊 Usage* stays under the chat: tap it (or send
 `/usage`) any time for the same report about now. An alert carries a *📊 Usage

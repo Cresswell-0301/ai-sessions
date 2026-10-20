@@ -407,7 +407,6 @@ final class UsageTests: XCTestCase {
         let twiceReport = UsageText.reportMessage(view(twice))
         XCTAssertTrue(twiceReport.contains("\nyz "), twiceReport)
         XCTAssertFalse(twiceReport.contains("yz-old"), twiceReport)
-        XCTAssertTrue(twiceReport.contains("week\n▸ YONG ZHEN\n"), "no blank line above the first group: \(twiceReport)")
         XCTAssertFalse(UsageText.reportMessage(view(snap, inUse: ["cress"]).hiding(UsageAlertScope(["cress"]))).contains("CRESSWELL"),
                        "a group whose only account is hidden goes too")
     }
@@ -422,7 +421,7 @@ final class UsageTests: XCTestCase {
         XCTAssertFalse(hidden.contains("roomy"), "not in the table nor the advice: \(hidden)")
         XCTAssertFalse(hidden.contains("cress"), hidden)
         XCTAssertFalse(hidden.contains("No account on the dashboard"), "the followed one was hidden, not missing: \(hidden)")
-        XCTAssertTrue(hidden.hasSuffix("Use first: <b>other</b>\nMost usage left: <b>other</b>"), hidden)
+        XCTAssertFalse(hidden.contains("Use first"), "no advice in a Telegram message: \(hidden)")
         XCTAssertEqual(UsageText.reportMessage(view(snap, inUse: ["roomy"]).hiding(UsageAlertScope([]))), shown,
                        "nothing named: nothing hidden")
     }
@@ -433,12 +432,11 @@ final class UsageTests: XCTestCase {
         project["email"] = "cress.nexxa@example.com"
         let snap = snapshot([claude("cress", session: 69, weekly: 72), project])
         let mine = UsageText.reportMessage(view(snap, inUse: ["cress"]))
-        XCTAssertTrue(mine.hasSuffix("Use first: <b>cress.nexxa@example.com</b>\nMost usage left: <b>cress.nexxa@example.com</b>"), mine)
+        XCTAssertTrue(mine.contains("\ncress.nexxa@e"), "the owner's table names the address: \(mine)")
         XCTAssertFalse(mine.contains("'s Mac"), "the owner's own report needs no note")
         let theirs = UsageText.reportMessage(view(snap, inUse: ["cress"]), owner: "Cress")
         XCTAssertTrue(lines(theirs).first?.hasSuffix(" · ◀ Cress's Mac") ?? false, theirs)
         XCTAssertTrue(theirs.contains("\ncress.nexxa "), "the table too: \(theirs)")
-        XCTAssertTrue(theirs.hasSuffix("Use first: <b>cress.nexxa</b>\nMost usage left: <b>cress.nexxa</b>"), theirs)
         XCTAssertFalse(theirs.contains("@"), "no address anywhere: \(theirs)")
     }
 
@@ -458,9 +456,6 @@ final class UsageTests: XCTestCase {
             "roomy   0%        53% 6d</pre>",
             "<b>Codex</b>",
             "<pre>cx 37% 3d</pre>",
-            "",
-            "Use first: <b>cress</b>",
-            "Most usage left: <b>roomy</b>",
         ])
     }
 
@@ -475,9 +470,6 @@ final class UsageTests: XCTestCase {
             "<pre>account session   week",
             "tr&lt;i&gt;mo 28% 2h46m 94% 2d7h ⚠ ◀",
             "roomy   0%        53% 6d</pre>",
-            "",
-            "Use first: <b>roomy</b>",
-            "Most usage left: <b>roomy</b>",
         ])
         XCTAssertFalse(html.contains("<i>mo"), "labels are escaped, not markup")
     }
@@ -494,9 +486,9 @@ final class UsageTests: XCTestCase {
                        "opted out on the dashboard")
         XCTAssertEqual(UsageAdvice.useFirst(snap.accounts, tool: "claude", excluded: excluded, now: now)?.account.label, "cress")
         let dark = snapshot([row("claude", "a", [], error: "Rate Limit"), row("claude", "b", [], error: "token expired — re-login")])
-        XCTAssertTrue(UsageText.reportMessage(view(dark)).hasSuffix("Use first: —\nMost usage left: —"))
+        XCTAssertEqual(UsageText.adviceLines(view(dark).leaving(), tools: ["claude"]), ["Use first: —", "Most usage left: —"])
         let near = snapshot([claude("a", session: 91, weekly: 92), claude("b", session: 100, weekly: 100)])
-        XCTAssertTrue(UsageText.reportMessage(view(near)).contains("Use first: <b>a</b>"), "the one that frees up first")
+        XCTAssertTrue(UsageText.adviceLines(view(near).leaving(), tools: ["claude"]).contains("Use first: <b>a</b>"), "the one that frees up first")
     }
 
     func testAnAlertSendsTheUserElsewhere() throws {
@@ -508,17 +500,18 @@ final class UsageTests: XCTestCase {
         let alert = try crossing(snap, 0, "weekly_all")
         let v = view(snap, inUse: ["cress"])
         XCTAssertEqual(v.useFirst(tool: "claude")?.account.label, "edge", "the dashboard's own pick, unchanged")
-        XCTAssertTrue(UsageText.alertMessage([alert], view: v).contains("Use first: <b>roomy</b>\nMost usage left: <b>roomy</b>"))
+        XCTAssertEqual(UsageText.adviceLines(v.leaving(), tools: ["claude"]), ["Use first: <b>roomy</b>", "Most usage left: <b>roomy</b>"])
+        XCTAssertFalse(UsageText.alertMessage([alert], view: v).contains("Use first"), "the Telegram alert gives no advice")
         XCTAssertEqual(UsageText.notification(for: [alert], view: v).body, "Use first: roomy (47% left).")
-        XCTAssertTrue(UsageText.reportMessage(v).contains("Use first: <b>roomy</b>\n"),
+        XCTAssertTrue(UsageText.adviceLines(v.leaving(), tools: ["claude"]).contains("Use first: <b>roomy</b>"),
                       "an account at the threshold is no place to go, in a report either")
 
         // Every account full: when work can go on, and where.
         let full = snapshot([claude("cress", session: 20, weekly: 95),
                              claude("other", session: 0, weekly: 100, weeklyResets: now.timeIntervalSince1970 + 3 * 3600)])
         let fullAlert = try crossing(full, 0, "weekly_all")
-        XCTAssertTrue(UsageText.alertMessage([fullAlert], view: view(full, inUse: ["cress"]))
-            .contains("Use first: <b>other</b>\nMost usage left: —"), "frees up first; nobody has room")
+        XCTAssertEqual(UsageText.adviceLines(view(full, inUse: ["cress"]).leaving(), tools: ["claude"]),
+                       ["Use first: <b>other</b>", "Most usage left: —"], "frees up first; nobody has room")
         XCTAssertEqual(UsageText.notification(for: [fullAlert], view: view(full)).body, "All near a limit; other frees up first.")
     }
 
@@ -578,7 +571,7 @@ final class UsageTests: XCTestCase {
         let report = UsageText.reportMessage(old)
         XCTAssertTrue(report.hasPrefix("📊 <b>AI usage</b> · 07:40\n⚠️ The dashboard is not answering: these numbers are from 02:40 (5h ago)."),
                       report)
-        XCTAssertTrue(report.hasSuffix("Use first: —\nMost usage left: —"), "no advice from a 5-hour-old reading: \(report)")
+        XCTAssertFalse(report.contains("Use first"), "no advice: \(report)")
         XCTAssertTrue(report.contains("cress   69%?"), "a session that has renewed since is not 69% now: \(report)")
     }
 

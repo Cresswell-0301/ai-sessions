@@ -158,7 +158,7 @@ final class UsageAlertAppTests: XCTestCase {
         let html = sent.first?.html ?? ""
         XCTAssertTrue(html.hasPrefix("⚠️ <b>trimo</b> — Claude weekly at <b>94%</b>\n\n<b>Claude Code</b>\n"), html)
         XCTAssertTrue(html.contains("trimo         28% 2h46m 94% 2d7h ⚠ ◀"), "with when each limit renews: \(html)")
-        XCTAssertTrue(html.hasSuffix("Use first: <b>cresswell-nexxatech</b>\nMost usage left: <b>cresswell-nexxatech</b>"), html)
+        XCTAssertFalse(html.contains("Use first") || html.contains("Most usage left"), "no advice in Telegram: \(html)")
         XCTAssertEqual(sent.first?.markup, .usageNowButton, "a button under the alert for a fresh report")
 
         await monitor.poll() // still over: nothing new
@@ -498,7 +498,7 @@ final class UsageAlertAppTests: XCTestCase {
         let report = await app.usageReport() ?? ""
         XCTAssertTrue(report.contains("⚠️ The dashboard is not answering: these numbers are from"), report)
         XCTAssertTrue(report.contains("(5h ago)"), report)
-        XCTAssertTrue(report.hasSuffix("Use first: —\nMost usage left: —"), "no advice from old numbers: \(report)")
+        XCTAssertFalse(report.contains("Use first"), "no advice: \(report)")
     }
 
     func testARowThatLosesItsEmailForAMomentIsNotAlertedTwice() async throws {
@@ -737,8 +737,7 @@ final class UsageAlertAppTests: XCTestCase {
         let text = reports.first?["text"] as? String ?? ""
         XCTAssertTrue(text.hasPrefix("📊 <b>AI usage</b> · "), text)
         XCTAssertTrue(text.contains("trimo         28% 2h46m 50% 2d7h ◀"), text)
-        XCTAssertTrue(text.hasSuffix("Use first: <b>trimo</b>\nMost usage left: <b>trimo</b>"),
-                      "same renewal for all: the less used first: \(text)")
+        XCTAssertFalse(text.contains("Use first") || text.contains("Most usage left"), "no advice in Telegram: \(text)")
         let keyboard = reports.first?["reply_markup"] as? [String: Any]
         XCTAssertEqual(keyboard?["is_persistent"] as? Bool, true, "the button stays under the chat")
         let polls = api.calls.filter { $0.method == "getUpdates" }.compactMap { ($0.body["offset"] as? NSNumber)?.intValue }
