@@ -380,6 +380,34 @@ final class UsageTests: XCTestCase {
 
     private func lines(_ html: String) -> [String] { html.components(separatedBy: "\n") }
 
+    func testTheTablesFollowTheDashboardsGroups() throws {
+        let rows = [claude("cress", session: 9, weekly: 32), claude("jun", session: 0, weekly: 30),
+                    claude("loose", session: 0, weekly: 5), claude("yz", session: 7, weekly: 57)]
+        let data = try JSONSerialization.data(withJSONObject: ["rows": rows, "meta": [
+            "order": ["group:claude:a", "claude:cress@example.com", "group:claude:b", "claude:yz@example.com",
+                      "claude:jun@example.com", "group:claude:empty"],
+            "groups": ["group:claude:a": "Cresswell", "group:claude:b": "Jun Hao", "group:claude:empty": "Nobody"]]])
+        let snap = try XCTUnwrap(UsageSnapshot.parse(data, fetchedAt: now))
+        let report = lines(UsageText.reportMessage(view(snap, inUse: ["cress"])))
+        let names = report.compactMap { $0.split(separator: " ").first.map(String.init) }
+        let table = try XCTUnwrap(names.firstIndex(of: "<pre>account"))
+        XCTAssertEqual(Array(names[(table + 1)...(table + 6)]), ["loose", "▸", "cress", "▸", "yz", "jun"],
+                       "a new account first, ungrouped; then each group in the dashboard's order: \(report)")
+        XCTAssertTrue(report.contains("▸ CRESSWELL"), "\(report)")
+        XCTAssertTrue(report.contains("▸ JUN HAO"))
+        XCTAssertFalse(report.contains("▸ NOBODY"), "an empty group is not shown")
+        // The same address twice (an old sign-in beside a new one): the newest reading only.
+        var stale = claude("yz-old", session: 0, weekly: 99, age: 300_000)
+        stale["email"] = "yz@example.com"
+        let twice = try XCTUnwrap(UsageSnapshot.parse(try JSONSerialization.data(withJSONObject: ["rows": [stale] + rows, "meta": [
+            "order": ["group:claude:b", "claude:yz@example.com"], "groups": ["group:claude:b": "Yong Zhen"]]]), fetchedAt: now))
+        let twiceReport = UsageText.reportMessage(view(twice))
+        XCTAssertTrue(twiceReport.contains("\nyz "), twiceReport)
+        XCTAssertFalse(twiceReport.contains("yz-old"), twiceReport)
+        XCTAssertFalse(UsageText.reportMessage(view(snap, inUse: ["cress"]).hiding(UsageAlertScope(["cress"]))).contains("CRESSWELL"),
+                       "a group whose only account is hidden goes too")
+    }
+
     func testAHiddenAccountIsLeftOutOfTheMessage() {
         let snap = snapshot([claude("cress", session: 69, weekly: 72), claude("roomy", session: 0, weekly: 10),
                              claude("other", session: 0, weekly: 40)])

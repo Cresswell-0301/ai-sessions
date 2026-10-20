@@ -237,7 +237,9 @@ final class UsageMonitor {
                 accounts[index].email = email
             }
         }
-        return UsageSnapshot(accounts: accounts, fetchedAt: snapshot.fetchedAt)
+        var known = snapshot
+        known.accounts = accounts
+        return known
     }
 
     /// One line whenever the accounts that alert change: at launch, after a

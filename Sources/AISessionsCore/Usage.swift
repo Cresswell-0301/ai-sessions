@@ -125,10 +125,47 @@ public struct UsageAccount: Equatable, Codable, Sendable {
 public struct UsageSnapshot: Equatable, Sendable {
     public var accounts: [UsageAccount]
     public var fetchedAt: Date
+    /// The dashboard's own row order (`meta.order`): account keys
+    /// ("claude:<email>") and group markers ("group:claude:<id>"), each
+    /// marker followed by the accounts in that group.
+    public var layout: [String]
+    /// Group names by marker (`meta.groups`): "Cresswell", "Jun Hao".
+    public var groupNames: [String: String]
 
-    public init(accounts: [UsageAccount], fetchedAt: Date) {
+    public init(accounts: [UsageAccount], fetchedAt: Date, layout: [String] = [], groupNames: [String: String] = [:]) {
         self.accounts = accounts
         self.fetchedAt = fetchedAt
+        self.layout = layout
+        self.groupNames = groupNames
+    }
+
+    /// `accounts` of `tool` in the dashboard's groups, as its page shows
+    /// them: accounts it has not placed yet first, ungrouped, then each group
+    /// in order. Nil when that tool has no groups.
+    public func grouped(_ accounts: [UsageAccount], tool: String) -> [(name: String?, accounts: [UsageAccount])]? {
+        let marker = "group:\(tool):"
+        guard layout.contains(where: { $0.hasPrefix(marker) }) else { return nil }
+        // One row per account, as the page shows: an address the dashboard
+        // lists twice (an old sign-in beside a new one) keeps its newest reading.
+        var byKey: [String: UsageAccount] = [:]
+        for account in accounts {
+            let key = UsageAdvice.exclusionKey(account)
+            if let kept = byKey[key], (kept.asOf ?? .distantPast) >= (account.asOf ?? .distantPast) { continue }
+            byKey[key] = account
+        }
+        let unplaced = accounts.filter { account in
+            let key = UsageAdvice.exclusionKey(account)
+            return !layout.contains(key) && byKey[key] == account
+        }
+        var sections: [(name: String?, accounts: [UsageAccount])] = [(nil, unplaced)]
+        for key in layout {
+            if key.hasPrefix(marker) {
+                sections.append((groupNames[key] ?? "", []))
+            } else if let account = byKey.removeValue(forKey: key) {
+                sections[sections.count - 1].accounts.append(account)
+            }
+        }
+        return sections.filter { !$0.accounts.isEmpty }
     }
 
     /// Parses the dashboard's `/data.json`: `{"rows": [{"tool", "label",
@@ -162,7 +199,10 @@ public struct UsageSnapshot: Equatable, Sendable {
                                          email: row["email"] as? String, asOf: asOf,
                                          error: error.flatMap { $0.isEmpty ? nil : $0 }))
         }
-        return UsageSnapshot(accounts: accounts, fetchedAt: fetchedAt)
+        let meta = root["meta"] as? [String: Any] ?? [:]
+        return UsageSnapshot(accounts: accounts, fetchedAt: fetchedAt,
+                             layout: (meta["order"] as? [Any])?.compactMap { $0 as? String } ?? [],
+                             groupNames: (meta["groups"] as? [String: Any])?.compactMapValues { $0 as? String } ?? [:])
     }
 
     /// `skipped` is the dashboard's note on its token-cost scan ("signed in —
@@ -181,7 +221,7 @@ public struct UsageSnapshot: Equatable, Sendable {
 
     /// The same reading, cut down to the accounts `keep` accepts.
     public func only(_ keep: (UsageAccount) -> Bool) -> UsageSnapshot {
-        UsageSnapshot(accounts: accounts.filter(keep), fetchedAt: fetchedAt)
+        UsageSnapshot(accounts: accounts.filter(keep), fetchedAt: fetchedAt, layout: layout, groupNames: groupNames)
     }
 }
 
@@ -707,7 +747,6 @@ public enum UsageText {
             let l = view.inUse.contains(lhs.element.key), r = view.inUse.contains(rhs.element.key)
             return l != r ? l : lhs.offset < rhs.offset
         }.map(\.element)
-        let names = shortNames(ordered.map(view.name))
         // "77% 3h10m": used, then when it renews. A number that is not a
         // reading of the running period (old, or its period over) gets a "?".
         func cell(_ window: UsageWindow?, renewal: Bool = true) -> String {
@@ -720,29 +759,47 @@ public enum UsageText {
             let state = account.readable ? (account.isOver(view.threshold, at: now) ? " ⚠" : "") : " ?"
             return state + (view.inUse.contains(account.key) ? " ◀" : "")
         }
-        var out: [String] = []
-        let claude = ordered.enumerated().filter { $0.element.tool == "claude" }
-        if !claude.isEmpty {
-            // The Fable column (by its label) only once some account uses it;
-            // its renewal is the week's, so it shows the number alone.
-            func fable(_ account: UsageAccount) -> UsageWindow? {
-                account.windows.first { $0.kind == "weekly_scoped" && $0.label.lowercased().contains("fable") }
+        // One tool's table, in the dashboard's groups when it has them: a
+        // "▸ CRESSWELL" line above each group's accounts.
+        func block(_ tool: String, header: [String]?, cells: ([UsageAccount]) -> (UsageAccount) -> [String]) -> String? {
+            let mine = ordered.filter { $0.tool == tool }
+            let sections = view.snapshot.grouped(mine, tool: tool) ?? [(nil, mine)]
+            let accounts = sections.flatMap(\.accounts)
+            guard !accounts.isEmpty else { return nil }
+            let names = shortNames(accounts.map(view.name))
+            let row = cells(accounts)
+            var lines = aligned((header.map { [$0] } ?? []) + accounts.enumerated().map { [names[$0.offset]] + row($0.element) })
+            let top = header == nil ? [] : [lines.removeFirst()]
+            var body: [String] = []
+            var index = 0
+            for section in sections {
+                if let name = section.name { body.append("▸ " + (name.isEmpty ? "group" : name).uppercased()) }
+                for account in section.accounts {
+                    body.append(lines[index] + marks(account))
+                    index += 1
+                }
             }
-            let showFable = claude.contains { ($0.element.windows.contains { $0.kind == "weekly_scoped" && $0.label.lowercased().contains("fable") && $0.pct > 0 }) }
-            var rows = [["account", "session", "week"] + (showFable ? ["fable"] : [])]
-            for (index, account) in claude {
-                rows.append([names[index], cell(account.window("session")), cell(account.window("weekly_all"))]
-                            + (showFable ? [cell(fable(account), renewal: false)] : []))
-            }
-            let lines = aligned(rows)
-            out.append("<b>Claude Code</b>")
-            out.append(table([lines[0]] + capped(zip(lines.dropFirst(), claude).map { $0 + marks($1.element) })))
+            return table(top + capped(body))
         }
-        let codex = ordered.enumerated().filter { $0.element.tool == "codex" }
-        if !codex.isEmpty {
-            let lines = aligned(codex.map { [names[$0.offset], cell(UsageAdvice.renewal($0.element))] })
+        var out: [String] = []
+        // The Fable column (by its label) only once some account uses it;
+        // its renewal is the week's, so it shows the number alone.
+        func fable(_ account: UsageAccount) -> UsageWindow? {
+            account.windows.first { $0.kind == "weekly_scoped" && $0.label.lowercased().contains("fable") }
+        }
+        let claudeAccounts = ordered.filter { $0.tool == "claude" }
+        if !claudeAccounts.isEmpty {
+            let showFable = claudeAccounts.contains { (fable($0)?.pct ?? 0) > 0 }
+            if let table = block("claude", header: ["account", "session", "week"] + (showFable ? ["fable"] : []), cells: { _ in
+                { [cell($0.window("session")), cell($0.window("weekly_all"))] + (showFable ? [cell(fable($0), renewal: false)] : []) }
+            }) {
+                out.append("<b>Claude Code</b>")
+                out.append(table)
+            }
+        }
+        if let table = block("codex", header: nil, cells: { _ in { [cell(UsageAdvice.renewal($0))] } }) {
             out.append("<b>Codex</b>")
-            out.append(table(capped(zip(lines, codex).map { $0 + marks($1.element) })))
+            out.append(table)
         }
         return out
     }

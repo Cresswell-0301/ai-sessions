@@ -523,7 +523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// "Stop Sharing › with …": asks first; then the bot no longer answers
     /// them, and tells them so (their 📊 Usage button goes away too).
-    func stopSharing(with chatId: Int64, confirm: (TelegramViewers.Viewer) -> Bool = TelegramSetup.confirmStopSharing) {
+    func stopSharing(with chatId: Int64, confirm: @MainActor (TelegramViewers.Viewer) -> Bool = TelegramSetup.confirmStopSharing) {
         guard let viewer = telegramViewers.allowed.first(where: { $0.chatId == chatId }), confirm(viewer),
               let stopped = telegramViewers.block(chatId, now: clock()) else { return }
         Log.shared.info("Telegram: stopped sharing usage reports with \(stopped.label)")
